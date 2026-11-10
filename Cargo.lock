@@ -1975,11 +1975,13 @@ dependencies = [
  "nguda-core",
  "nguda-engine",
  "serde",
+ "serde_json",
  "specta",
  "specta-typescript",
  "tauri",
  "tauri-build",
  "tauri-specta",
+ "tempfile",
  "tokio",
 ]
 
@@ -2000,6 +2002,8 @@ name = "nguda-core"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 

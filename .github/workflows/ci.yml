@@ -58,6 +58,9 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Frontend tests (incl. Rust/TS elapsed conformance, AD-11)
+        run: npm test
+
       - name: cargo fmt
         run: cargo fmt --all --check
 

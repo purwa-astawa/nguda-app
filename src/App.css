@@ -1,0 +1,46 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 0;
+  padding: 1rem;
+}
+
+.status {
+  color: #b00020;
+}
+
+.add,
+.edit,
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.add input[type="number"],
+.edit input[type="number"] {
+  width: 4.5rem;
+}
+
+.plan {
+  padding-left: 1.2rem;
+}
+
+.item {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #ddd;
+}
+
+.item.running .title {
+  font-weight: bold;
+}
+
+.facts .meta {
+  margin-left: 0.6rem;
+  color: #555;
+  font-variant-numeric: tabular-nums;
+}
+
+.actions {
+  margin-top: 0.3rem;
+}
