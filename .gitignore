@@ -1,6 +1,9 @@
 target/
 node_modules/
 dist/
-spike/*/target
 src-tauri/gen/
-_bmad/render/
+
+# Local planning and spikes (not published)
+_bmad/
+_bmad-output/
+spike/
