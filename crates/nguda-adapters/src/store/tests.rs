@@ -526,6 +526,36 @@ async fn day_log_appends_load_in_order_per_day() {
 }
 
 #[tokio::test]
+async fn a_removed_day_log_entry_round_trips_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let removed = DayLogEntry {
+        at: ts(1_200),
+        kind: DayLogKind::Removed { item_id: id(3) },
+    };
+    store
+        .commit(batch([
+            StoreOp::AppendDayLog {
+                date: date(),
+                entry: recovered(1, 1_100),
+            },
+            StoreOp::AppendDayLog {
+                date: date(),
+                entry: removed.clone(),
+            },
+        ]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store.load_day_log(date()).await.unwrap(),
+        vec![recovered(1, 1_100), removed]
+    );
+}
+
+#[tokio::test]
 async fn day_log_on_an_unknown_day_rolls_back_the_batch() {
     let dir = TempDir::new().unwrap();
     let store = seeded(&db(&dir)).await;

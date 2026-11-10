@@ -16,4 +16,6 @@ pub struct DayLogEntry {
 pub enum DayLogKind {
     /// An open segment left by a crash was closed at the last heartbeat.
     Recovered { item_id: ItemId },
+    /// The user removed the item: it is tombstoned, never deleted.
+    Removed { item_id: ItemId },
 }

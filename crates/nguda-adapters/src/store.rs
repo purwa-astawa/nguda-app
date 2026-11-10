@@ -367,6 +367,7 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
             let ctx = format!("append day log for {date}");
             let (kind, item_id) = match &entry.kind {
                 DayLogKind::Recovered { item_id } => (KIND_RECOVERED, Some(item_id.to_string())),
+                DayLogKind::Removed { item_id } => (KIND_REMOVED, Some(item_id.to_string())),
             };
             tx.execute(
                 "INSERT INTO day_log (day_date, at, kind, item_id) VALUES (?1, ?2, ?3, ?4)",
@@ -380,6 +381,7 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
 
 /// Stored `day_log.kind` values.
 const KIND_RECOVERED: &str = "recovered";
+const KIND_REMOVED: &str = "removed";
 
 fn last_alive_at(conn: &Connection) -> Result<Option<Timestamp>, StoreError> {
     let ctx = "load last alive";
@@ -451,7 +453,10 @@ fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, Store
                 (KIND_RECOVERED, Some(item_id)) => DayLogKind::Recovered {
                     item_id: parse_id(&item_id)?,
                 },
-                (KIND_RECOVERED, None) => {
+                (KIND_REMOVED, Some(item_id)) => DayLogKind::Removed {
+                    item_id: parse_id(&item_id)?,
+                },
+                (KIND_RECOVERED | KIND_REMOVED, None) => {
                     return Err(StoreError::new(format!("{ctx}: missing item id")));
                 }
                 _ => return Err(StoreError::new(format!("{ctx}: unknown kind"))),

@@ -5,8 +5,20 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 
 /** Commands */
 export const commands = {
-	/**  Start (or restart) the demo task. Fire-and-forget: it never waits for the engine. */
-	startDemo: () => typedError<null, string>(__TAURI_INVOKE("start_demo")),
+	/**  Adds a pending flexible item at the end of the plan. */
+	createTask: (title: string, plannedSecs: number) => typedError<null, string>(__TAURI_INVOKE("create_task", { title, plannedSecs })),
+	/**  Changes an item's title and/or planned length; `null` keeps the current value. */
+	editTask: (itemId: string, title: string | null, plannedSecs: number | null) => typedError<null, string>(__TAURI_INVOKE("edit_task", { itemId, title, plannedSecs })),
+	/**  Moves a flexible item before or after another flexible item. */
+	reorderTask: (itemId: string, anchor: ReorderAnchorArg, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("reorder_task", { itemId, anchor, expectedRev })),
+	/**  Pins a flexible item at `pinnedStart` (RFC 3339, required), or unpins a fixed one. */
+	toggleFixed: (itemId: string, pinnedStart: string | null, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("toggle_fixed", { itemId, pinnedStart, expectedRev })),
+	/**  Removes an item that is not running. It is tombstoned, never deleted. */
+	removeTask: (itemId: string) => typedError<null, string>(__TAURI_INVOKE("remove_task", { itemId })),
+	/**  Starts or resumes an item now, pausing whichever item is running. */
+	startTask: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("start_task", { itemId, expectedRev })),
+	/**  Pauses the running item now. */
+	pauseTask: (itemId: string) => typedError<null, string>(__TAURI_INVOKE("pause_task", { itemId })),
 };
 
 /** Events */
@@ -15,6 +27,16 @@ export const events = {
 };
 
 /* Types */
+/**  Which side of the anchor item a reordered item goes. */
+export type AnchorPlace = "before" | "after";
+
+/**  A reorder target: next to another flexible item, never a numeric index (AD-15). */
+export type ReorderAnchorArg = {
+	place: AnchorPlace,
+	/**  UUID of the anchor item. */
+	itemId: string,
+};
+
 export type RunningView = {
 	title: string,
 	/**  RFC 3339 UTC instant, e.g. `2026-11-10T09:00:00Z`. */
