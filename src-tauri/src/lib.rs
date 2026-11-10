@@ -2,7 +2,8 @@
 //!
 //! It builds the engine with the real clock, exposes fire-and-forget commands
 //! (AD-4), mirrors snapshots to the view as a typed event, and renders the tray
-//! from a snapshot subscriber (AD-11).
+//! from a snapshot subscriber (AD-11). The tray menu (status line and Quit) and
+//! its Quit handler live in `tray`.
 
 mod ipc;
 mod tray;
