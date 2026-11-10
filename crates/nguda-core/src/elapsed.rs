@@ -105,4 +105,34 @@ mod tests {
             Duration::from_millis(1000)
         );
     }
+
+    /// One case of the Rust/TS conformance fixture shared with `test/elapsed.test.ts`.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Case {
+        name: String,
+        segment_started_at: String,
+        accumulated_secs: u64,
+        now: String,
+        elapsed_secs: u64,
+        formatted: String,
+    }
+
+    const FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/elapsed.json"
+    ));
+
+    #[test]
+    fn conformance_fixture_matches() {
+        let cases: Vec<Case> = serde_json::from_str(FIXTURE).unwrap();
+        assert!(cases.len() >= 12, "fixture has too few cases");
+        for c in cases {
+            let r = running(c.segment_started_at.parse().unwrap(), c.accumulated_secs);
+            let now: Timestamp = c.now.parse().unwrap();
+            let secs = elapsed_secs(&r, now);
+            assert_eq!(secs, c.elapsed_secs, "{}", c.name);
+            assert_eq!(format_elapsed(secs), c.formatted, "{}", c.name);
+        }
+    }
 }

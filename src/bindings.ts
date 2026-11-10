@@ -19,6 +19,11 @@ export const commands = {
 	startTask: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("start_task", { itemId, expectedRev })),
 	/**  Pauses the running item now. */
 	pauseTask: (itemId: string) => typedError<null, string>(__TAURI_INVOKE("pause_task", { itemId })),
+	/**
+	 *  The latest snapshot, read from the engine's `watch` receiver. Sends nothing to
+	 *  the engine (AD-4), so a window that loads after the last event still renders.
+	 */
+	currentSnapshot: () => __TAURI_INVOKE<SnapshotEvent_Serialize>("current_snapshot"),
 };
 
 /** Events */
@@ -30,6 +35,43 @@ export const events = {
 /**  Which side of the anchor item a reordered item goes. */
 export type AnchorPlace = "before" | "after";
 
+export type DayView = {
+	/**  Local date, `YYYY-MM-DD`. */
+	date: string,
+	/**  The IANA zone fixed for this day. */
+	tz: string,
+};
+
+export type ItemStatusView = "pending" | "running" | "paused" | "done" | "carriedOver" | "removed";
+
+export type ItemView = ItemView_Serialize | ItemView_Deserialize;
+
+export type ItemView_Deserialize = {
+	/**  UUID of the item. */
+	id: string,
+	title: string,
+	plannedSecs: number,
+	fixed: boolean,
+	/**  RFC 3339 UTC instant; set exactly when `fixed`. */
+	pinnedStart?: string | null,
+	status: ItemStatusView,
+	/**  Closed segments only. A running item's live time comes from `running`. */
+	actualSecs: number,
+};
+
+export type ItemView_Serialize = {
+	/**  UUID of the item. */
+	id: string,
+	title: string,
+	plannedSecs: number,
+	fixed: boolean,
+	/**  RFC 3339 UTC instant; set exactly when `fixed`. */
+	pinnedStart: string | null,
+	status: ItemStatusView,
+	/**  Closed segments only. A running item's live time comes from `running`. */
+	actualSecs: number,
+};
+
 /**  A reorder target: next to another flexible item, never a numeric index (AD-15). */
 export type ReorderAnchorArg = {
 	place: AnchorPlace,
@@ -38,25 +80,61 @@ export type ReorderAnchorArg = {
 };
 
 export type RunningView = {
+	/**  UUID of the running item. */
+	itemId: string,
 	title: string,
 	/**  RFC 3339 UTC instant, e.g. `2026-11-10T09:00:00Z`. */
 	segmentStartedAt: string,
 	accumulatedSecs: number,
 };
 
-/**  The last engine snapshot, as the view sees it. */
+/**
+ *  The last engine snapshot, as the view sees it. Also the reply of
+ *  [`current_snapshot`], so a window that loads late still gets the latest state.
+ */
 export type SnapshotEvent = SnapshotEvent_Serialize | SnapshotEvent_Deserialize;
 
-/**  The last engine snapshot, as the view sees it. */
+/**
+ *  The last engine snapshot, as the view sees it. Also the reply of
+ *  [`current_snapshot`], so a window that loads late still gets the latest state.
+ */
 export type SnapshotEvent_Deserialize = {
 	rev: number,
+	/**  Today. `null` only before startup finishes (rev 0). */
+	day?: DayView | null,
+	/**
+	 *  Today's non-removed items in display order (`Day::in_order`). The view shows
+	 *  them as given and never re-sorts.
+	 */
+	items: ItemView_Deserialize[],
 	running?: RunningView | null,
+	/**  One entry per status key, sorted by key. */
+	status: StatusView[],
 };
 
-/**  The last engine snapshot, as the view sees it. */
+/**
+ *  The last engine snapshot, as the view sees it. Also the reply of
+ *  [`current_snapshot`], so a window that loads late still gets the latest state.
+ */
 export type SnapshotEvent_Serialize = {
 	rev: number,
+	/**  Today. `null` only before startup finishes (rev 0). */
+	day: DayView | null,
+	/**
+	 *  Today's non-removed items in display order (`Day::in_order`). The view shows
+	 *  them as given and never re-sorts.
+	 */
+	items: ItemView_Serialize[],
 	running: RunningView | null,
+	/**  One entry per status key, sorted by key. */
+	status: StatusView[],
+};
+
+export type StatusKeyView = "store" | "commandRejected";
+
+export type StatusView = {
+	key: StatusKeyView,
+	message: string,
 };
 
 /* Tauri Specta runtime */

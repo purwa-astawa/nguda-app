@@ -1,0 +1,18 @@
+[
+  { "name": "segment just started", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 0, "now": "2026-11-11T09:00:00Z", "elapsedSecs": 0, "formatted": "00:00" },
+  { "name": "sub-second is truncated", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 0, "now": "2026-11-11T09:00:00.999Z", "elapsedSecs": 0, "formatted": "00:00" },
+  { "name": "exactly one second", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 0, "now": "2026-11-11T09:00:01Z", "elapsedSecs": 1, "formatted": "00:01" },
+  { "name": "sub-millisecond start, just short of one second", "segmentStartedAt": "2026-11-11T09:00:00.0005Z", "accumulatedSecs": 0, "now": "2026-11-11T09:00:01Z", "elapsedSecs": 0, "formatted": "00:00" },
+  { "name": "sub-millisecond start and now, one second apart", "segmentStartedAt": "2026-11-11T09:00:00.0005Z", "accumulatedSecs": 0, "now": "2026-11-11T09:00:01.0005Z", "elapsedSecs": 1, "formatted": "00:01" },
+  { "name": "nanosecond short of five seconds", "segmentStartedAt": "2026-11-11T09:00:00.123456789Z", "accumulatedSecs": 0, "now": "2026-11-11T09:00:05.123456788Z", "elapsedSecs": 4, "formatted": "00:04" },
+  { "name": "clock half a second behind the start keeps accumulated", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 7, "now": "2026-11-11T08:59:59.5Z", "elapsedSecs": 7, "formatted": "00:07" },
+  { "name": "clock an hour behind the start", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 0, "now": "2026-11-11T08:00:00Z", "elapsedSecs": 0, "formatted": "00:00" },
+  { "name": "positive offset start", "segmentStartedAt": "2026-11-11T10:00:00+01:00", "accumulatedSecs": 0, "now": "2026-11-11T09:00:30Z", "elapsedSecs": 30, "formatted": "00:30" },
+  { "name": "negative offset start with a fraction", "segmentStartedAt": "2026-11-11T04:00:00.25-05:00", "accumulatedSecs": 0, "now": "2026-11-11T09:10:00.5Z", "elapsedSecs": 600, "formatted": "10:00" },
+  { "name": "accumulated plus open segment", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 90, "now": "2026-11-11T09:00:10.5Z", "elapsedSecs": 100, "formatted": "01:40" },
+  { "name": "last second below one hour", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 0, "now": "2026-11-11T09:59:59.999Z", "elapsedSecs": 3599, "formatted": "59:59" },
+  { "name": "exactly one hour", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 0, "now": "2026-11-11T10:00:00Z", "elapsedSecs": 3600, "formatted": "1:00:00" },
+  { "name": "accumulated reaches one hour", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 3540, "now": "2026-11-11T09:01:00Z", "elapsedSecs": 3600, "formatted": "1:00:00" },
+  { "name": "over ten hours", "segmentStartedAt": "2026-11-11T09:00:00Z", "accumulatedSecs": 36000, "now": "2026-11-11T09:01:01Z", "elapsedSecs": 36061, "formatted": "10:01:01" },
+  { "name": "across midnight", "segmentStartedAt": "2026-11-10T23:59:59.75+00:00", "accumulatedSecs": 0, "now": "2026-11-11T00:00:01Z", "elapsedSecs": 1, "formatted": "00:01" }
+]
