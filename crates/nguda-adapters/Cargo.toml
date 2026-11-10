@@ -1,0 +1,10 @@
+[package]
+name = "nguda-adapters"
+description = "nguda adapters: implementations of nguda-core ports, without Tauri."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+nguda-core.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "nguda"
+description = "nguda desktop shell: composition root, tray, commands and events."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin name (cargo#8519).
+name = "nguda_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+nguda-core.workspace = true
+nguda-engine.workspace = true
+nguda-adapters.workspace = true
+tauri.workspace = true
+tauri-specta.workspace = true
+specta.workspace = true
+specta-typescript.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "macros"] }

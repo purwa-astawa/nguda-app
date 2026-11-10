@@ -1,0 +1,6 @@
+target/
+node_modules/
+dist/
+spike/*/target
+src-tauri/gen/
+_bmad/render/

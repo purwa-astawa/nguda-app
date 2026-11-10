@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/nguda-core", "crates/nguda-engine", "crates/nguda-adapters", "src-tauri"]
+exclude = ["spike"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+nguda-core = { path = "crates/nguda-core" }
+nguda-engine = { path = "crates/nguda-engine" }
+nguda-adapters = { path = "crates/nguda-adapters" }
+
+tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
+tauri-build = { version = "2.5", features = [] }
+tauri-specta = { version = "=2.0.0-rc.26", features = ["derive", "typescript"] }
+specta = { version = "=2.0.0-rc.26", features = ["derive"] }
+specta-typescript = "=0.0.13"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.54.1", default-features = false }
+jiff = { version = "0.2.42", default-features = false, features = ["std"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
