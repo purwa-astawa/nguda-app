@@ -9,6 +9,7 @@ mod error;
 mod order;
 mod plan;
 mod segment;
+mod store;
 #[cfg(test)]
 mod test_support;
 
@@ -18,6 +19,7 @@ pub use error::DomainError;
 pub use jiff::Timestamp;
 pub use jiff::civil::Date;
 pub use order::OrderKey;
-pub use plan::{Action, Day, ItemId, ItemStatus, PlanItem, display_order};
+pub use plan::{Action, Day, ItemId, ItemStatus, PlanItem, PlanItemRecord, display_order};
 pub use segment::{Segment, actual_secs, closed_secs};
+pub use store::{Store, StoreBatch, StoreError, StoreFuture, StoreOp};
 pub use uuid::Uuid;
