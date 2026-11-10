@@ -8,3 +8,10 @@ publish.workspace = true
 
 [dependencies]
 nguda-core.workspace = true
+rusqlite.workspace = true
+rusqlite_migration.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }

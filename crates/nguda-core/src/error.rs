@@ -17,6 +17,8 @@ pub enum DomainError {
     UnknownItem(ItemId),
     /// The day already has an item with this id.
     DuplicateItem(ItemId),
+    /// A stored record is internally inconsistent and cannot be rehydrated.
+    InvalidRecord { id: ItemId, reason: &'static str },
 }
 
 impl fmt::Display for DomainError {
@@ -29,6 +31,9 @@ impl fmt::Display for DomainError {
             Self::InvalidOrder => f.write_str("invalid order keys"),
             Self::UnknownItem(id) => write!(f, "unknown item {id}"),
             Self::DuplicateItem(id) => write!(f, "duplicate item {id}"),
+            Self::InvalidRecord { id, reason } => {
+                write!(f, "invalid record for item {id}: {reason}")
+            }
         }
     }
 }

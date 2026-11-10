@@ -94,7 +94,74 @@ pub struct PlanItem {
     segments: Vec<Segment>,
 }
 
+/// Every field of a [`PlanItem`], public, for rehydrating stored rows. Turn it into
+/// an item only through [`PlanItem::restore`], which checks its consistency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanItemRecord {
+    pub id: ItemId,
+    pub title: String,
+    pub planned_secs: u64,
+    pub order: OrderKey,
+    pub fixed: bool,
+    pub pinned_start: Option<Timestamp>,
+    pub status: ItemStatus,
+    pub removed_at: Option<Timestamp>,
+    pub segments: Vec<Segment>,
+}
+
 impl PlanItem {
+    /// Rebuilds a stored item, rejecting a record that breaks an item invariant:
+    /// fixed exactly when pinned, removed exactly when tombstoned, no inverted closed
+    /// segment, at most one open segment, and an open segment exactly when running.
+    pub fn restore(record: PlanItemRecord) -> Result<Self, DomainError> {
+        let invalid = |reason| DomainError::InvalidRecord {
+            id: record.id,
+            reason,
+        };
+        if record.fixed != record.pinned_start.is_some() {
+            return Err(invalid("fixed must match having a pinned start"));
+        }
+        if (record.status == ItemStatus::Removed) != record.removed_at.is_some() {
+            return Err(invalid("removed must match having a removed_at"));
+        }
+        if record
+            .segments
+            .iter()
+            .any(|s| s.ended_at.is_some_and(|end| end < s.started_at))
+        {
+            return Err(invalid("segment ends before it starts"));
+        }
+        let open = record.segments.iter().filter(|s| s.is_open()).count();
+        if open > 1 {
+            return Err(invalid("more than one open segment"));
+        }
+        if (record.status == ItemStatus::Running) != (open == 1) {
+            return Err(invalid("open segment must match running status"));
+        }
+        let PlanItemRecord {
+            id,
+            title,
+            planned_secs,
+            order,
+            fixed,
+            pinned_start,
+            status,
+            removed_at,
+            segments,
+        } = record;
+        Ok(Self {
+            id,
+            title,
+            planned_secs,
+            order,
+            fixed,
+            pinned_start,
+            status,
+            removed_at,
+            segments,
+        })
+    }
+
     /// A new flexible, pending item with no recorded time.
     pub fn new(id: ItemId, title: impl Into<String>, planned_secs: u64, order: OrderKey) -> Self {
         Self {
@@ -284,8 +351,8 @@ impl PlanItem {
 /// leaves the day unchanged when it fails.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Day {
-    pub date: Date,
-    pub tz: String,
+    date: Date,
+    tz: String,
     items: Vec<PlanItem>,
 }
 
@@ -296,6 +363,29 @@ impl Day {
             tz: tz.into(),
             items: Vec::new(),
         }
+    }
+
+    /// Rebuilds a stored day, adding each item through [`Day::add`] so duplicate ids
+    /// and a second open segment are rejected.
+    pub fn restore(
+        date: Date,
+        tz: impl Into<String>,
+        items: impl IntoIterator<Item = PlanItem>,
+    ) -> Result<Self, DomainError> {
+        let mut day = Self::new(date, tz);
+        for item in items {
+            day.add(item)?;
+        }
+        Ok(day)
+    }
+
+    pub fn date(&self) -> Date {
+        self.date
+    }
+
+    /// The IANA zone fixed for this day.
+    pub fn tz(&self) -> &str {
+        &self.tz
     }
 
     /// Adds an item. Rejects a duplicate id, and an item with an open segment while
@@ -920,5 +1010,151 @@ mod tests {
         let ids: Vec<ItemId> = d.in_order().iter().map(|i| i.id()).collect();
         assert_eq!(ids, vec![id(2), id(1), id(4), id(3)]);
         assert_eq!(d.items().len(), 5);
+    }
+
+    fn record(status: ItemStatus) -> PlanItemRecord {
+        PlanItemRecord {
+            id: id(1),
+            title: "item 1".into(),
+            planned_secs: 1500,
+            order: key("V"),
+            fixed: false,
+            pinned_start: None,
+            status,
+            removed_at: None,
+            segments: Vec::new(),
+        }
+    }
+
+    fn closed(from: i64, to: i64) -> Segment {
+        Segment {
+            started_at: FakeClock::ts(from),
+            ended_at: Some(FakeClock::ts(to)),
+        }
+    }
+
+    fn assert_invalid(r: PlanItemRecord) {
+        assert!(
+            matches!(
+                PlanItem::restore(r.clone()),
+                Err(DomainError::InvalidRecord { id: i, .. }) if i == id(1)
+            ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn restore_accepts_every_state_reached_by_transitions() {
+        let clock = FakeClock::at(1_000);
+        for s in ALL {
+            let mut d = day_with(s, &clock);
+            d.set_title(id(1), "t").ok();
+            if s != ItemStatus::Removed {
+                d.set_fixed(id(1), FakeClock::ts(5_000)).unwrap();
+            }
+            let i = d.item(id(1)).unwrap().clone();
+            let r = PlanItemRecord {
+                id: i.id(),
+                title: i.title().into(),
+                planned_secs: i.planned_secs(),
+                order: i.order().clone(),
+                fixed: i.fixed(),
+                pinned_start: i.pinned_start(),
+                status: i.status(),
+                removed_at: i.removed_at(),
+                segments: i.segments().to_vec(),
+            };
+            assert_eq!(PlanItem::restore(r), Ok(i), "{s}");
+        }
+    }
+
+    #[test]
+    fn restore_accepts_a_zero_length_closed_segment() {
+        let mut r = record(ItemStatus::Paused);
+        r.segments = vec![closed(10, 10)];
+        assert!(PlanItem::restore(r).is_ok());
+    }
+
+    #[test]
+    fn restore_rejects_fixed_without_a_pin_and_a_pin_without_fixed() {
+        let mut r = record(ItemStatus::Pending);
+        r.fixed = true;
+        assert_invalid(r);
+        let mut r = record(ItemStatus::Pending);
+        r.pinned_start = Some(FakeClock::ts(5_000));
+        assert_invalid(r);
+    }
+
+    #[test]
+    fn restore_rejects_removed_status_and_tombstone_mismatch() {
+        assert_invalid(record(ItemStatus::Removed));
+        let mut r = record(ItemStatus::Done);
+        r.removed_at = Some(FakeClock::ts(5_000));
+        assert_invalid(r);
+    }
+
+    #[test]
+    fn restore_rejects_an_inverted_closed_segment() {
+        let mut r = record(ItemStatus::Done);
+        r.segments = vec![closed(20, 10)];
+        assert_invalid(r);
+    }
+
+    #[test]
+    fn restore_rejects_two_open_segments() {
+        let mut r = record(ItemStatus::Running);
+        r.segments = vec![
+            Segment::open(FakeClock::ts(10)),
+            Segment::open(FakeClock::ts(20)),
+        ];
+        assert_invalid(r);
+    }
+
+    #[test]
+    fn restore_requires_an_open_segment_exactly_when_running() {
+        assert_invalid(record(ItemStatus::Running));
+        let mut r = record(ItemStatus::Running);
+        r.segments = vec![closed(0, 10)];
+        assert_invalid(r);
+        for s in [ItemStatus::Pending, ItemStatus::Paused, ItemStatus::Done] {
+            let mut r = record(s);
+            r.segments = vec![Segment::open(FakeClock::ts(10))];
+            assert_invalid(r);
+        }
+    }
+
+    #[test]
+    fn invalid_record_display_names_the_id_not_the_title() {
+        let mut r = record(ItemStatus::Running);
+        r.title = "secret title".into();
+        let msg = PlanItem::restore(r).unwrap_err().to_string();
+        assert!(msg.contains(&id(1).to_string()), "{msg}");
+        assert!(!msg.contains("secret"), "{msg}");
+    }
+
+    #[test]
+    fn day_restore_builds_through_add() {
+        let date = jiff::civil::date(2026, 11, 10);
+        let d = Day::restore(date, "Europe/Berlin", vec![item(1, "V"), item(2, "W")]).unwrap();
+        assert_eq!(d.date(), date);
+        assert_eq!(d.tz(), "Europe/Berlin");
+        assert_eq!(d.items().len(), 2);
+        assert_eq!(
+            Day::restore(date, "UTC", vec![item(1, "V"), item(1, "W")]),
+            Err(DomainError::DuplicateItem(id(1)))
+        );
+        let clock = FakeClock::at(1_000);
+        let mut a = day(vec![item(1, "V")]);
+        a.start(id(1), clock.now()).unwrap();
+        let mut b = day(vec![item(2, "W")]);
+        b.start(id(2), clock.now()).unwrap();
+        let running = [
+            a.item(id(1)).unwrap().clone(),
+            b.item(id(2)).unwrap().clone(),
+        ];
+        assert_eq!(
+            Day::restore(date, "UTC", running),
+            Err(DomainError::AnotherItemRunning)
+        );
     }
 }

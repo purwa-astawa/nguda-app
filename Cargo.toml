@@ -23,6 +23,9 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.54.1", default-features = false }
 jiff = { version = "0.2.42", default-features = false, features = ["std"] }
 uuid = { version = "1.29", default-features = false }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite_migration = "2.6.0"
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1
