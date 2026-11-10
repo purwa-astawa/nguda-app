@@ -73,3 +73,14 @@ jobs:
       # Arguments after the second `--` go to `cargo build` (keeps --locked everywhere).
       - name: Tauri build (no bundle)
         run: npm run tauri build -- --no-bundle -- --locked
+
+      # For the manual GNOME/KDE tray check (story 2): run in a VM with the
+      # WebKitGTK 4.1 and Ayatana AppIndicator runtime libraries installed.
+      - name: Upload Linux binary
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nguda-linux-x86_64
+          path: target/release/nguda
+          if-no-files-found: error
+          retention-days: 7
