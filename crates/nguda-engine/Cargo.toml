@@ -8,7 +8,8 @@ publish.workspace = true
 
 [dependencies]
 nguda-core.workspace = true
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }

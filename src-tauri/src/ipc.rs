@@ -96,6 +96,7 @@ mod tests {
                 segment_started_at: nguda_core::Timestamp::from_millisecond(1_500).unwrap(),
                 accumulated_secs: 0,
             }),
+            ..Default::default()
         };
         let ev = SnapshotEvent::from(&snap);
         assert_eq!(ev.rev, 3);

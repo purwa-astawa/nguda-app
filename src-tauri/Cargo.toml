@@ -23,4 +23,5 @@ tauri-specta.workspace = true
 specta.workspace = true
 specta-typescript.workspace = true
 serde.workspace = true
+jiff = { workspace = true, features = ["tz-system", "tzdb-zoneinfo"] }
 tokio = { workspace = true, features = ["sync", "time", "macros"] }

@@ -1,18 +1,32 @@
 //! nguda engine: one actor task that owns live state (AD-2, AD-3).
 //!
-//! Inputs arrive as [`EngineMsg`] on a channel and are handled one at a time. After
-//! each applied message the engine bumps `rev` and publishes a [`Snapshot`] on a
-//! `watch` channel. It holds no `Mutex` and runs no per-second tick: rendering the
-//! ticking elapsed time is the subscriber's job (AD-11).
+//! Inputs arrive as [`EngineMsg`] on a channel and are handled one at a time. Each
+//! change is computed on a copy of the day, persisted as one [`nguda_core::StoreBatch`],
+//! and swapped in only once that commit succeeds. After each change the engine bumps
+//! `rev` and publishes a [`Snapshot`] on a `watch` channel, and one-time outputs go
+//! out as [`Effect`]s. It holds no `Mutex` and runs no per-second tick: it waits on
+//! one deadline through [`Clock::sleep_until`], and rendering the ticking elapsed
+//! time is the subscriber's job (AD-11).
+
+mod actor;
+mod batch;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
-use nguda_core::{Clock, Running};
+use nguda_core::{Clock, Day, IdGen, ItemId, Running, Store, TimeZone};
 use tokio::sync::{mpsc, watch};
 
 /// Title of the hard-coded tracer-bullet task.
 pub const DEMO_TITLE: &str = "Demo";
+
+/// How often the engine records `last_alive_at` for crash recovery (AD-6).
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 
 /// Every input to the engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,11 +35,45 @@ pub enum EngineMsg {
     StartDemo,
 }
 
-/// Live state as published after each applied message.
+/// Who owns a status entry. Each owner sets or clears only its own key (AD-14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StatusKey {
+    /// The last store request failed.
+    Store,
+}
+
+/// One problem the user should see. At most one entry per key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub key: StatusKey,
+    pub message: String,
+}
+
+/// Live state as published after each applied change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub rev: u64,
+    /// Today's plan. `None` only before startup finishes (rev 0).
+    pub day: Option<Day>,
     pub running: Option<Running>,
+    /// Sorted by key.
+    pub status: Vec<StatusEntry>,
+}
+
+/// One-time outputs, each emitted exactly once (AD-3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// A segment left open by a crash was closed at startup.
+    Recovered { item_id: ItemId },
+}
+
+/// The ports and settings the engine runs on.
+pub struct EngineDeps {
+    pub clock: Arc<dyn Clock>,
+    pub store: Arc<dyn Store>,
+    pub ids: Arc<dyn IdGen>,
+    /// The zone that decides "today" and is fixed on each new day (AD-8).
+    pub tz: TimeZone,
 }
 
 /// The engine task has stopped, so the message was not delivered.
@@ -60,113 +108,14 @@ impl EngineHandle {
 }
 
 /// Starts the engine on the current tokio runtime. Must be called from within one.
-pub fn spawn(clock: Arc<dyn Clock>) -> EngineHandle {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+///
+/// Returns at once: startup (load, crash recovery, first snapshot at rev 1) runs on
+/// the engine task, and messages sent meanwhile queue and are handled after it, in
+/// order. Until then subscribers see `Snapshot::default()` (rev 0).
+pub fn spawn(deps: EngineDeps) -> (EngineHandle, mpsc::UnboundedReceiver<Effect>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (effects_tx, effects) = mpsc::unbounded_channel();
     let (snap_tx, snapshots) = watch::channel(Snapshot::default());
-    tokio::spawn(async move {
-        let mut state = Snapshot::default();
-        while let Some(msg) = rx.recv().await {
-            state = apply(&state, msg, clock.as_ref());
-            // Every receiver may be gone; the engine keeps serving senders regardless.
-            snap_tx.send_replace(state.clone());
-        }
-    });
-    EngineHandle { tx, snapshots }
-}
-
-/// Computes the next state from a copy of the current one.
-fn apply(state: &Snapshot, msg: EngineMsg, clock: &dyn Clock) -> Snapshot {
-    match msg {
-        EngineMsg::StartDemo => Snapshot {
-            rev: state.rev + 1,
-            running: Some(Running {
-                title: DEMO_TITLE.to_owned(),
-                segment_started_at: clock.now(),
-                accumulated_secs: 0,
-            }),
-        },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicI64, Ordering};
-
-    use nguda_core::Timestamp;
-
-    use super::*;
-
-    struct FakeClock(AtomicI64);
-
-    impl FakeClock {
-        fn at(secs: i64) -> Arc<Self> {
-            Arc::new(Self(AtomicI64::new(secs)))
-        }
-
-        fn set(&self, secs: i64) {
-            self.0.store(secs, Ordering::SeqCst);
-        }
-    }
-
-    impl Clock for FakeClock {
-        fn now(&self) -> Timestamp {
-            Timestamp::from_second(self.0.load(Ordering::SeqCst)).unwrap()
-        }
-    }
-
-    async fn next(rx: &mut watch::Receiver<Snapshot>) -> Snapshot {
-        rx.changed().await.expect("engine stopped");
-        rx.borrow_and_update().clone()
-    }
-
-    #[tokio::test]
-    async fn starts_with_an_empty_snapshot() {
-        let engine = spawn(FakeClock::at(1_000));
-        assert_eq!(*engine.subscribe().borrow(), Snapshot::default());
-    }
-
-    #[tokio::test]
-    async fn start_demo_yields_rev_1_running_demo() {
-        let engine = spawn(FakeClock::at(1_000));
-        let mut rx = engine.subscribe();
-        engine.send(EngineMsg::StartDemo).unwrap();
-        let snap = next(&mut rx).await;
-        assert_eq!(snap.rev, 1);
-        let running = snap.running.expect("demo should be running");
-        assert_eq!(running.title, "Demo");
-        assert_eq!(
-            running.segment_started_at,
-            Timestamp::from_second(1_000).unwrap()
-        );
-        assert_eq!(running.accumulated_secs, 0);
-    }
-
-    #[test]
-    fn send_after_engine_stopped_returns_engine_closed() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let engine = rt.block_on(async { spawn(FakeClock::at(1_000)) });
-        drop(rt); // drops the engine task and its receiver
-        assert_eq!(engine.send(EngineMsg::StartDemo), Err(EngineClosed));
-    }
-
-    #[tokio::test]
-    async fn start_demo_again_restarts_the_segment_and_bumps_rev() {
-        let clock = FakeClock::at(1_000);
-        let engine = spawn(clock.clone());
-        let mut rx = engine.subscribe();
-        engine.send(EngineMsg::StartDemo).unwrap();
-        next(&mut rx).await;
-        clock.set(1_042);
-        engine.send(EngineMsg::StartDemo).unwrap();
-        let snap = next(&mut rx).await;
-        assert_eq!(snap.rev, 2);
-        let running = snap.running.unwrap();
-        assert_eq!(
-            running.segment_started_at,
-            Timestamp::from_second(1_042).unwrap()
-        );
-        assert_eq!(running.accumulated_secs, 0);
-    }
+    tokio::spawn(actor::run(deps, rx, snap_tx, effects_tx));
+    (EngineHandle { tx, snapshots }, effects)
 }

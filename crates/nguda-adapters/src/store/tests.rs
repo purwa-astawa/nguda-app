@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use nguda_core::{Day, ItemId, OrderKey, PlanItem, Store, StoreBatch, StoreOp, Timestamp, Uuid};
+use nguda_core::{
+    Day, DayLogEntry, DayLogKind, ItemId, OpenSegmentRef, OrderKey, PlanItem, Store, StoreBatch,
+    StoreOp, Timestamp, Uuid,
+};
 use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
 use tempfile::TempDir;
@@ -160,8 +163,10 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 1);
+    assert_eq!(user_version(&path), 2);
     assert!(has_table(&path, "time_segment"));
+    assert!(has_table(&path, "engine_meta"));
+    assert!(has_table(&path, "day_log"));
     assert!(backups(&dir).is_empty());
 }
 
@@ -247,7 +252,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
         err,
         OpenError::NewerSchema {
             found: 5,
-            supported: 1
+            supported: 2
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -430,4 +435,157 @@ async fn a_stopped_worker_yields_a_store_error() {
     };
     assert!(store.commit(StoreBatch::new()).await.is_err());
     assert!(store.load_day(date()).await.is_err());
+    assert!(store.last_alive_at().await.is_err());
+    assert!(store.open_segment().await.is_err());
+    assert!(store.load_day_log(date()).await.is_err());
+}
+
+#[tokio::test]
+async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = SqliteStore::open_with(&path, &v1()).unwrap();
+    store.commit(batch_for(&sample_day())).await.unwrap();
+    drop(store);
+    assert_eq!(user_version(&path), 1);
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.load_day(date()).await.unwrap(), Some(sample_day()));
+    assert_eq!(store.last_alive_at().await.unwrap(), None);
+    assert_eq!(store.load_day_log(date()).await.unwrap(), vec![]);
+    drop(store);
+
+    let bak = dir.path().join("nguda.db.v1.bak");
+    assert_eq!(backups(&dir), vec![bak.clone()]);
+    assert_eq!(user_version(&bak), 1);
+    assert!(!has_table(&bak, "day_log"));
+    assert_eq!(user_version(&path), 2);
+    assert!(has_table(&path, "engine_meta"));
+}
+
+#[tokio::test]
+async fn last_alive_round_trips_and_is_overwritten() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.last_alive_at().await.unwrap(), None);
+    store
+        .commit(batch([StoreOp::SetLastAlive { at: ts(1_000) }]))
+        .await
+        .unwrap();
+    assert_eq!(store.last_alive_at().await.unwrap(), Some(ts(1_000)));
+    store
+        .commit(batch([StoreOp::SetLastAlive { at: ts(1_060) }]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.last_alive_at().await.unwrap(), Some(ts(1_060)));
+}
+
+fn recovered(n: u128, at: i64) -> DayLogEntry {
+    DayLogEntry {
+        at: ts(at),
+        kind: DayLogKind::Recovered { item_id: id(n) },
+    }
+}
+
+#[tokio::test]
+async fn day_log_appends_load_in_order_per_day() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    // Appended out of time order: load order is append order.
+    store
+        .commit(batch([
+            StoreOp::AppendDayLog {
+                date: date(),
+                entry: recovered(2, 900),
+            },
+            StoreOp::AppendDayLog {
+                date: date(),
+                entry: recovered(1, 800),
+            },
+        ]))
+        .await
+        .unwrap();
+    store
+        .commit(batch([StoreOp::AppendDayLog {
+            date: date(),
+            entry: recovered(4, 950),
+        }]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store.load_day_log(date()).await.unwrap(),
+        vec![recovered(2, 900), recovered(1, 800), recovered(4, 950)]
+    );
+    assert_eq!(store.load_day_log(other_date()).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn day_log_on_an_unknown_day_rolls_back_the_batch() {
+    let dir = TempDir::new().unwrap();
+    let store = seeded(&db(&dir)).await;
+    store
+        .commit(batch([
+            StoreOp::SetLastAlive { at: ts(1_000) },
+            StoreOp::AppendDayLog {
+                date: other_date(),
+                entry: recovered(1, 900),
+            },
+        ]))
+        .await
+        .unwrap_err();
+    assert_eq!(store.last_alive_at().await.unwrap(), None);
+    assert_eq!(store.load_day_log(other_date()).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn an_unknown_stored_day_log_kind_fails_the_load_without_its_text() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    drop(seeded(&path).await);
+    let raw = Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO day_log (day_date, at, kind, item_id) VALUES (?1, 0, 'from-the-future', NULL)",
+        [date().to_string()],
+    )
+    .unwrap();
+    drop(raw);
+    let store = SqliteStore::open(&path).unwrap();
+    let err = store.load_day_log(date()).await.unwrap_err();
+    assert!(err.message.contains("unknown kind"), "{err}");
+    assert!(!err.message.contains("from-the-future"), "{err}");
+}
+
+#[tokio::test]
+async fn open_segment_is_none_open_or_none_after_close() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.open_segment().await.unwrap(), None);
+
+    // sample_day leaves item 1 running since 500.
+    store.commit(batch_for(&sample_day())).await.unwrap();
+    assert_eq!(
+        store.open_segment().await.unwrap(),
+        Some(OpenSegmentRef {
+            date: date(),
+            item_id: id(1),
+            started_at: ts(500),
+        })
+    );
+
+    store
+        .commit(batch([StoreOp::CloseSegment {
+            item_id: id(1),
+            started_at: ts(500),
+            ended_at: ts(560),
+        }]))
+        .await
+        .unwrap();
+    assert_eq!(store.open_segment().await.unwrap(), None);
 }

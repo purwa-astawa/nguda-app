@@ -1970,6 +1970,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 name = "nguda"
 version = "0.1.0"
 dependencies = [
+ "jiff",
  "nguda-adapters",
  "nguda-core",
  "nguda-engine",
@@ -1991,6 +1992,7 @@ dependencies = [
  "rusqlite_migration",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2007,6 +2009,7 @@ version = "0.1.0"
 dependencies = [
  "nguda-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

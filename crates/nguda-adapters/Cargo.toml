@@ -10,8 +10,9 @@ publish.workspace = true
 nguda-core.workspace = true
 rusqlite.workspace = true
 rusqlite_migration.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
+uuid = { workspace = true, features = ["v7", "std"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }

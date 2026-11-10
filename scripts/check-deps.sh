@@ -74,7 +74,7 @@ rule_no_dependents() {
 }
 
 rule_allow nguda-core jiff uuid
-rule_allow nguda-engine nguda-core tokio
+rule_allow nguda-engine nguda-core tokio tracing
 rule_deny nguda-core tauri rusqlite reqwest hyper
 rule_deny nguda-engine tauri rusqlite reqwest hyper
 rule_deny nguda-adapters tauri

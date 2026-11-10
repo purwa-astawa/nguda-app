@@ -42,9 +42,28 @@ CREATE UNIQUE INDEX time_segment_single_open
     ON time_segment ((ended_at IS NULL)) WHERE ended_at IS NULL;
 "#;
 
+/// v2: the engine heartbeat (one row) and the append-only day log. `kind` has no
+/// CHECK, so later kinds need no table rebuild; the adapter rejects unknown ones.
+const V2: &str = r#"
+CREATE TABLE engine_meta (
+    id            INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+    last_alive_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE day_log (
+    id       INTEGER PRIMARY KEY,
+    day_date TEXT NOT NULL REFERENCES day (date),
+    at       INTEGER NOT NULL,
+    kind     TEXT NOT NULL,
+    item_id  TEXT REFERENCES plan_item (id)
+) STRICT;
+
+CREATE INDEX day_log_day_date ON day_log (day_date);
+"#;
+
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1)])
+    Migrations::new(vec![M::up(V1), M::up(V2)])
 }
 
 #[cfg(test)]
