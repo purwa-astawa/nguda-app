@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use jiff::Timestamp;
 
-use crate::clock::Clock;
+use crate::clock::{Clock, SleepFuture};
 
 /// A settable clock, in whole seconds since the Unix epoch.
 pub(crate) struct FakeClock(AtomicI64);
@@ -26,5 +26,10 @@ impl FakeClock {
 impl Clock for FakeClock {
     fn now(&self) -> Timestamp {
         Self::ts(self.0.load(Ordering::SeqCst))
+    }
+
+    /// Never completes: core tests have no deadlines.
+    fn sleep_until(&self, _deadline: Timestamp) -> SleepFuture {
+        Box::pin(std::future::pending())
     }
 }

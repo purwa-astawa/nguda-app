@@ -193,6 +193,7 @@ mod tests {
                 segment_started_at: Timestamp::from_second(secs).unwrap(),
                 accumulated_secs: 0,
             }),
+            ..Default::default()
         }
     }
 

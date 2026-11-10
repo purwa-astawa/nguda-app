@@ -14,8 +14,8 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use nguda_core::{
-    Date, Day, ItemId, ItemStatus, OrderKey, PlanItem, PlanItemRecord, Segment, Store, StoreBatch,
-    StoreError, StoreFuture, StoreOp, Timestamp, Uuid,
+    Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OpenSegmentRef, OrderKey, PlanItem,
+    PlanItemRecord, Segment, Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use rusqlite_migration::{Migrations, SchemaVersion};
@@ -60,6 +60,9 @@ impl From<rusqlite::Error> for OpenError {
 enum Request {
     Commit(StoreBatch, oneshot::Sender<Result<(), StoreError>>),
     LoadDay(Date, oneshot::Sender<Result<Option<Day>, StoreError>>),
+    LastAliveAt(oneshot::Sender<Result<Option<Timestamp>, StoreError>>),
+    OpenSegment(oneshot::Sender<Result<Option<OpenSegmentRef>, StoreError>>),
+    LoadDayLog(Date, oneshot::Sender<Result<Vec<DayLogEntry>, StoreError>>),
 }
 
 /// The SQLite implementation of the [`Store`] port.
@@ -125,6 +128,21 @@ impl Store for SqliteStore {
     fn load_day(&self, date: Date) -> StoreFuture<Option<Day>> {
         let (tx, rx) = oneshot::channel();
         self.call(Request::LoadDay(date, tx), rx)
+    }
+
+    fn last_alive_at(&self) -> StoreFuture<Option<Timestamp>> {
+        let (tx, rx) = oneshot::channel();
+        self.call(Request::LastAliveAt(tx), rx)
+    }
+
+    fn open_segment(&self) -> StoreFuture<Option<OpenSegmentRef>> {
+        let (tx, rx) = oneshot::channel();
+        self.call(Request::OpenSegment(tx), rx)
+    }
+
+    fn load_day_log(&self, date: Date) -> StoreFuture<Vec<DayLogEntry>> {
+        let (tx, rx) = oneshot::channel();
+        self.call(Request::LoadDayLog(date, tx), rx)
     }
 }
 
@@ -220,6 +238,15 @@ fn serve(mut conn: Connection, rx: mpsc::Receiver<Request>) {
             }
             Request::LoadDay(date, reply) => {
                 let _ = reply.send(load_day(&conn, date));
+            }
+            Request::LastAliveAt(reply) => {
+                let _ = reply.send(last_alive_at(&conn));
+            }
+            Request::OpenSegment(reply) => {
+                let _ = reply.send(open_segment(&conn));
+            }
+            Request::LoadDayLog(date, reply) => {
+                let _ = reply.send(load_day_log(&conn, date));
             }
         }
     }
@@ -327,8 +354,114 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                 return Err(StoreError::new(format!("{ctx}: no such open segment")));
             }
         }
+        StoreOp::SetLastAlive { at } => {
+            let ctx = "set last alive";
+            tx.execute(
+                "INSERT INTO engine_meta (id, last_alive_at) VALUES (1, ?1)
+                 ON CONFLICT (id) DO UPDATE SET last_alive_at = excluded.last_alive_at",
+                [to_nanos(*at, ctx)?],
+            )
+            .map_err(sql_err(ctx))?;
+        }
+        StoreOp::AppendDayLog { date, entry } => {
+            let ctx = format!("append day log for {date}");
+            let (kind, item_id) = match &entry.kind {
+                DayLogKind::Recovered { item_id } => (KIND_RECOVERED, Some(item_id.to_string())),
+            };
+            tx.execute(
+                "INSERT INTO day_log (day_date, at, kind, item_id) VALUES (?1, ?2, ?3, ?4)",
+                params![date.to_string(), to_nanos(entry.at, &ctx)?, kind, item_id],
+            )
+            .map_err(sql_err(&ctx))?;
+        }
     }
     Ok(())
+}
+
+/// Stored `day_log.kind` values.
+const KIND_RECOVERED: &str = "recovered";
+
+fn last_alive_at(conn: &Connection) -> Result<Option<Timestamp>, StoreError> {
+    let ctx = "load last alive";
+    conn.query_row(
+        "SELECT last_alive_at FROM engine_meta WHERE id = 1",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(sql_err(ctx))?
+    .map(|n| from_nanos(n, ctx))
+    .transpose()
+}
+
+fn open_segment(conn: &Connection) -> Result<Option<OpenSegmentRef>, StoreError> {
+    let ctx = "load open segment";
+    let Some((date, item_id, started_at)) = conn
+        .query_row(
+            "SELECT p.day_date, s.item_id, s.started_at
+             FROM time_segment s JOIN plan_item p ON p.id = s.item_id
+             WHERE s.ended_at IS NULL",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_err(ctx))?
+    else {
+        return Ok(None);
+    };
+    let item_id = parse_id(&item_id)?;
+    let ctx = format!("open segment for item {item_id}");
+    let date = date
+        .parse::<Date>()
+        .map_err(|_| StoreError::new(format!("{ctx}: invalid stored date")))?;
+    Ok(Some(OpenSegmentRef {
+        date,
+        item_id,
+        started_at: from_nanos(started_at, &ctx)?,
+    }))
+}
+
+fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, StoreError> {
+    let ctx = format!("load day log {date}");
+    let mut stmt = conn
+        .prepare("SELECT id, at, kind, item_id FROM day_log WHERE day_date = ?1 ORDER BY id")
+        .map_err(sql_err(&ctx))?;
+    let rows = stmt
+        .query_map([date.to_string()], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(sql_err(&ctx))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_err(&ctx))?;
+    rows.into_iter()
+        .map(|(row_id, at, kind, item_id)| {
+            let ctx = format!("day log entry {row_id}");
+            let kind = match (kind.as_str(), item_id) {
+                (KIND_RECOVERED, Some(item_id)) => DayLogKind::Recovered {
+                    item_id: parse_id(&item_id)?,
+                },
+                (KIND_RECOVERED, None) => {
+                    return Err(StoreError::new(format!("{ctx}: missing item id")));
+                }
+                _ => return Err(StoreError::new(format!("{ctx}: unknown kind"))),
+            };
+            Ok(DayLogEntry {
+                at: from_nanos(at, &ctx)?,
+                kind,
+            })
+        })
+        .collect()
 }
 
 /// One plan-item row before its segments are attached.

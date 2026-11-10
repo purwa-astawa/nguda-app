@@ -1,4 +1,5 @@
-//! The store port: atomic write batches and day loads (AD-2, AD-3, AD-6).
+//! The store port: atomic write batches, day loads, and the engine's recovery reads
+//! (AD-2, AD-3, AD-6).
 //!
 //! The future type is std-only so core stays free of any async runtime (AD-1).
 
@@ -9,6 +10,7 @@ use std::pin::Pin;
 use jiff::Timestamp;
 use jiff::civil::Date;
 
+use crate::day_log::DayLogEntry;
 use crate::plan::{Day, ItemId, PlanItem};
 
 /// One write in a [`StoreBatch`].
@@ -31,6 +33,18 @@ pub enum StoreOp {
         started_at: Timestamp,
         ended_at: Timestamp,
     },
+    /// Records the engine heartbeat, replacing any earlier value (AD-6).
+    SetLastAlive { at: Timestamp },
+    /// Appends `entry` to the stored day `date`'s log.
+    AppendDayLog { date: Date, entry: DayLogEntry },
+}
+
+/// Where the one open segment is: its item's day, the item, and its start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenSegmentRef {
+    pub date: Date,
+    pub item_id: ItemId,
+    pub started_at: Timestamp,
 }
 
 /// Writes committed together, in order, as one transaction: all or nothing.
@@ -87,4 +101,13 @@ pub trait Store: Send + Sync + 'static {
 
     /// The stored day with its items and segments, or `None` if no such day exists.
     fn load_day(&self, date: Date) -> StoreFuture<Option<Day>>;
+
+    /// The last recorded engine heartbeat, or `None` if none was ever written.
+    fn last_alive_at(&self) -> StoreFuture<Option<Timestamp>>;
+
+    /// The open segment, on any day, or `None` if every segment is closed.
+    fn open_segment(&self) -> StoreFuture<Option<OpenSegmentRef>>;
+
+    /// The day's log entries in append order. Empty for an unknown day.
+    fn load_day_log(&self, date: Date) -> StoreFuture<Vec<DayLogEntry>>;
 }

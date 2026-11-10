@@ -10,10 +10,13 @@ mod tray;
 
 use std::sync::Arc;
 
-use nguda_adapters::SystemClock;
-use nguda_core::Clock;
-use nguda_engine::EngineHandle;
+use nguda_adapters::{SqliteStore, SystemClock, UuidV7Ids};
+use nguda_core::{Clock, Store, TimeZone};
+use nguda_engine::{EngineDeps, EngineHandle};
 use tauri::Manager;
+
+/// The database file, in the app data directory.
+const DB_FILE: &str = "nguda.sqlite3";
 
 pub use ipc::specta_builder;
 
@@ -32,10 +35,19 @@ pub fn run() {
             builder.mount_events(app);
 
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let store: Arc<dyn Store> = Arc::new(open_store(app));
+            let deps = EngineDeps {
+                clock: clock.clone(),
+                store,
+                ids: Arc::new(UuidV7Ids),
+                tz: system_time_zone(),
+            };
             // `nguda_engine::spawn` uses `tokio::spawn`, so enter Tauri's runtime first.
-            let engine = {
+            // The effect receiver has no consumer until the notifier lands, so it is
+            // dropped; the engine ignores a closed effect channel.
+            let (engine, _effects) = {
                 let _guard = tauri::async_runtime::handle().inner().enter();
-                nguda_engine::spawn(clock.clone())
+                nguda_engine::spawn(deps)
             };
             let snapshots = engine.subscribe();
             app.manage::<EngineHandle>(engine);
@@ -62,6 +74,41 @@ pub fn run() {
         Err(e) => {
             eprintln!("nguda: failed to start: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// Opens (creating and migrating) `<app_data_dir>/nguda.sqlite3`, or exits: the app
+/// cannot run without its store (AD-12).
+fn open_store(app: &tauri::App) -> SqliteStore {
+    let dir = match app.path().app_data_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("nguda: no app data directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("nguda: cannot create {}: {e}", dir.display());
+        std::process::exit(1);
+    }
+    let path = dir.join(DB_FILE);
+    match SqliteStore::open(&path) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("nguda: cannot open {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The system zone, or UTC when it cannot be determined.
+fn system_time_zone() -> TimeZone {
+    match jiff::tz::TimeZone::try_system() {
+        Ok(tz) => tz,
+        Err(e) => {
+            eprintln!("nguda: cannot determine the system time zone, using UTC: {e}");
+            TimeZone::UTC
         }
     }
 }
