@@ -7,9 +7,15 @@
 //! out as [`Effect`]s. It holds no `Mutex` and runs no per-second tick: it waits on
 //! one deadline through [`Clock::sleep_until`], and rendering the ticking elapsed
 //! time is the subscriber's job (AD-11).
+//!
+//! Plan commands are targeted (AD-15): each item command names its `item_id`, and
+//! those whose meaning depends on the current state also carry the `expected_rev`
+//! of the snapshot the sender rendered. A stale rev, invalid input, or a domain
+//! error applies nothing and sets the [`StatusKey::CommandRejected`] status.
 
 mod actor;
 mod batch;
+mod commands;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -19,20 +25,56 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nguda_core::{Clock, Day, IdGen, ItemId, Running, Store, TimeZone};
+use nguda_core::{Clock, Day, IdGen, ItemId, Running, Store, TimeZone, Timestamp};
 use tokio::sync::{mpsc, watch};
-
-/// Title of the hard-coded tracer-bullet task.
-pub const DEMO_TITLE: &str = "Demo";
 
 /// How often the engine records `last_alive_at` for crash recovery (AD-6).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 
 /// Every input to the engine.
+///
+/// Messages may carry task titles, so they are never logged or `Debug`-printed
+/// outside tests (AD-14).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineMsg {
-    /// Start the demo task now, restarting its segment if it is already running.
-    StartDemo,
+    /// Adds a pending flexible item after the last flexible one. The title must not
+    /// be blank and `planned_secs` must be positive.
+    CreateTask { title: String, planned_secs: u64 },
+    /// Changes the title and/or planned length of a non-removed item. `None` keeps
+    /// the current value.
+    EditTask {
+        item_id: ItemId,
+        title: Option<String>,
+        planned_secs: Option<u64>,
+    },
+    /// Moves a flexible item next to another flexible item.
+    ReorderTask {
+        item_id: ItemId,
+        anchor: ReorderAnchor,
+        expected_rev: u64,
+    },
+    /// Pins a flexible item at `pinned_start` (required), or makes a fixed item
+    /// flexible again (`pinned_start` is then ignored).
+    ToggleFixed {
+        item_id: ItemId,
+        pinned_start: Option<Timestamp>,
+        expected_rev: u64,
+    },
+    /// Tombstones a pending, paused, done, or carried-over item and logs it (AD-6).
+    RemoveTask { item_id: ItemId },
+    /// Starts a pending item or resumes a paused one now, pausing any other running
+    /// item first. Already running: no change.
+    Start { item_id: ItemId, expected_rev: u64 },
+    /// Pauses the running item now.
+    Pause { item_id: ItemId },
+}
+
+/// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
+/// flexible item. Never a numeric index (AD-15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReorderAnchor {
+    Before(ItemId),
+    After(ItemId),
 }
 
 /// Who owns a status entry. Each owner sets or clears only its own key (AD-14).
@@ -40,6 +82,9 @@ pub enum EngineMsg {
 pub enum StatusKey {
     /// The last store request failed.
     Store,
+    /// The last command was rejected (stale rev, invalid input, or a domain rule).
+    /// Cleared by the next command that passes validation.
+    CommandRejected,
 }
 
 /// One problem the user should see. At most one entry per key.

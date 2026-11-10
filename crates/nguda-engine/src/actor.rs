@@ -8,19 +8,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use nguda_core::{
-    Clock, Date, Day, DayLogEntry, DayLogKind, DomainError, IdGen, ItemId, ItemStatus,
-    OpenSegmentRef, OrderKey, PlanItem, Running, Store, StoreBatch, StoreError, StoreOp, TimeZone,
-    Timestamp,
+    Clock, Date, Day, DayLogEntry, DayLogKind, IdGen, OpenSegmentRef, PlanItem, Running, Store,
+    StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::batch::diff;
-use crate::{
-    DEMO_TITLE, Effect, EngineDeps, EngineMsg, HEARTBEAT_EVERY, Snapshot, StatusEntry, StatusKey,
-};
-
-/// The demo item's planned length.
-const DEMO_PLANNED_SECS: u64 = 25 * 60;
+use crate::commands::{self, domain_kind};
+use crate::{Effect, EngineDeps, EngineMsg, HEARTBEAT_EVERY, Snapshot, StatusEntry, StatusKey};
 
 pub(crate) async fn run(
     deps: EngineDeps,
@@ -187,32 +182,50 @@ impl Actor {
         next
     }
 
+    /// One command: rev check, validate and apply on a copy, commit `diff + extras`
+    /// unless the day is unchanged, then swap. A rejection sets `CommandRejected`;
+    /// anything that passes validation clears it. Publishes when the day or the
+    /// status changed, and always on a rejection.
     async fn handle(&mut self, msg: EngineMsg) {
         let status_before = self.status.clone();
-        let changed = match msg {
-            EngineMsg::StartDemo => self.start_demo().await,
+        let name = commands::name(&msg);
+        let item_id = commands::target(&msg);
+        let now = self.clock.now();
+        let mut next = self.day.clone();
+        let changed = match commands::apply(msg, &mut next, now, self.ids.as_ref(), self.rev) {
+            Err(reject) => {
+                match item_id {
+                    Some(item_id) => tracing::warn!(
+                        command = name,
+                        %item_id,
+                        kind = reject.kind(),
+                        "command rejected"
+                    ),
+                    None => {
+                        tracing::warn!(command = name, kind = reject.kind(), "command rejected");
+                    }
+                }
+                self.status
+                    .insert(StatusKey::CommandRejected, reject.to_string());
+                self.publish();
+                return;
+            }
+            Ok(extras) => {
+                self.status.remove(&StatusKey::CommandRejected);
+                if next == self.day {
+                    false
+                } else {
+                    let mut batch = diff(&self.day, &next);
+                    for op in extras {
+                        batch.push(op);
+                    }
+                    self.swap_after_commit(next, batch).await
+                }
+            }
         };
         if changed || self.status != status_before {
             self.publish();
         }
-    }
-
-    async fn start_demo(&mut self) -> bool {
-        let now = self.clock.now();
-        let mut next = self.day.clone();
-        if let Err(e) = start_demo_on(&mut next, self.ids.as_ref(), now) {
-            tracing::warn!(
-                msg = "StartDemo",
-                kind = domain_kind(&e),
-                "message rejected"
-            );
-            return false;
-        }
-        if next == self.day {
-            return false;
-        }
-        let batch = diff(&self.day, &next);
-        self.swap_after_commit(next, batch).await
     }
 
     /// Commits `batch`, then swaps `next` in. On failure the old state stays.
@@ -280,55 +293,6 @@ impl Actor {
     }
 }
 
-/// StartDemo on `day`: find or add the demo item, pause any other running item,
-/// then restart the demo's segment at `now` (pause+resume from Running, resume from
-/// Paused, start from Pending). A demo already restarted at `now` is left as is. On
-/// error `day` may be half-changed: callers pass a
-/// copy and drop it.
-pub(crate) fn start_demo_on(
-    day: &mut Day,
-    ids: &dyn IdGen,
-    now: Timestamp,
-) -> Result<(), DomainError> {
-    let demo = match day.items().iter().find(|i| i.title() == DEMO_TITLE) {
-        Some(item) => item.id(),
-        None => {
-            let id = ids.new_item_id();
-            let order = OrderKey::between(None, None)?;
-            day.add(PlanItem::new(id, DEMO_TITLE, DEMO_PLANNED_SECS, order))?;
-            id
-        }
-    };
-    let others: Vec<ItemId> = day
-        .items()
-        .iter()
-        .filter(|i| i.id() != demo && i.status() == ItemStatus::Running)
-        .map(PlanItem::id)
-        .collect();
-    for id in others {
-        day.pause(id, now)?;
-    }
-    let item = day.item(demo);
-    match item.map(PlanItem::status) {
-        // Restarting at the instant it started changes nothing, and a zero-length
-        // segment beside a new one at the same start would collide in the store.
-        Some(ItemStatus::Running)
-            if item
-                .and_then(PlanItem::running_view)
-                .map(|r| r.segment_started_at)
-                == Some(now) =>
-        {
-            Ok(())
-        }
-        Some(ItemStatus::Running) => {
-            day.pause(demo, now)?;
-            day.resume(demo, now)
-        }
-        Some(ItemStatus::Paused) => day.resume(demo, now),
-        _ => day.start(demo, now),
-    }
-}
-
 /// The first item that is running.
 fn running_of(day: &Day) -> Option<Running> {
     day.items().iter().find_map(PlanItem::running_view)
@@ -345,16 +309,4 @@ fn tz_name(tz: &TimeZone) -> String {
 
 fn deadline_after(now: Timestamp) -> Timestamp {
     now.checked_add(HEARTBEAT_EVERY).unwrap_or(Timestamp::MAX)
-}
-
-/// A domain error's kind, for logs: never its ids' titles or a `Debug` dump.
-fn domain_kind(e: &DomainError) -> &'static str {
-    match e {
-        DomainError::AnotherItemRunning => "another_item_running",
-        DomainError::InvalidTransition { .. } => "invalid_transition",
-        DomainError::InvalidOrder => "invalid_order",
-        DomainError::UnknownItem(_) => "unknown_item",
-        DomainError::DuplicateItem(_) => "duplicate_item",
-        DomainError::InvalidRecord { .. } => "invalid_record",
-    }
 }

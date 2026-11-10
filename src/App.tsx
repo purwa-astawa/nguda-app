@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { commands, events, type SnapshotEvent_Serialize } from "./bindings";
+import { events, type SnapshotEvent_Serialize } from "./bindings";
 
-// Thin view (AD-5): it sends commands and shows the last snapshot, nothing more.
+// Thin view (AD-5): it shows the last snapshot, nothing more. The plan view and its
+// commands arrive with the window story.
 function App() {
   const [snapshot, setSnapshot] = useState<SnapshotEvent_Serialize | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const unlisten = events.snapshotEvent.listen((e) => setSnapshot(e.payload));
@@ -13,23 +13,14 @@ function App() {
     };
   }, []);
 
-  async function startDemo() {
-    const result = await commands.startDemo();
-    setError(result.status === "error" ? result.error : null);
-  }
-
   return (
     <main>
       <h1>nguda</h1>
-      <button type="button" onClick={startDemo}>
-        Start demo
-      </button>
       <p>
         {snapshot
           ? `rev ${snapshot.rev} · ${snapshot.running?.title ?? "idle"}`
           : "No snapshot yet"}
       </p>
-      {error && <p role="alert">{error}</p>}
     </main>
   );
 }
