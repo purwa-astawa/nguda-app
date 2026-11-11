@@ -315,8 +315,8 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                 .execute(
                     r#"INSERT INTO plan_item
                          (id, day_date, title, planned_secs, "order", fixed, pinned_start,
-                          status, removed_at)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                          status, removed_at, carried_from)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                        ON CONFLICT (id) DO UPDATE SET
                          title = excluded.title,
                          planned_secs = excluded.planned_secs,
@@ -324,7 +324,8 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                          fixed = excluded.fixed,
                          pinned_start = excluded.pinned_start,
                          status = excluded.status,
-                         removed_at = excluded.removed_at
+                         removed_at = excluded.removed_at,
+                         carried_from = excluded.carried_from
                        WHERE day_date = excluded.day_date"#,
                     params![
                         id.to_string(),
@@ -338,6 +339,7 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                         item.pinned_start().map(|t| to_nanos(t, &ctx)).transpose()?,
                         status_str(item.status()),
                         item.removed_at().map(|t| to_nanos(t, &ctx)).transpose()?,
+                        item.carried_from().map(|id| id.to_string()),
                     ],
                 )
                 .map_err(sql_err(&ctx))?;
@@ -400,6 +402,9 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                     (KIND_EXTENDED, item_id, None, Some(secs))
                 }
                 DayLogKind::Inserted { item_id } => (KIND_INSERTED, item_id, None, None),
+                DayLogKind::CarriedOver { item_id, to } => {
+                    (KIND_CARRIED_OVER, item_id, Some(*to), None)
+                }
             };
             tx.execute(
                 "INSERT INTO day_log (day_date, at, kind, item_id, to_item_id, secs)
@@ -476,6 +481,7 @@ const KIND_REMOVED: &str = "removed";
 const KIND_SWITCHED: &str = "switched";
 const KIND_EXTENDED: &str = "extended";
 const KIND_INSERTED: &str = "inserted";
+const KIND_CARRIED_OVER: &str = "carried_over";
 
 fn last_alive_at(conn: &Connection) -> Result<Option<Timestamp>, StoreError> {
     let ctx = "load last alive";
@@ -568,8 +574,17 @@ fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, Store
                 (KIND_INSERTED, Some(item_id)) => DayLogKind::Inserted {
                     item_id: parse_id(&item_id)?,
                 },
+                (KIND_CARRIED_OVER, Some(item_id)) => DayLogKind::CarriedOver {
+                    item_id: parse_id(&item_id)?,
+                    to: to_item_id
+                        .as_deref()
+                        .map(parse_id)
+                        .transpose()?
+                        .ok_or_else(|| StoreError::new(format!("{ctx}: missing to_item_id")))?,
+                },
                 (
-                    KIND_RECOVERED | KIND_REMOVED | KIND_SWITCHED | KIND_EXTENDED | KIND_INSERTED,
+                    KIND_RECOVERED | KIND_REMOVED | KIND_SWITCHED | KIND_EXTENDED | KIND_INSERTED
+                    | KIND_CARRIED_OVER,
                     None,
                 ) => {
                     return Err(StoreError::new(format!("{ctx}: missing item id")));
@@ -594,6 +609,7 @@ struct ItemRow {
     pinned_start: Option<i64>,
     status: String,
     removed_at: Option<i64>,
+    carried_from: Option<String>,
 }
 
 fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
@@ -611,7 +627,8 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
 
     let rows = query_all(
         conn,
-        r#"SELECT id, title, planned_secs, "order", fixed, pinned_start, status, removed_at
+        r#"SELECT id, title, planned_secs, "order", fixed, pinned_start, status, removed_at,
+                  carried_from
            FROM plan_item WHERE day_date = ?1 ORDER BY rowid"#,
         [&date_text],
         &ctx,
@@ -625,6 +642,7 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
                 pinned_start: r.get(5)?,
                 status: r.get(6)?,
                 removed_at: r.get(7)?,
+                carried_from: r.get(8)?,
             })
         },
     )?;
@@ -691,6 +709,7 @@ fn restore_item(id: ItemId, row: ItemRow, segments: Vec<Segment>) -> Result<Plan
         status: parse_status(&row.status).ok_or_else(|| bad("status"))?,
         removed_at: row.removed_at.map(|n| from_nanos(n, &ctx)).transpose()?,
         segments,
+        carried_from: row.carried_from.as_deref().map(parse_id).transpose()?,
     };
     PlanItem::restore(record).map_err(|e| StoreError::new(e.to_string()))
 }

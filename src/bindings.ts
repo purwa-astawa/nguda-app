@@ -31,6 +31,11 @@ export const commands = {
 	 */
 	setWorkEnd: (minutes: number) => typedError<null, string>(__TAURI_INVOKE("set_work_end", { minutes })),
 	/**
+	 *  Carries the leftovers the snapshot at `expected_rev` lists as overflow over to
+	 *  tomorrow (AD-6). The engine rejects a stale rev or an empty list.
+	 */
+	carryOverToTomorrow: (expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("carry_over_to_tomorrow", { expectedRev })),
+	/**
 	 *  The latest snapshot, read from the engine's `watch` receiver. Sends nothing to
 	 *  the engine (AD-4), so a window that loads after the last event still renders.
 	 */

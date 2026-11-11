@@ -9,7 +9,7 @@ use std::fmt;
 
 use nguda_core::{
     Day, DayLogEntry, DayLogKind, DomainError, IdGen, ItemId, ItemStatus, OrderKey, PlanItem,
-    StoreOp, Timestamp, WorkEnd,
+    StoreOp, Timestamp, WorkEnd, closed_secs,
 };
 
 use crate::{EngineMsg, InsertAnchor, ReorderAnchor};
@@ -42,7 +42,7 @@ impl Reject {
         }
     }
 
-    fn invalid(command: &'static str, reason: impl Into<String>) -> Self {
+    pub(crate) fn invalid(command: &'static str, reason: impl Into<String>) -> Self {
         Self::Invalid {
             command,
             reason: reason.into(),
@@ -87,6 +87,7 @@ const SWITCH: &str = "Switch";
 const EXTEND_TASK: &str = "ExtendTask";
 const INSERT_TASK: &str = "InsertTask";
 const SET_WORK_END: &str = "SetWorkEnd";
+pub(crate) const CARRY_OVER: &str = "CarryOverToTomorrow";
 
 /// The message's name, for logs and reject messages.
 pub(crate) fn name(msg: &EngineMsg) -> &'static str {
@@ -102,13 +103,16 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::ExtendTask { .. } => EXTEND_TASK,
         EngineMsg::InsertTask { .. } => INSERT_TASK,
         EngineMsg::SetWorkEnd { .. } => SET_WORK_END,
+        EngineMsg::CarryOverToTomorrow { .. } => CARRY_OVER,
     }
 }
 
 /// The item a message targets, for logs.
 pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
     match msg {
-        EngineMsg::CreateTask { .. } | EngineMsg::SetWorkEnd { .. } => None,
+        EngineMsg::CreateTask { .. }
+        | EngineMsg::SetWorkEnd { .. }
+        | EngineMsg::CarryOverToTomorrow { .. } => None,
         EngineMsg::InsertTask { anchor, .. } => match anchor {
             InsertAnchor::After(id) | InsertAnchor::Before(id) => Some(*id),
             InsertAnchor::Now | InsertAnchor::End => None,
@@ -204,6 +208,10 @@ pub(crate) fn apply(
             insert_task(day, now, ids, title, planned_secs, anchor)
         }
         EngineMsg::SetWorkEnd { minutes } => set_work_end(work_end, minutes),
+        // The actor routes it to `carry_over` with tomorrow's day loaded.
+        EngineMsg::CarryOverToTomorrow { .. } => {
+            Err(Reject::invalid(CARRY_OVER, "needs tomorrow's day"))
+        }
     }
 }
 
@@ -585,6 +593,58 @@ fn insert_task(
     }])
 }
 
+/// Carries each of `items` (in that order) over from `today` to `tomorrow` (AD-6):
+/// the original turns `carried_over` and stays on its day, and a fresh flexible,
+/// pending item with the same title and the original's remaining time
+/// (`planned_secs − closed segments`, at least 60 s) is added after tomorrow's
+/// last flexible item, linked by `carried_from`. Returns one `CarriedOver` entry
+/// per item, logged on today. An empty list is invalid input; an item that is not
+/// pending or paused is a domain reject.
+pub(crate) fn carry_over(
+    today: &mut Day,
+    tomorrow: &mut Day,
+    items: &[ItemId],
+    ids: &dyn IdGen,
+    now: Timestamp,
+) -> Result<Vec<StoreOp>, Reject> {
+    const CMD: &str = CARRY_OVER;
+    /// The shortest carried item, so a nearly done leftover still gets a slot.
+    const MIN_SECS: u64 = 60;
+    if items.is_empty() {
+        return Err(Reject::invalid(CMD, "nothing to carry over"));
+    }
+    let mut last = flexible_in_order(tomorrow)
+        .last()
+        .map(|i| i.order().clone());
+    let mut ops = Vec::with_capacity(items.len());
+    for &item_id in items {
+        let item = today
+            .item(item_id)
+            .ok_or(DomainError::UnknownItem(item_id))
+            .map_err(domain(CMD))?;
+        let title = item.title().to_owned();
+        let left = item
+            .planned_secs()
+            .saturating_sub(closed_secs(item.segments()))
+            .max(MIN_SECS);
+        today.carry_over(item_id).map_err(domain(CMD))?;
+        let order = OrderKey::between(last.as_ref(), None).map_err(domain(CMD))?;
+        let to = ids.new_item_id();
+        tomorrow
+            .add(PlanItem::carried(to, title, left, order.clone(), item_id))
+            .map_err(domain(CMD))?;
+        last = Some(order);
+        ops.push(StoreOp::AppendDayLog {
+            date: today.date(),
+            entry: DayLogEntry {
+                at: now,
+                kind: DayLogKind::CarriedOver { item_id, to },
+            },
+        });
+    }
+    Ok(ops)
+}
+
 #[cfg(test)]
 mod tests {
     use nguda_core::Date;
@@ -779,5 +839,68 @@ mod tests {
             Ok(vec![StoreOp::SetWorkEnd { work_end: late }])
         );
         assert_eq!(we, late);
+    }
+
+    #[test]
+    fn carry_over_marks_originals_and_appends_linked_items_tomorrow() {
+        let ids = SeqIds::default();
+        let mut today = abc();
+        // 100 paused with 200 s done; 101 pending.
+        today.start(id(100), ts(0)).unwrap();
+        today.pause(id(100), ts(200)).unwrap();
+        let mut tomorrow = Day::new(Date::constant(1970, 1, 2), "UTC");
+        tomorrow
+            .add(PlanItem::new(id(50), "x", 60, key("V")))
+            .unwrap();
+        let ops = carry_over(&mut today, &mut tomorrow, &[id(101), id(100)], &ids, ts(9)).unwrap();
+        for n in [100, 101] {
+            assert_eq!(today.item(id(n)).unwrap().status(), ItemStatus::CarriedOver);
+        }
+        let (b, a) = (tomorrow.item(id(1)).unwrap(), tomorrow.item(id(2)).unwrap());
+        assert_eq!(
+            (b.title(), b.planned_secs(), b.carried_from()),
+            ("t101", 600, Some(id(101)))
+        );
+        assert_eq!(
+            (a.title(), a.planned_secs(), a.carried_from()),
+            ("t100", 400, Some(id(100)))
+        );
+        assert_eq!(order_of(&tomorrow), vec![id(50), id(1), id(2)]);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            ops[0],
+            StoreOp::AppendDayLog {
+                date: today.date(),
+                entry: DayLogEntry {
+                    at: ts(9),
+                    kind: DayLogKind::CarriedOver {
+                        item_id: id(101),
+                        to: id(1),
+                    },
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn carry_over_keeps_at_least_a_minute_and_rejects_empty_or_running() {
+        let ids = SeqIds::default();
+        let mut today = abc();
+        today.start(id(100), ts(0)).unwrap();
+        today.pause(id(100), ts(10_000)).unwrap();
+        let mut tomorrow = Day::new(Date::constant(1970, 1, 2), "UTC");
+        carry_over(&mut today, &mut tomorrow, &[id(100)], &ids, ts(9)).unwrap();
+        assert_eq!(tomorrow.item(id(1)).unwrap().planned_secs(), 60);
+
+        let empty = carry_over(&mut abc(), &mut tomorrow.clone(), &[], &ids, ts(9)).unwrap_err();
+        assert_eq!(
+            empty.to_string(),
+            "CarryOverToTomorrow: nothing to carry over"
+        );
+        let mut running = abc();
+        running.start(id(101), ts(0)).unwrap();
+        let err =
+            carry_over(&mut running, &mut tomorrow.clone(), &[id(101)], &ids, ts(9)).unwrap_err();
+        assert_eq!(err.kind(), "invalid_transition");
     }
 }

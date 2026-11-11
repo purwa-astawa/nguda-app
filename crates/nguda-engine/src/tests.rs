@@ -2005,3 +2005,265 @@ async fn a_failed_settings_load_uses_the_default_with_store_status() {
     assert_eq!(snap.work_end, WorkEnd::DEFAULT);
     assert_eq!(snap.status, store_status());
 }
+
+// --- Carry-over and midnight rollover ---
+
+/// Midnight between day 1 and day 2 (UTC).
+const MIDNIGHT: i64 = DAY_SECS;
+
+fn carry(expected_rev: u64) -> EngineMsg {
+    EngineMsg::CarryOverToTomorrow { expected_rev }
+}
+
+fn carried_at(n: u128, to: u128, at: i64) -> DayLogEntry {
+    DayLogEntry {
+        at: ts(at),
+        kind: DayLogKind::CarriedOver {
+            item_id: id(n),
+            to: id(to),
+        },
+    }
+}
+
+/// `day` (A 100 then `rest`) seeded, A started at 16:00 at rev 2.
+async fn a_started_at_four(day: &Day) -> (Harness, Arc<MemoryStore>) {
+    let (mut h, store) = running_on(FOUR_PM, Some(day)).await;
+    h.send(start_msg(100, 1));
+    h.rev(2).await;
+    (h, store)
+}
+
+/// A (100, 45 min) running from 16:00 at rev 2, then B (101, 40 min) and C (102,
+/// 30 min) pending, ending 17:25 and 17:55: overflow [B, C], episode prompt 1.
+/// Today's zone is `tz`.
+async fn leftovers(tz: &str) -> (Harness, Arc<MemoryStore>) {
+    let mut day = Day::new(day1(), tz);
+    day.add(PlanItem::new(id(100), "A", 2_700, key("U")))
+        .unwrap();
+    day.add(PlanItem::new(id(101), "B", 2_400, key("V")))
+        .unwrap();
+    day.add(PlanItem::new(id(102), "C", 1_800, key("W")))
+        .unwrap();
+    let (mut h, store) = a_started_at_four(&day).await;
+    assert_eq!(h.rx.borrow().overflow, vec![id(101), id(102)]);
+    assert_eq!(h.next_effect().await, notify_overflow(1, 101));
+    (h, store)
+}
+
+#[tokio::test]
+async fn carry_over_moves_the_leftovers_to_a_new_tomorrow_in_one_batch() {
+    let (mut h, store) = leftovers("Europe/Berlin").await;
+    let batches = store.batches().len();
+    h.send(carry(2));
+    let snap = h.rev(3).await;
+    let today = day_of(&snap);
+    for n in [101, 102] {
+        assert_eq!(today.item(id(n)).unwrap().status(), ItemStatus::CarriedOver);
+    }
+    assert_eq!(today.item(id(100)).unwrap().status(), ItemStatus::Running);
+    assert_eq!(rejected(&snap), None);
+
+    let tomorrow = store.stored_day(day2()).unwrap();
+    assert_eq!(tomorrow.tz(), "Europe/Berlin");
+    let new: Vec<_> = [1, 2].map(|n| tomorrow.item(id(n)).unwrap().clone()).into();
+    assert_eq!(tomorrow.items().len(), 2);
+    for (item, (title, secs, from)) in new.iter().zip([("B", 2_400, 101), ("C", 1_800, 102)]) {
+        assert_eq!(item.title(), title);
+        assert_eq!(item.planned_secs(), secs);
+        assert_eq!(item.carried_from(), Some(id(from)));
+        assert_eq!(item.status(), ItemStatus::Pending);
+        assert!(!item.fixed());
+    }
+    assert!(new[0].order() < new[1].order());
+    assert_eq!(
+        store.day_log(day1()),
+        vec![carried_at(101, 1, FOUR_PM), carried_at(102, 2, FOUR_PM)]
+    );
+    assert!(store.day_log(day2()).is_empty());
+    assert_eq!(store.batches().len(), batches + 1, "one batch");
+
+    assert!(snap.overflow.is_empty());
+    assert_eq!(overflow_status(&snap), None);
+    assert_eq!(h.next_effect().await, withdraw(1));
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn a_paused_leftover_carries_only_its_remaining_time() {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(PlanItem::new(id(100), "A", 2_700, key("U")))
+        .unwrap();
+    day.add(PlanItem::new(id(101), "P", 2_400, key("V")))
+        .unwrap();
+    // P: 10 of 40 min done, so it flows 16:45–17:15.
+    day.start(id(101), ts(1_000)).unwrap();
+    day.pause(id(101), ts(1_600)).unwrap();
+    let (mut h, store) = a_started_at_four(&day).await;
+    assert_eq!(h.rx.borrow().overflow, vec![id(101)]);
+    h.send(carry(2));
+    let snap = h.rev(3).await;
+    assert_eq!(
+        day_of(&snap).item(id(101)).unwrap().status(),
+        ItemStatus::CarriedOver
+    );
+    let carried = store
+        .stored_day(day2())
+        .unwrap()
+        .item(id(1))
+        .unwrap()
+        .clone();
+    assert_eq!(carried.planned_secs(), 1_800);
+    assert!(carried.segments().is_empty());
+}
+
+#[tokio::test]
+async fn carry_over_appends_after_an_existing_tomorrow_and_keeps_it() {
+    let mut existing = Day::new(day2(), "UTC");
+    existing.add(item(200, "X", "Y")).unwrap();
+    // Today's zone differs, so a tomorrow rebuilt with it would show.
+    let (mut h, store) = leftovers("Europe/Berlin").await;
+    store.seed(&existing);
+    h.send(carry(2));
+    h.rev(3).await;
+    let tomorrow = store.stored_day(day2()).unwrap();
+    assert_eq!(tomorrow.tz(), "UTC");
+    assert_eq!(tomorrow.item(id(200)), existing.item(id(200)));
+    let x = tomorrow.item(id(200)).unwrap().order();
+    let (b, c) = (
+        tomorrow.item(id(1)).unwrap().order(),
+        tomorrow.item(id(2)).unwrap().order(),
+    );
+    assert!(x < b && b < c);
+}
+
+#[tokio::test]
+async fn carry_over_with_nothing_overflowing_is_rejected() {
+    let (mut h, store) = running_on(1_000, Some(&abc_day())).await;
+    let snap = expect_rejected(&mut h, &store, carry(1), 2).await;
+    assert_eq!(
+        rejected(&snap),
+        Some("CarryOverToTomorrow: nothing to carry over")
+    );
+    assert_eq!(store.stored_day(day2()), None);
+}
+
+#[tokio::test]
+async fn carry_over_with_a_stale_rev_is_rejected() {
+    let (mut h, store) = leftovers("UTC").await;
+    let snap = expect_rejected(&mut h, &store, carry(1), 3).await;
+    assert_eq!(rejected(&snap), Some("stale rev: expected 1, current 2"));
+    assert_eq!(snap.overflow, vec![id(101), id(102)]);
+    assert_eq!(store.stored_day(day2()), None);
+}
+
+#[tokio::test]
+async fn a_failed_tomorrow_load_applies_nothing_and_sets_store_status() {
+    let (mut h, store) = leftovers("UTC").await;
+    let batches = store.batches().len();
+    let before = h.rx.borrow().day.clone();
+    store.fail_load_day(true);
+    h.send(carry(2));
+    let snap = h.rev(3).await;
+    assert_eq!(snap.day, before);
+    assert_eq!(snap.overflow, vec![id(101), id(102)]);
+    assert_eq!(store.batches().len(), batches, "no commit");
+    assert!(snap.status.iter().any(|e| e.key == StatusKey::Store));
+    store.fail_load_day(false);
+    assert_eq!(store.stored_day(day2()), None);
+}
+
+#[tokio::test]
+async fn midnight_rolls_over_to_the_day_holding_the_carried_items() {
+    let (mut h, store) = leftovers("UTC").await;
+    h.send(carry(2));
+    h.rev(3).await;
+    h.clock.advance(60);
+    h.send(EngineMsg::Pause { item_id: id(100) });
+    let snap = h.rev(4).await;
+    assert_eq!(day_of(&snap).date(), day1(), "16:01 is still day 1");
+    assert_eq!(snap.running, None);
+
+    h.clock.set(MIDNIGHT + 30);
+    let snap = h.rev(5).await;
+    let today = day_of(&snap);
+    assert_eq!(today.date(), day2());
+    assert_eq!(today, &store.stored_day(day2()).unwrap());
+    for (n, from) in [(1, 101), (2, 102)] {
+        let item = today.item(id(n)).unwrap();
+        assert_eq!(item.status(), ItemStatus::Pending);
+        assert_eq!(item.carried_from(), Some(id(from)));
+    }
+    assert_eq!(
+        snap.next_item.map(|n| n.item_id),
+        Some(id(1)),
+        "the carried items are next"
+    );
+    assert!(snap.overflow.is_empty());
+}
+
+#[tokio::test]
+async fn an_item_running_at_midnight_keeps_its_day_until_it_stops() {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(PlanItem::new(id(100), "A", 3_600, key("U")))
+        .unwrap();
+    let (mut h, store) = running_on(MIDNIGHT - 1_800, Some(&day)).await;
+    h.send(start_msg(100, 1));
+    h.rev(2).await;
+
+    h.clock.set(MIDNIGHT + 60);
+    h.until(|| store.last_alive() == Some(ts(MIDNIGHT + 60)))
+        .await;
+    let snap = h.rx.borrow().clone();
+    assert_eq!(snap.rev, 2);
+    assert_eq!(day_of(&snap).date(), day1());
+    assert_eq!(snap.running.as_ref().map(|r| r.item_id), Some(id(100)));
+
+    h.clock.set(MIDNIGHT + 600);
+    h.send(EngineMsg::Pause { item_id: id(100) });
+    // Rev 3 is the pause on day 1, rev 4 the rollover right after it.
+    let snap = h.rev(4).await;
+    assert_eq!(day_of(&snap), &Day::new(day2(), "UTC"));
+    let old = store.stored_day(day1()).unwrap();
+    let paused = old.item(id(100)).unwrap();
+    assert_eq!(paused.status(), ItemStatus::Paused);
+    // The segment stays whole on day 1, across midnight.
+    assert_eq!(
+        paused.segments(),
+        &[closed(MIDNIGHT - 1_800, MIDNIGHT + 600)]
+    );
+}
+
+#[tokio::test]
+async fn a_command_with_a_pre_rollover_rev_is_rejected_after_rolling_over() {
+    let (mut h, store) = running_on(MIDNIGHT - 60, Some(&abc_day())).await;
+    let batches = store.batches().len();
+    h.clock.set(MIDNIGHT + 10);
+    h.send(start_msg(100, 1));
+    // Rev 2 is the rollover (it may be overwritten before it is seen), so the
+    // stale rev is 1 against 2.
+    let snap = h.rev(3).await;
+    assert_eq!(rejected(&snap), Some("stale rev: expected 1, current 2"));
+    assert_eq!(snap.running, None);
+    assert_eq!(day_of(&snap).date(), day2());
+    assert!(
+        store.batches()[batches..].iter().all(|b| b
+            .ops()
+            .iter()
+            .all(|op| matches!(op, StoreOp::SetLastAlive { .. }))),
+        "only heartbeats were committed"
+    );
+}
+
+#[tokio::test]
+async fn carried_items_load_with_their_link_after_a_restart() {
+    let (mut h, store) = leftovers("UTC").await;
+    h.send(carry(2));
+    h.rev(3).await;
+    drop(h);
+    let mut h = start(&FakeClock::at(MIDNIGHT + 100), &store);
+    let snap = h.rev(1).await;
+    let today = day_of(&snap);
+    assert_eq!(today.date(), day2());
+    assert_eq!(today.item(id(1)).unwrap().carried_from(), Some(id(101)));
+    assert_eq!(today.item(id(2)).unwrap().carried_from(), Some(id(102)));
+}

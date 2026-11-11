@@ -161,6 +161,29 @@ async fn seeded(path: &Path) -> SqliteStore {
     store
 }
 
+/// Writes `sample_day` into a v1 database at `path`. The adapter writes columns v1
+/// lacks, so the rows go through a current-schema scratch database and are copied
+/// over with v1's columns only.
+async fn seed_v1(dir: &TempDir, path: &Path) {
+    drop(SqliteStore::open_with(path, &v1()).unwrap());
+    let scratch = dir.path().join("scratch.sqlite");
+    drop(seeded(&scratch).await);
+    let conn = Connection::open(path).unwrap();
+    conn.execute("ATTACH DATABASE ?1 AS src", [scratch.to_str().unwrap()])
+        .unwrap();
+    conn.execute_batch(
+        r#"INSERT INTO day SELECT date, tz FROM src.day ORDER BY rowid;
+           INSERT INTO plan_item
+             SELECT id, day_date, title, planned_secs, "order", fixed, pinned_start,
+                    status, removed_at
+             FROM src.plan_item ORDER BY rowid;
+           INSERT INTO time_segment SELECT id, item_id, started_at, ended_at
+             FROM src.time_segment ORDER BY id;
+           DETACH DATABASE src;"#,
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     let dir = TempDir::new().unwrap();
@@ -168,7 +191,7 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 6);
+    assert_eq!(user_version(&path), 7);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
@@ -195,9 +218,7 @@ async fn journal_mode_is_wal() {
 async fn upgrade_writes_a_backup_of_the_old_schema_then_migrates() {
     let dir = TempDir::new().unwrap();
     let path = db(&dir);
-    let store = SqliteStore::open_with(&path, &v1()).unwrap();
-    store.commit(batch_for(&sample_day())).await.unwrap();
-    drop(store);
+    seed_v1(&dir, &path).await;
     // A stale file at the backup path is replaced.
     let bak = backup_path(&path, 1);
     assert_eq!(bak, dir.path().join("nguda.db.v1.bak"));
@@ -255,7 +276,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     // connection: a read-write open closing it would checkpoint them.
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-    raw.pragma_update(None, "user_version", 7).unwrap();
+    raw.pragma_update(None, "user_version", 8).unwrap();
     let copy = dir.path().join("newer.db");
     let wal = |p: &Path| PathBuf::from(format!("{}-wal", p.display()));
     std::fs::copy(&path, &copy).unwrap();
@@ -270,14 +291,14 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     assert_eq!(
         err,
         OpenError::NewerSchema {
-            found: 7,
-            supported: 6
+            found: 8,
+            supported: 7
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read(wal(&path)).unwrap(), wal_before);
     assert!(backups(&dir).is_empty());
-    assert_eq!(user_version(&path), 7);
+    assert_eq!(user_version(&path), 8);
 }
 
 #[tokio::test]
@@ -463,9 +484,7 @@ async fn a_stopped_worker_yields_a_store_error() {
 async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     let dir = TempDir::new().unwrap();
     let path = db(&dir);
-    let store = SqliteStore::open_with(&path, &v1()).unwrap();
-    store.commit(batch_for(&sample_day())).await.unwrap();
-    drop(store);
+    seed_v1(&dir, &path).await;
     assert_eq!(user_version(&path), 1);
 
     let store = SqliteStore::open(&path).unwrap();
@@ -478,7 +497,7 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 6);
+    assert_eq!(user_version(&path), 7);
     assert!(has_table(&path, "engine_meta"));
 }
 
@@ -909,4 +928,71 @@ async fn inserted_day_log_entries_round_trip_across_a_reopen() {
     drop(store);
     let store = SqliteStore::open(&path).unwrap();
     assert_eq!(store.load_day_log(date()).await.unwrap(), vec![entry]);
+}
+
+#[tokio::test]
+async fn a_carried_item_round_trips_its_link_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let mut tomorrow = Day::new(other_date(), "Europe/Berlin");
+    tomorrow
+        .add(PlanItem::carried(
+            id(20),
+            format!("{TITLE} 1"),
+            900,
+            OrderKey::new("V").unwrap(),
+            id(1),
+        ))
+        .unwrap();
+    store.commit(batch_for(&tomorrow)).await.unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let loaded = store.load_day(other_date()).await.unwrap().unwrap();
+    assert_eq!(loaded, tomorrow);
+    assert_eq!(loaded.item(id(20)).unwrap().carried_from(), Some(id(1)));
+    // Items that were not carried keep no link.
+    let today = store.load_day(date()).await.unwrap().unwrap();
+    assert!(today.items().iter().all(|i| i.carried_from().is_none()));
+}
+
+#[tokio::test]
+async fn carried_over_day_log_entries_round_trip_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let entry = DayLogEntry {
+        at: ts(1_600),
+        kind: DayLogKind::CarriedOver {
+            item_id: id(2),
+            to: id(4),
+        },
+    };
+    store
+        .commit(batch([StoreOp::AppendDayLog {
+            date: date(),
+            entry: entry.clone(),
+        }]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.load_day_log(date()).await.unwrap(), vec![entry]);
+}
+
+#[tokio::test]
+async fn a_carried_over_entry_without_a_target_fails_the_load() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    drop(seeded(&path).await);
+    let raw = Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO day_log (day_date, at, kind, item_id) VALUES (?1, 0, 'carried_over', ?2)",
+        [date().to_string(), id(1).to_string()],
+    )
+    .unwrap();
+    drop(raw);
+    let store = SqliteStore::open(&path).unwrap();
+    let err = store.load_day_log(date()).await.unwrap_err();
+    assert!(err.message.contains("missing to_item_id"), "{err}");
 }

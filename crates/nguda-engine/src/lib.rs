@@ -5,9 +5,9 @@
 //! and swapped in only once that commit succeeds. After each change the engine bumps
 //! `rev` and publishes a [`Snapshot`] on a `watch` channel, and one-time outputs go
 //! out as [`Effect`]s. It holds no `Mutex` and runs no per-second tick: it waits on
-//! one deadline through [`Clock::sleep_until`] (the earlier of the heartbeat and the
-//! running item's planned end), and rendering the ticking elapsed
-//! time is the subscriber's job (AD-11).
+//! one deadline through [`Clock::sleep_until`] (the earliest of the heartbeat, the
+//! running item's planned end, and, while nothing runs, the next local midnight),
+//! and rendering the ticking elapsed time is the subscriber's job (AD-11).
 //!
 //! Overflow: every publish re-flows the day and lists the flexible items that end
 //! after the work-end setting ([`EngineMsg::SetWorkEnd`], persisted, default 17:00
@@ -25,6 +25,19 @@
 //! Inserting "now" while an item runs pauses it onto the day's persisted interrupt
 //! stack, and [`nguda_core::next_task`] (used by Switch and for `next_item`) resumes
 //! the top of that stack before anything else.
+//!
+//! Carry-over (AD-6): [`EngineMsg::CarryOverToTomorrow`] moves the current overflow
+//! list to tomorrow. Items never change days: each original turns `carried_over`,
+//! and tomorrow's day (created with today's zone if missing) gains a fresh pending
+//! item linked by `carried_from`, all with `CarriedOver` day-log entries in one
+//! batch. The emptied list then ends the overflow episode.
+//!
+//! Rollover (AD-8): "today" is the day the engine last made current. While nothing
+//! runs, the next local midnight after today is a deadline; when the local date has
+//! moved past today, the engine loads (or creates) the new date's day and publishes
+//! it. The check also runs before and after each command, so a command carrying a
+//! pre-rollover rev is stale-rejected. While an item runs no rollover is armed and
+//! its day stays current until it stops; segments are never split at midnight.
 
 mod actor;
 mod batch;
@@ -109,6 +122,12 @@ pub enum EngineMsg {
     /// Sets the work-end time of day to `minutes` after local midnight
     /// (`0..=1439`), persisted. Not rev-checked; the same value changes nothing.
     SetWorkEnd { minutes: u32 },
+    /// Carries every item of the current overflow list over to tomorrow (AD-6):
+    /// each turns `carried_over` and tomorrow gains a new pending flexible item with
+    /// the same title and the remaining time (at least a minute), linked by
+    /// `carried_from`, logged `CarriedOver` on today, in one batch. Rev-checked; an
+    /// empty overflow list is rejected.
+    CarryOverToTomorrow { expected_rev: u64 },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
