@@ -1,10 +1,12 @@
 //! The tray surface (AD-11). Setters run only in the snapshot subscriber (AD-4).
 //!
 //! One text source, `title_for`, drives the title, the first (disabled) menu line,
-//! and the tooltip. On Linux the title becomes the AppIndicator label, the tooltip
-//! is a no-op in Tauri's backend, and the first menu line is the fallback. Tray
-//! clicks don't fire on Linux, so every action is a menu item. The menu is built
-//! once and only edited (`set_text`), because on Linux it can't be replaced.
+//! and the tooltip: `<task> · <elapsed>` while a task runs, `Next: <title>` while
+//! idle with something left, otherwise the app name. On Linux the title becomes
+//! the AppIndicator label, the tooltip is a no-op in Tauri's backend, and the
+//! first menu line is the fallback. Tray clicks don't fire on Linux, so every
+//! action is a menu item. The menu is built once and only edited (`set_text`),
+//! because on Linux it can't be replaced.
 
 use std::sync::Arc;
 
@@ -103,11 +105,13 @@ fn render(surface: &impl Surface, text: &str) {
     }
 }
 
-/// `<task> · <elapsed>` while a task runs, otherwise the app name.
+/// `<task> · <elapsed>` while a task runs, `Next: <title>` while idle with an item
+/// left, otherwise the app name.
 pub fn title_for(snapshot: &Snapshot, now: Timestamp) -> String {
-    match &snapshot.running {
-        Some(r) => format!("{} · {}", r.title, format_elapsed(elapsed_secs(r, now))),
-        None => IDLE_TITLE.to_owned(),
+    match (&snapshot.running, &snapshot.next_item) {
+        (Some(r), _) => format!("{} · {}", r.title, format_elapsed(elapsed_secs(r, now))),
+        (None, Some(n)) => format!("Next: {}", n.title),
+        (None, None) => IDLE_TITLE.to_owned(),
     }
 }
 
@@ -152,7 +156,8 @@ async fn sleep_or_forever(wait: Option<std::time::Duration>) {
 mod tests {
     use std::cell::RefCell;
 
-    use nguda_core::Running;
+    use nguda_core::{ItemId, Running, Uuid};
+    use nguda_engine::NextItem;
 
     use super::*;
 
@@ -195,6 +200,70 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn snapshot_next(title: &str) -> Snapshot {
+        Snapshot {
+            rev: 2,
+            next_item: Some(NextItem {
+                item_id: ItemId(Uuid::from_u128(1)),
+                title: title.into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn idle_title_shows_the_next_item() {
+        assert_eq!(
+            title_for(&snapshot_next("B"), Timestamp::UNIX_EPOCH),
+            "Next: B"
+        );
+    }
+
+    #[test]
+    fn idle_with_nothing_left_after_startup_is_the_app_name() {
+        let s = Snapshot {
+            rev: 3,
+            ..Default::default()
+        };
+        assert_eq!(title_for(&s, Timestamp::UNIX_EPOCH), "nguda");
+    }
+
+    #[test]
+    fn running_wins_over_next_item() {
+        let s = Snapshot {
+            next_item: snapshot_next("B").next_item,
+            ..snapshot_started_at(1_000)
+        };
+        assert_eq!(
+            title_for(&s, Timestamp::from_second(1_005).unwrap()),
+            "Demo · 00:05"
+        );
+    }
+
+    #[test]
+    fn idle_next_renders_on_title_status_line_and_tooltip() {
+        let surface = FakeSurface::default();
+        render(
+            &surface,
+            &title_for(&snapshot_next("B"), Timestamp::UNIX_EPOCH),
+        );
+        assert_eq!(
+            rendered(&surface),
+            vec![
+                ("title", "Next: B".to_owned()),
+                ("status", "Next: B".to_owned()),
+                ("tooltip", "Next: B".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_next_with_an_ampersand_escapes_only_the_menu_line() {
+        let text = title_for(&snapshot_next("R&D"), Timestamp::UNIX_EPOCH);
+        assert_eq!(text, "Next: R&D");
+        assert_eq!(menu_text(&text), "Next: R&&D");
     }
 
     #[test]

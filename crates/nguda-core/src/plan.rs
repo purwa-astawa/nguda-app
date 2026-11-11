@@ -501,6 +501,15 @@ impl Day {
     pub fn in_order(&self) -> Vec<&PlanItem> {
         display_order(&self.items)
     }
+
+    /// The first pending or paused item in display order, or `None` when nothing is
+    /// left. A stand-in for "next" until re-flow (epic 2); paused counts, because
+    /// resuming it is a likely next step.
+    pub fn next_item(&self) -> Option<&PlanItem> {
+        self.in_order()
+            .into_iter()
+            .find(|i| matches!(i.status, ItemStatus::Pending | ItemStatus::Paused))
+    }
 }
 
 /// Temporary display order until re-flow (epic 2): non-removed items, fixed ones by
@@ -1156,5 +1165,65 @@ mod tests {
             Day::restore(date, "UTC", running),
             Err(DomainError::AnotherItemRunning)
         );
+    }
+
+    fn next_id(d: &Day) -> Option<ItemId> {
+        d.next_item().map(PlanItem::id)
+    }
+
+    #[test]
+    fn next_item_is_the_first_pending_after_done_fixed() {
+        let t = FakeClock::ts(0);
+        let mut d = day(vec![item(1, "a"), item(2, "b"), item(3, "c")]);
+        d.set_fixed(id(1), FakeClock::ts(100)).unwrap();
+        d.start(id(1), t).unwrap();
+        d.finish(id(1), t).unwrap();
+        assert_eq!(next_id(&d), Some(id(2)));
+        assert_eq!(d.next_item().unwrap().title(), "item 2");
+    }
+
+    #[test]
+    fn next_item_counts_a_paused_item() {
+        let t = FakeClock::ts(0);
+        let mut d = day(vec![item(1, "a"), item(2, "b")]);
+        d.start(id(1), t).unwrap();
+        d.pause(id(1), t).unwrap();
+        assert_eq!(next_id(&d), Some(id(1)));
+    }
+
+    #[test]
+    fn next_item_skips_done_carried_over_removed_and_running() {
+        let t = FakeClock::ts(0);
+        let mut d = day(vec![
+            item(1, "a"),
+            item(2, "b"),
+            item(3, "c"),
+            item(4, "d"),
+            item(5, "e"),
+        ]);
+        d.start(id(1), t).unwrap();
+        d.finish(id(1), t).unwrap();
+        d.carry_over(id(2)).unwrap();
+        d.remove(id(3), t).unwrap();
+        d.start(id(4), t).unwrap();
+        assert_eq!(next_id(&d), Some(id(5)));
+    }
+
+    #[test]
+    fn next_item_puts_a_pending_fixed_item_first() {
+        let mut d = day(vec![item(1, "a"), item(2, "z")]);
+        d.set_fixed(id(2), FakeClock::ts(5_000)).unwrap();
+        assert_eq!(next_id(&d), Some(id(2)));
+    }
+
+    #[test]
+    fn next_item_is_none_when_nothing_is_left() {
+        assert_eq!(next_id(&day(vec![])), None);
+        let t = FakeClock::ts(0);
+        let mut d = day(vec![item(1, "a"), item(2, "b")]);
+        d.start(id(1), t).unwrap();
+        d.finish(id(1), t).unwrap();
+        d.remove(id(2), t).unwrap();
+        assert_eq!(next_id(&d), None);
     }
 }

@@ -3,9 +3,12 @@
 //! It builds the engine with the real clock, exposes fire-and-forget commands
 //! (AD-4), mirrors snapshots to the view as a typed event, and renders the tray
 //! from a snapshot subscriber (AD-11). The tray menu (status line and Quit) and
-//! its Quit handler live in `tray`.
+//! its Quit handler live in `tray`. On macOS the app runs as an accessory (no Dock
+//! icon) and the tray title gets monospaced digits once, from `macos`.
 
 mod ipc;
+#[cfg(target_os = "macos")]
+mod macos;
 mod tray;
 
 use std::sync::Arc;
@@ -32,6 +35,17 @@ pub fn run() {
     let app = tauri::Builder::default()
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
+            // A tray app: no Dock icon or app menu.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // An accessory app is not activated at launch, so bring the plan window forward.
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main")
+                && let Err(e) = window.set_focus()
+            {
+                eprintln!("nguda: failed to focus the main window: {e}");
+            }
+
             builder.mount_events(app);
 
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -59,6 +73,12 @@ pub fn run() {
                     std::process::exit(1);
                 }
             };
+            // Once, on the main thread, with no lock held (AD-4): the button keeps its
+            // font across title updates.
+            #[cfg(target_os = "macos")]
+            if !macos::apply_monospaced_digits() {
+                eprintln!("nguda: status-bar button not found; tray title keeps the default font");
+            }
             tauri::async_runtime::spawn(tray::subscribe(
                 app.handle().clone(),
                 tray,

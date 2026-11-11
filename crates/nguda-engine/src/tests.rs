@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, watch};
 use crate::batch::diff;
 use crate::test_support::{FakeClock, INJECTED, MemoryStore, SeqIds, ts};
 use crate::{
-    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, ReorderAnchor, Snapshot,
+    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, NextItem, ReorderAnchor, Snapshot,
     StatusEntry, StatusKey, spawn,
 };
 
@@ -570,6 +570,31 @@ async fn pause_pauses_the_running_item_and_rejects_others() {
 
     expect_rejected(&mut h, &store, EngineMsg::Pause { item_id: id(100) }, 4).await;
     expect_rejected(&mut h, &store, EngineMsg::Pause { item_id: id(101) }, 5).await;
+}
+
+#[tokio::test]
+async fn next_item_is_published_only_while_nothing_runs() {
+    let (mut h, _store) = running_on(1_000, None).await;
+    assert_eq!(h.rev(1).await.next_item, None);
+
+    h.send(create("A", 600));
+    let snap = h.rev(2).await;
+    let next_a = Some(NextItem {
+        item_id: id(1),
+        title: "A".into(),
+    });
+    assert_eq!(snap.next_item, next_a);
+
+    h.send(start_msg(1, 2));
+    let snap = h.rev(3).await;
+    assert!(snap.running.is_some());
+    assert_eq!(snap.next_item, None);
+
+    h.clock.set(1_020);
+    h.send(EngineMsg::Pause { item_id: id(1) });
+    let snap = h.rev(4).await;
+    assert_eq!(snap.running, None);
+    assert_eq!(snap.next_item, next_a);
 }
 
 #[tokio::test]

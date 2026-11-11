@@ -15,7 +15,9 @@ use tokio::sync::{mpsc, watch};
 
 use crate::batch::diff;
 use crate::commands::{self, domain_kind};
-use crate::{Effect, EngineDeps, EngineMsg, HEARTBEAT_EVERY, Snapshot, StatusEntry, StatusKey};
+use crate::{
+    Effect, EngineDeps, EngineMsg, HEARTBEAT_EVERY, NextItem, Snapshot, StatusEntry, StatusKey,
+};
 
 pub(crate) async fn run(
     deps: EngineDeps,
@@ -274,10 +276,17 @@ impl Actor {
 
     fn publish(&mut self) {
         self.rev += 1;
+        let running = running_of(&self.day);
+        let next_item = if running.is_none() {
+            next_item_of(&self.day)
+        } else {
+            None
+        };
         let snapshot = Snapshot {
             rev: self.rev,
             day: Some(self.day.clone()),
-            running: running_of(&self.day),
+            running,
+            next_item,
             status: self
                 .status
                 .iter()
@@ -296,6 +305,14 @@ impl Actor {
 /// The first item that is running.
 fn running_of(day: &Day) -> Option<Running> {
     day.items().iter().find_map(PlanItem::running_view)
+}
+
+/// The next item to show while nothing runs (`Day::next_item`).
+fn next_item_of(day: &Day) -> Option<NextItem> {
+    day.next_item().map(|i| NextItem {
+        item_id: i.id(),
+        title: i.title().to_owned(),
+    })
 }
 
 fn today(now: Timestamp, tz: &TimeZone) -> Date {

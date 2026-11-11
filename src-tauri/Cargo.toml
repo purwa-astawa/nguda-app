@@ -26,6 +26,10 @@ serde.workspace = true
 jiff = { workspace = true, features = ["tz-system", "tzdb-zoneinfo"] }
 tokio = { workspace = true, features = ["sync", "time", "macros"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSView", "NSResponder", "NSControl", "NSButton", "NSFont", "NSFontDescriptor"] }
+
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
