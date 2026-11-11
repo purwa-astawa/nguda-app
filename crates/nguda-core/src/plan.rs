@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::elapsed::Running;
 use crate::error::DomainError;
 use crate::order::OrderKey;
+use crate::reflow::reflow;
 use crate::segment::{Segment, actual_secs, closed_secs};
 
 /// Identity of a plan item. Generation lives outside core.
@@ -472,7 +473,7 @@ impl Day {
     }
 
     /// Finishes the running item `current` and starts or resumes [`Day::next_item`]
-    /// (as chosen after the finish) at `now`, all or nothing. Returns the item now
+    /// (as chosen after the finish, as of `now`) at `now`, all or nothing. Returns the item now
     /// running, or `None` when nothing was left. Only a running item can be switched
     /// from (AD-15).
     pub fn switch(
@@ -486,7 +487,7 @@ impl Day {
         }
         let mut next = self.clone();
         next.finish(current, now)?;
-        let to = next.next_item().map(|i| (i.id, i.status));
+        let to = next.next_item(now).map(|i| (i.id, i.status));
         match to {
             Some((id, ItemStatus::Paused)) => next.resume(id, now)?,
             Some((id, _)) => next.start(id, now)?,
@@ -526,32 +527,12 @@ impl Day {
         self.apply(id, |i| i.edit(|n| n.set_planned_secs(secs)))
     }
 
-    /// Non-removed items in display order. See `display_order`.
-    pub fn in_order(&self) -> Vec<&PlanItem> {
-        display_order(&self.items)
-    }
-
-    /// The first pending or paused item in display order, or `None` when nothing is
-    /// left. A stand-in for "next" until re-flow (epic 2); paused counts, because
+    /// The first pending or paused item in schedule order as of `now` (see
+    /// [`crate::reflow`]), or `None` when nothing is left. Paused counts, because
     /// resuming it is a likely next step.
-    pub fn next_item(&self) -> Option<&PlanItem> {
-        self.in_order()
-            .into_iter()
-            .find(|i| matches!(i.status, ItemStatus::Pending | ItemStatus::Paused))
+    pub fn next_item(&self, now: Timestamp) -> Option<&PlanItem> {
+        reflow(self, now).next().and_then(|id| self.item(id))
     }
-}
-
-/// Temporary display order until re-flow (epic 2): non-removed items, fixed ones by
-/// `pinned_start`, then flexible ones by `order`. Not a schedule.
-pub(crate) fn display_order(items: &[PlanItem]) -> Vec<&PlanItem> {
-    let (mut fixed, mut flexible): (Vec<&PlanItem>, Vec<&PlanItem>) = items
-        .iter()
-        .filter(|i| i.status != ItemStatus::Removed)
-        .partition(|i| i.fixed);
-    fixed.sort_by_key(|i| i.pinned_start);
-    flexible.sort_by(|a, b| a.order.cmp(&b.order));
-    fixed.extend(flexible);
-    fixed
 }
 
 #[cfg(test)]
@@ -1033,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn in_order_puts_fixed_by_pin_then_flexible_by_order_and_skips_removed() {
+    fn schedule_puts_fixed_at_their_pins_flows_flexible_by_order_and_skips_removed() {
         let mut d = day(vec![
             item(1, "1"),
             item(3, "b"),
@@ -1044,8 +1025,12 @@ mod tests {
         d.set_fixed(id(1), ts(9_000)).unwrap();
         d.set_fixed(id(2), ts(3_000)).unwrap();
         d.remove(id(5), ts(0)).unwrap();
-        let ids: Vec<ItemId> = d.in_order().iter().map(|i| i.id()).collect();
-        assert_eq!(ids, vec![id(2), id(1), id(4), id(3)]);
+        let ids: Vec<ItemId> = reflow(&d, ts(0))
+            .slots()
+            .iter()
+            .map(|s| s.item_id)
+            .collect();
+        assert_eq!(ids, vec![id(4), id(3), id(2), id(1)]);
         assert_eq!(d.items().len(), 5);
     }
 
@@ -1186,7 +1171,7 @@ mod tests {
     }
 
     fn next_id(d: &Day) -> Option<ItemId> {
-        d.next_item().map(PlanItem::id)
+        d.next_item(ts(0)).map(PlanItem::id)
     }
 
     #[test]
@@ -1197,7 +1182,7 @@ mod tests {
         d.start(id(1), t).unwrap();
         d.finish(id(1), t).unwrap();
         assert_eq!(next_id(&d), Some(id(2)));
-        assert_eq!(d.next_item().unwrap().title(), "item 2");
+        assert_eq!(d.next_item(ts(0)).unwrap().title(), "item 2");
     }
 
     #[test]
@@ -1228,10 +1213,12 @@ mod tests {
     }
 
     #[test]
-    fn next_item_puts_a_pending_fixed_item_first() {
+    fn next_item_puts_a_past_pin_first_and_a_future_pin_after_a_flexible_item_that_fits() {
         let mut d = day(vec![item(1, "a"), item(2, "z")]);
         d.set_fixed(id(2), ts(5_000)).unwrap();
-        assert_eq!(next_id(&d), Some(id(2)));
+        // Item 1 (1500 s) fits before the pin at 5000.
+        assert_eq!(next_id(&d), Some(id(1)));
+        assert_eq!(d.next_item(ts(6_000)).map(PlanItem::id), Some(id(2)));
     }
 
     #[test]

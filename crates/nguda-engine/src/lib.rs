@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Day, IdGen, ItemId, PromptId, PromptKind, Running, Store, TimeZone, Timestamp,
+    Clock, Day, IdGen, ItemId, PromptId, PromptKind, Running, Schedule, Store, TimeZone, Timestamp,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -108,8 +108,12 @@ pub struct Snapshot {
     /// Today's plan. `None` only before startup finishes (rev 0).
     pub day: Option<Day>,
     pub running: Option<Running>,
-    /// What to do next (`Day::next_item`). Set only while nothing runs (AD-11).
+    /// What to do next: the first pending or paused item of `schedule`. Set only
+    /// while nothing runs (AD-11).
     pub next_item: Option<NextItem>,
+    /// Today's schedule, re-flowed at publish time (`nguda_core::reflow`). Empty
+    /// only before startup finishes (rev 0).
+    pub schedule: Schedule,
     /// Sorted by key.
     pub status: Vec<StatusEntry>,
 }

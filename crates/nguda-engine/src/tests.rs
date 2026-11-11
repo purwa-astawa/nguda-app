@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use nguda_core::{
     Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OrderKey, PlanItem, PromptKind,
-    Segment, StoreOp, TimeZone,
+    Segment, SlotKind, StoreOp, TimeZone,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -195,8 +195,7 @@ async fn create_task_adds_a_pending_flexible_item_and_persists_it() {
     let snap = h.rev(3).await;
     let day = day_of(&snap);
     assert!(day.item(id(2)).unwrap().order() > day.item(id(1)).unwrap().order());
-    let order: Vec<_> = day.in_order().into_iter().map(PlanItem::id).collect();
-    assert_eq!(order, vec![id(1), id(2)]);
+    assert_eq!(ids_in_order(&snap), vec![id(1), id(2)]);
 
     // A reload gives the same day.
     let mut reloaded = start(&FakeClock::at(1_010), &store);
@@ -289,11 +288,7 @@ fn reorder(n: u128, anchor: ReorderAnchor, expected_rev: u64) -> EngineMsg {
 }
 
 fn ids_in_order(snap: &Snapshot) -> Vec<ItemId> {
-    day_of(snap)
-        .in_order()
-        .into_iter()
-        .map(PlanItem::id)
-        .collect()
+    snap.schedule.slots().iter().map(|s| s.item_id).collect()
 }
 
 #[tokio::test]
@@ -1123,4 +1118,71 @@ async fn switch_from_a_non_running_item_is_rejected() {
     }
     assert_eq!(store.day_log(day1()), vec![]);
     assert_eq!(h.rx.borrow().running.as_ref().unwrap().item_id, id(100));
+}
+
+/// A slot as `(item, kind, (start, end))` in whole seconds.
+type SlotSecs = (ItemId, SlotKind, Option<(i64, i64)>);
+
+fn spans(snap: &Snapshot) -> Vec<SlotSecs> {
+    snap.schedule
+        .slots()
+        .iter()
+        .map(|s| {
+            let span = s.span.map(|sp| (sp.start.as_second(), sp.end.as_second()));
+            (s.item_id, s.kind, span)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_snapshot_carries_the_schedule_reflowed_at_publish_time() {
+    // A and B flexible, C fixed at 1_900; all 600 s.
+    let mut day = abc_day();
+    day.set_fixed(id(102), ts(1_900)).unwrap();
+    let (mut h, _store) = running_on(1_000, Some(&day)).await;
+
+    h.send(start_msg(100, 1));
+    let snap = h.rev(2).await;
+    // A runs to 1_600; B would overlap C, so it moves past it.
+    assert_eq!(
+        spans(&snap),
+        vec![
+            (id(100), SlotKind::Running, Some((1_000, 1_600))),
+            (id(102), SlotKind::Fixed, Some((1_900, 2_500))),
+            (id(101), SlotKind::Flexible, Some((2_500, 3_100))),
+        ]
+    );
+    assert_eq!(snap.next_item, None);
+
+    // Paused at 1_300, A keeps its remaining 300 s and flows from now.
+    h.clock.set(1_300);
+    h.send(EngineMsg::Pause { item_id: id(100) });
+    let snap = h.rev(3).await;
+    assert_eq!(
+        spans(&snap),
+        vec![
+            (id(100), SlotKind::Flexible, Some((1_300, 1_600))),
+            (id(102), SlotKind::Fixed, Some((1_900, 2_500))),
+            (id(101), SlotKind::Flexible, Some((2_500, 3_100))),
+        ]
+    );
+    assert_eq!(snap.next_item.as_ref().map(|n| n.item_id), Some(id(100)));
+    assert_eq!(snap.schedule.overflow(ts(2_500)), vec![id(101)]);
+}
+
+#[tokio::test]
+async fn next_item_and_switch_follow_the_schedule_past_a_due_pin() {
+    // C is pinned at 500, before now, so it comes first and Switch starts it.
+    let mut day = abc_day();
+    day.set_fixed(id(102), ts(500)).unwrap();
+    let (mut h, _store) = running_on(1_000, Some(&day)).await;
+    let next = h.rx.borrow().next_item.as_ref().map(|n| n.item_id);
+    assert_eq!(next, Some(id(102)));
+
+    h.send(start_msg(100, 1));
+    h.rev(2).await;
+    h.clock.set(1_100);
+    h.send(switch_msg(100, 2));
+    let snap = h.rev(3).await;
+    assert_eq!(snap.running.as_ref().map(|r| r.item_id), Some(id(102)));
 }

@@ -4,6 +4,7 @@ import {
   pinCommand,
   rowActions,
   rowTime,
+  scheduleLabel,
   secsToMinutes,
   type Command,
   type Item,
@@ -38,6 +39,7 @@ export function PlanItemRow({ snap, item, now, send }: Props) {
   const [pinTime, setPinTime] = useState("");
   const actions = rowActions(snap, item);
   const pin = pinCommand(snap, item, pinTime);
+  const scheduled = snap.day ? scheduleLabel(item, snap.day.tz) : null;
 
   const startEdit = () => {
     setTitle(item.title);
@@ -73,6 +75,7 @@ export function PlanItemRow({ snap, item, now, send }: Props) {
         </form>
       ) : (
         <div className="facts">
+          {scheduled && <span className="when">{scheduled}</span>}
           <span className="title">{item.title}</span>
           <span className="meta">
             {STATUS_LABEL[item.status]} · {rowTime(snap, item, now)} /{" "}

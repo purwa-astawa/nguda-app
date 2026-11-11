@@ -413,7 +413,10 @@ mod tests {
     }
 
     fn order_of(day: &Day) -> Vec<ItemId> {
-        day.in_order().into_iter().map(PlanItem::id).collect()
+        flexible_in_order(day)
+            .into_iter()
+            .map(PlanItem::id)
+            .collect()
     }
 
     #[test]

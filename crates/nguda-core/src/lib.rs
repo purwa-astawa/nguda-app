@@ -11,6 +11,7 @@ mod ids;
 mod notifier;
 mod order;
 mod plan;
+mod reflow;
 mod segment;
 mod store;
 #[cfg(test)]
@@ -27,6 +28,7 @@ pub use jiff::tz::TimeZone;
 pub use notifier::{Notification, Notifier, NotifierError, PromptKind};
 pub use order::OrderKey;
 pub use plan::{Action, Day, ItemId, ItemStatus, PlanItem, PlanItemRecord};
+pub use reflow::{Schedule, Slot, SlotKind, Span, reflow};
 pub use segment::{Segment, actual_secs, closed_secs};
 pub use store::{OpenSegmentRef, Store, StoreBatch, StoreError, StoreFuture, StoreOp};
 pub use uuid::Uuid;
