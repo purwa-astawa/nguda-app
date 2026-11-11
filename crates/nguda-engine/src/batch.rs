@@ -9,7 +9,8 @@ use nguda_core::{Day, StoreBatch, StoreOp};
 /// 2. `PutItem` for each new or changed item,
 /// 3. `CloseSegment` for each segment open in `old` and closed in `new`,
 /// 4. each segment new in `new`: closed ones first (open then close), then the open
-///    one.
+///    one,
+/// 5. `SetInterruptStack` when the interrupt stack changed.
 ///
 /// Callers append their extra ops (day log, heartbeat) after these.
 pub(crate) fn diff(old: &Day, new: &Day) -> StoreBatch {
@@ -78,6 +79,12 @@ pub(crate) fn diff(old: &Day, new: &Day) -> StoreBatch {
     }
     if let Some(op) = open {
         batch.push(op);
+    }
+    if old.interrupt_stack() != new.interrupt_stack() {
+        batch.push(StoreOp::SetInterruptStack {
+            date: new.date(),
+            items: new.interrupt_stack().to_vec(),
+        });
     }
     batch
 }
@@ -178,6 +185,46 @@ mod tests {
                 close_op(100, 1_000, 1_050),
                 open_op(1, 1_050)
             ]
+        );
+    }
+
+    #[test]
+    fn diff_sets_the_interrupt_stack_last_when_it_changed() {
+        let old = day_running_other();
+        let mut new = old.clone();
+        new.interrupt(id(100), item(1, "n", "U"), ts(1_050))
+            .unwrap();
+        let stack = StoreOp::SetInterruptStack {
+            date: day1(),
+            items: vec![id(100)],
+        };
+        assert_eq!(
+            ops(&diff(&old, &new)),
+            vec![
+                put_day(),
+                put(&new, 100),
+                put(&new, 1),
+                close_op(100, 1_000, 1_050),
+                open_op(1, 1_050),
+                stack,
+            ]
+        );
+        // Popping it writes an empty stack.
+        let mut popped = new.clone();
+        popped.switch(id(1), ts(1_100)).unwrap();
+        assert_eq!(
+            ops(&diff(&new, &popped)).last(),
+            Some(&StoreOp::SetInterruptStack {
+                date: day1(),
+                items: vec![],
+            })
+        );
+        // An unchanged stack writes nothing.
+        let mut renamed = new.clone();
+        renamed.set_title(id(100), "x").unwrap();
+        assert_eq!(
+            ops(&diff(&new, &renamed)),
+            vec![put_day(), put(&renamed, 100)]
         );
     }
 

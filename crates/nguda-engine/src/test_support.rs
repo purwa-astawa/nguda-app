@@ -119,6 +119,8 @@ struct Data {
     segments: Vec<(ItemId, Segment)>,
     last_alive: Option<Timestamp>,
     day_log: Vec<(Date, DayLogEntry)>,
+    /// date → interrupt stack, bottom first.
+    stacks: BTreeMap<Date, Vec<ItemId>>,
 }
 
 impl Data {
@@ -212,6 +214,21 @@ impl Data {
                 }
                 self.day_log.push((*date, entry.clone()));
             }
+            StoreOp::SetInterruptStack { date, items } => {
+                if !self.days.contains_key(date) {
+                    return Err(StoreError::new(format!(
+                        "set interrupt stack: no day {date}"
+                    )));
+                }
+                for id in items {
+                    if self.item_date(*id) != Some(*date) {
+                        return Err(StoreError::new(format!(
+                            "set interrupt stack: item {id} is not on day {date}"
+                        )));
+                    }
+                }
+                self.stacks.insert(*date, items.clone());
+            }
         }
         Ok(())
     }
@@ -236,7 +253,9 @@ impl Data {
                 PlanItem::restore(record).map_err(|e| StoreError::new(e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let stack = self.stacks.get(&date).cloned().unwrap_or_default();
         Day::restore(date, tz.clone(), items)
+            .and_then(|mut day| day.restore_interrupt_stack(stack).map(|()| day))
             .map(Some)
             .map_err(|e| StoreError::new(format!("load day {date}: {e}")))
     }
@@ -309,6 +328,13 @@ impl MemoryStore {
                 data.segments.push((item.id(), seg.clone()));
             }
         }
+        data.stacks
+            .insert(day.date(), day.interrupt_stack().to_vec());
+    }
+
+    /// Stores `items` as `date`'s interrupt stack as is, bypassing batches.
+    pub(crate) fn seed_interrupt_stack(&self, date: Date, items: Vec<ItemId>) {
+        self.data.lock().unwrap().stacks.insert(date, items);
     }
 
     pub(crate) fn seed_last_alive(&self, at: Option<Timestamp>) {

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use nguda_core::{
     Clock, Date, Day, DayLogEntry, DayLogKind, IdGen, ItemId, OpenSegmentRef, PlanItem, PromptId,
-    PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
+    PromptKind, Running, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp, next_task,
     reflow,
 };
 use tokio::sync::{mpsc, watch};
@@ -361,10 +361,11 @@ impl Actor {
 
     fn publish(&mut self) {
         self.rev += 1;
+        let now = self.clock.now();
         let running = running_of(&self.day);
-        let schedule = reflow(&self.day, self.clock.now());
+        let schedule = reflow(&self.day, now);
         let next_item = if running.is_none() {
-            next_item_of(&self.day, &schedule)
+            next_item_of(&self.day, now)
         } else {
             None
         };
@@ -394,11 +395,10 @@ fn running_of(day: &Day) -> Option<Running> {
     day.items().iter().find_map(PlanItem::running_view)
 }
 
-/// The next item to show while nothing runs: the schedule's first pending or
-/// paused item.
-fn next_item_of(day: &Day, schedule: &Schedule) -> Option<NextItem> {
-    schedule
-        .next()
+/// The next item to show while nothing runs: [`next_task`], so the top of the
+/// interrupt stack, else the schedule's first pending or paused item.
+fn next_item_of(day: &Day, now: Timestamp) -> Option<NextItem> {
+    next_task(day, now)
         .and_then(|id| day.item(id))
         .map(|i| NextItem {
             item_id: i.id(),

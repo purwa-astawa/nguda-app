@@ -73,9 +73,20 @@ const V4: &str = r#"
 ALTER TABLE day_log ADD COLUMN secs INTEGER CHECK (secs IS NULL OR secs > 0);
 "#;
 
+/// v5: each day's interrupt stack (AD-15), one row per entry, `position` 0 at the
+/// bottom. An item is on at most one stack, once.
+const V5: &str = r#"
+CREATE TABLE interrupt_entry (
+    day_date TEXT NOT NULL REFERENCES day (date),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    item_id  TEXT NOT NULL UNIQUE REFERENCES plan_item (id),
+    PRIMARY KEY (day_date, position)
+) STRICT;
+"#;
+
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4)])
+    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4), M::up(V5)])
 }
 
 #[cfg(test)]

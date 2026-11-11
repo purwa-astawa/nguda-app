@@ -15,8 +15,8 @@ use crate::test_support::{
     FakeClock, INJECTED, MemoryStore, SeqIds, day_running_other, day1, id, item, key, prompt, ts,
 };
 use crate::{
-    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, NextItem, ReorderAnchor, Snapshot,
-    StatusEntry, StatusKey, spawn,
+    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, InsertAnchor, NextItem,
+    ReorderAnchor, Snapshot, StatusEntry, StatusKey, spawn,
 };
 
 const DAY_SECS: i64 = 86_400;
@@ -349,6 +349,27 @@ async fn reorder_rejects_fixed_removed_unknown_and_self_anchors() {
         expect_rejected(&mut h, &store, reorder(n, anchor, rev), rev + 1).await;
     }
     assert_eq!(store.stored_day(day1()), Some(day));
+}
+
+#[tokio::test]
+async fn reorder_of_or_next_to_an_interrupted_item_is_rejected() {
+    // Stack [A]; N running; B, C pending.
+    let (mut h, store) = n_interrupts_a().await;
+    let cases = [
+        (100, ReorderAnchor::After(id(102)), "item"),
+        (101, ReorderAnchor::Before(id(100)), "anchor"),
+    ];
+    for (rev, (n, anchor, role)) in (3..).zip(cases) {
+        let snap = expect_rejected(&mut h, &store, reorder(n, anchor, rev), rev + 1).await;
+        let a = "00000000-0000-0000-0000-000000000064";
+        assert_eq!(
+            rejected(&snap),
+            Some(format!("ReorderTask: {role} {a} is interrupted").as_str()),
+            "{anchor:?}"
+        );
+    }
+    let day = store.stored_day(day1()).unwrap();
+    assert_eq!(day.interrupt_stack(), &[id(100)]);
 }
 
 fn toggle(n: u128, pinned_start: Option<i64>, expected_rev: u64) -> EngineMsg {
@@ -1402,4 +1423,349 @@ async fn a_failed_extend_commit_keeps_the_plan_and_withdraws_nothing() {
     // Not re-armed: the old end was already prompted.
     h.clock.set(1_900);
     h.expect_no_effect().await;
+}
+
+// --- Insert ---
+
+fn insert_msg(
+    title: &str,
+    planned_secs: u64,
+    anchor: InsertAnchor,
+    expected_rev: u64,
+) -> EngineMsg {
+    EngineMsg::InsertTask {
+        title: title.into(),
+        planned_secs,
+        anchor,
+        expected_rev,
+    }
+}
+
+fn inserted_at(n: u128, at: i64) -> DayLogEntry {
+    DayLogEntry {
+        at: ts(at),
+        kind: DayLogKind::Inserted { item_id: id(n) },
+    }
+}
+
+/// The one committed batch holding `entry`. The heartbeat may commit on its own
+/// around it, so batches are found by their entry, not their index.
+fn batch_with(store: &MemoryStore, entry: DayLogEntry) -> Vec<StoreOp> {
+    let op = StoreOp::AppendDayLog {
+        date: day1(),
+        entry,
+    };
+    let batches: Vec<_> = store
+        .batches()
+        .into_iter()
+        .filter(|b| b.ops().contains(&op))
+        .collect();
+    assert_eq!(batches.len(), 1);
+    let ops = batches[0].ops().to_vec();
+    assert_eq!(ops.last(), Some(&op), "the entry comes last");
+    ops
+}
+
+/// A (100) running from 1_000 at rev 2, B (101) and C (102) pending, all 600 s;
+/// N (1, 300 s) inserted with `Now` at 1_100, at rev 3.
+async fn n_interrupts_a() -> (Harness, Arc<MemoryStore>) {
+    let (mut h, store) = started_a(&abc_day()).await;
+    h.clock.set(1_100);
+    h.send(insert_msg("N", 300, InsertAnchor::Now, 2));
+    let snap = h.rev(3).await;
+    assert!(snap.status.is_empty(), "{:?}", snap.status);
+    (h, store)
+}
+
+#[tokio::test]
+async fn insert_now_pauses_the_running_item_onto_the_stack_and_starts_the_new_one() {
+    let (h, store) = n_interrupts_a().await;
+    let snap = h.rx.borrow().clone();
+    let day = day_of(&snap);
+    let a = day.item(id(100)).unwrap();
+    assert_eq!(a.status(), ItemStatus::Paused);
+    assert_eq!(a.segments(), &[closed(1_000, 1_100)]);
+    let n = day.item(id(1)).unwrap();
+    assert_eq!((n.title(), n.planned_secs(), n.fixed()), ("N", 300, false));
+    assert_eq!(n.segments(), &[Segment::open(ts(1_100))]);
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(1));
+    assert_eq!(day.interrupt_stack(), &[id(100)]);
+    assert_eq!(
+        spans(&snap),
+        vec![
+            (id(1), SlotKind::Running, Some((1_100, 1_400))),
+            (id(100), SlotKind::Flexible, Some((1_400, 1_900))),
+            (id(101), SlotKind::Flexible, Some((1_900, 2_500))),
+            (id(102), SlotKind::Flexible, Some((2_500, 3_100))),
+        ]
+    );
+    assert_eq!(store.stored_day(day1()), snap.day);
+    assert_eq!(store.day_log(day1()), vec![inserted_at(1, 1_100)]);
+    let ops = batch_with(&store, inserted_at(1, 1_100));
+    assert!(ops.contains(&StoreOp::CloseSegment {
+        item_id: id(100),
+        started_at: ts(1_000),
+        ended_at: ts(1_100),
+    }));
+    assert!(ops.contains(&StoreOp::OpenSegment {
+        item_id: id(1),
+        started_at: ts(1_100),
+    }));
+    assert!(ops.contains(&StoreOp::SetInterruptStack {
+        date: day1(),
+        items: vec![id(100)],
+    }));
+}
+
+#[tokio::test]
+async fn switch_from_the_inserted_item_resumes_the_interrupted_one() {
+    let (mut h, store) = n_interrupts_a().await;
+    h.clock.set(1_200);
+    h.send(switch_msg(1, 3));
+    let snap = h.rev(4).await;
+    let day = day_of(&snap);
+    assert_eq!(day.item(id(1)).unwrap().status(), ItemStatus::Done);
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(100), "A, not B");
+    assert_eq!(day.item(id(101)).unwrap().status(), ItemStatus::Pending);
+    assert!(day.interrupt_stack().is_empty());
+    assert_eq!(store.stored_day(day1()), snap.day);
+    assert_eq!(
+        store.day_log(day1()),
+        vec![inserted_at(1, 1_100), switched_at(1, Some(100), 1_200)]
+    );
+}
+
+#[tokio::test]
+async fn nested_insert_now_resumes_in_reverse_order() {
+    let (mut h, store) = n_interrupts_a().await;
+    h.clock.set(1_150);
+    h.send(insert_msg("M", 300, InsertAnchor::Now, 3));
+    let snap = h.rev(4).await;
+    assert_eq!(day_of(&snap).interrupt_stack(), &[id(100), id(1)]);
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(2));
+    // N first, then A: the stacked items flow top first.
+    let flow: Vec<ItemId> = spans(&snap).into_iter().map(|(i, ..)| i).collect();
+    assert_eq!(flow, vec![id(2), id(1), id(100), id(101), id(102)]);
+
+    h.send(switch_msg(2, 4));
+    let snap = h.rev(5).await;
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(1));
+    assert_eq!(day_of(&snap).interrupt_stack(), &[id(100)]);
+    h.send(switch_msg(1, 5));
+    let snap = h.rev(6).await;
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(100));
+    assert!(day_of(&snap).interrupt_stack().is_empty());
+    assert_eq!(store.stored_day(day1()), snap.day);
+}
+
+#[tokio::test]
+async fn insert_now_while_idle_starts_the_new_item_and_pushes_nothing() {
+    let (mut h, store) = running_on(1_000, Some(&abc_day())).await;
+    h.send(insert_msg("N", 300, InsertAnchor::Now, 1));
+    let snap = h.rev(2).await;
+    let day = day_of(&snap);
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(1));
+    assert!(day.interrupt_stack().is_empty());
+    assert!(day.item(id(1)).unwrap().order() > day.item(id(102)).unwrap().order());
+    let ops = batch_with(&store, inserted_at(1, 1_000));
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, StoreOp::SetInterruptStack { .. }))
+    );
+    assert_eq!(store.stored_day(day1()), snap.day);
+}
+
+#[tokio::test]
+async fn insert_after_the_current_item_flows_right_after_it() {
+    let (mut h, store) = started_a(&abc_day()).await;
+    h.send(insert_msg("N", 300, InsertAnchor::After(id(100)), 2));
+    let snap = h.rev(3).await;
+    assert_eq!(
+        spans(&snap),
+        vec![
+            (id(100), SlotKind::Running, Some((1_000, 1_600))),
+            (id(1), SlotKind::Flexible, Some((1_600, 1_900))),
+            (id(101), SlotKind::Flexible, Some((1_900, 2_500))),
+            (id(102), SlotKind::Flexible, Some((2_500, 3_100))),
+        ]
+    );
+    let day = day_of(&snap);
+    assert_eq!(day.item(id(1)).unwrap().status(), ItemStatus::Pending);
+    assert!(day.interrupt_stack().is_empty());
+    assert_eq!(store.day_log(day1()), vec![inserted_at(1, 1_000)]);
+}
+
+#[tokio::test]
+async fn insert_after_or_before_an_item_lands_between_its_neighbours() {
+    let (mut h, store) = running_on(1_000, Some(&abc_day())).await;
+    h.send(insert_msg("N", 300, InsertAnchor::After(id(101)), 1));
+    let snap = h.rev(2).await;
+    assert_eq!(
+        spans(&snap),
+        vec![
+            (id(100), SlotKind::Flexible, Some((1_000, 1_600))),
+            (id(101), SlotKind::Flexible, Some((1_600, 2_200))),
+            (id(1), SlotKind::Flexible, Some((2_200, 2_500))),
+            (id(102), SlotKind::Flexible, Some((2_500, 3_100))),
+        ]
+    );
+    h.send(insert_msg("M", 300, InsertAnchor::Before(id(102)), 2));
+    let snap = h.rev(3).await;
+    assert_eq!(
+        spans(&snap),
+        vec![
+            (id(100), SlotKind::Flexible, Some((1_000, 1_600))),
+            (id(101), SlotKind::Flexible, Some((1_600, 2_200))),
+            (id(1), SlotKind::Flexible, Some((2_200, 2_500))),
+            (id(2), SlotKind::Flexible, Some((2_500, 2_800))),
+            (id(102), SlotKind::Flexible, Some((2_800, 3_400))),
+        ]
+    );
+    assert_eq!(store.stored_day(day1()), snap.day);
+}
+
+#[tokio::test]
+async fn insert_at_end_goes_last_among_flexible_items_and_fixed_items_never_move() {
+    // C fixed at 5_000; A, B flexible.
+    let mut day = abc_day();
+    day.set_fixed(id(102), ts(5_000)).unwrap();
+    let (mut h, _store) = running_on(1_000, Some(&day)).await;
+    let fixed_span = (id(102), SlotKind::Fixed, Some((5_000, 5_600)));
+    h.send(insert_msg("N", 300, InsertAnchor::End, 1));
+    let snap = h.rev(2).await;
+    assert_eq!(
+        spans(&snap),
+        vec![
+            (id(100), SlotKind::Flexible, Some((1_000, 1_600))),
+            (id(101), SlotKind::Flexible, Some((1_600, 2_200))),
+            (id(1), SlotKind::Flexible, Some((2_200, 2_500))),
+            fixed_span,
+        ]
+    );
+    for (rev, anchor) in (2..).zip([
+        InsertAnchor::After(id(100)),
+        InsertAnchor::Before(id(101)),
+        InsertAnchor::Now,
+        InsertAnchor::Now,
+        InsertAnchor::After(id(1)),
+    ]) {
+        h.send(insert_msg("X", 300, anchor, rev));
+        let snap = h.rev(rev + 1).await;
+        assert!(snap.status.is_empty(), "{anchor:?}: {:?}", snap.status);
+        assert!(spans(&snap).contains(&fixed_span), "{anchor:?}");
+    }
+}
+
+#[tokio::test]
+async fn starting_a_stacked_item_by_hand_drops_its_entry() {
+    let (mut h, store) = n_interrupts_a().await;
+    h.send(start_msg(100, 3));
+    let snap = h.rev(4).await;
+    let day = day_of(&snap);
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(100));
+    assert_eq!(day.item(id(1)).unwrap().status(), ItemStatus::Paused);
+    assert!(day.interrupt_stack().is_empty());
+    assert_eq!(store.stored_day(day1()), snap.day);
+}
+
+#[tokio::test]
+async fn the_interrupt_stack_survives_an_engine_restart() {
+    let (h, store) = n_interrupts_a().await;
+    drop(h);
+    // N's open segment is recovered (paused) on restart; the stack is kept.
+    let mut h = start(&FakeClock::at(1_300), &store);
+    let snap = h.rev(1).await;
+    let day = day_of(&snap);
+    assert_eq!(day.interrupt_stack(), &[id(100)]);
+    assert_eq!(day.item(id(1)).unwrap().status(), ItemStatus::Paused);
+    assert_eq!(snap.next_item.as_ref().map(|n| n.item_id), Some(id(100)));
+    h.send(start_msg(1, 1));
+    h.rev(2).await;
+    h.send(switch_msg(1, 2));
+    let snap = h.rev(3).await;
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(100));
+    assert!(day_of(&snap).interrupt_stack().is_empty());
+}
+
+#[tokio::test]
+async fn a_stale_insert_applies_nothing() {
+    let (mut h, store) = started_a(&abc_day()).await;
+    for (rev, anchor) in (3..).zip([InsertAnchor::Now, InsertAnchor::After(id(101))]) {
+        let snap = expect_rejected(&mut h, &store, insert_msg("N", 300, anchor, 1), rev).await;
+        assert_eq!(
+            rejected(&snap),
+            Some(format!("stale rev: expected 1, current {}", rev - 1).as_str())
+        );
+    }
+    assert_eq!(store.day_log(day1()), vec![]);
+}
+
+#[tokio::test]
+async fn insert_with_bad_input_or_a_bad_anchor_is_rejected() {
+    let mut day = abc_day();
+    day.add(item(103, "F", "X")).unwrap();
+    day.set_fixed(id(103), ts(5_000)).unwrap();
+    day.add(item(104, "R", "Y")).unwrap();
+    day.remove(id(104), ts(5)).unwrap();
+    let (mut h, store) = started_a(&day).await;
+    let msgs = [
+        ("", 300, InsertAnchor::End),
+        ("  ", 300, InsertAnchor::Now),
+        ("N", 0, InsertAnchor::End),
+        ("N", 300, InsertAnchor::After(id(104))),
+        ("N", 300, InsertAnchor::Before(id(999))),
+        ("N", 300, InsertAnchor::After(id(103))),
+        ("N", 300, InsertAnchor::Before(id(103))),
+        ("N", 300, InsertAnchor::Before(id(100))),
+    ];
+    for (rev, (title, secs, anchor)) in (2..).zip(msgs) {
+        let snap = expect_rejected(
+            &mut h,
+            &store,
+            insert_msg(title, secs, anchor, rev),
+            rev + 1,
+        )
+        .await;
+        assert!(
+            rejected(&snap).unwrap().starts_with("InsertTask: "),
+            "{anchor:?}: {:?}",
+            rejected(&snap)
+        );
+    }
+    assert_eq!(store.day_log(day1()), vec![]);
+}
+
+#[tokio::test]
+async fn insert_next_to_an_interrupted_item_is_rejected() {
+    let (mut h, store) = n_interrupts_a().await;
+    for (rev, anchor) in (4..).zip([InsertAnchor::Before(id(100)), InsertAnchor::After(id(100))]) {
+        let snap =
+            expect_rejected(&mut h, &store, insert_msg("X", 300, anchor, rev - 1), rev).await;
+        assert_eq!(
+            rejected(&snap),
+            Some("InsertTask: anchor 00000000-0000-0000-0000-000000000064 is interrupted"),
+            "{anchor:?}"
+        );
+    }
+    assert_eq!(store.day_log(day1()), vec![inserted_at(1, 1_100)]);
+}
+
+#[tokio::test]
+async fn a_bad_stored_interrupt_stack_fails_the_load_with_store_status() {
+    let mut paused = abc_day();
+    paused.start(id(100), ts(10)).unwrap();
+    paused.pause(id(100), ts(20)).unwrap();
+    for (day, stack) in [
+        (abc_day(), vec![id(101)]),
+        (paused.clone(), vec![id(100), id(100)]),
+    ] {
+        let (clock, store) = (FakeClock::at(5_000), MemoryStore::new());
+        store.seed(&day);
+        store.seed_interrupt_stack(day1(), stack.clone());
+        let mut h = start(&clock, &store);
+        let snap = h.rev(1).await;
+        assert_eq!(snap.day, Some(Day::new(day1(), "UTC")), "{stack:?}");
+        let status = snap.status.iter().find(|e| e.key == StatusKey::Store);
+        assert!(status.is_some(), "{stack:?}");
+    }
 }

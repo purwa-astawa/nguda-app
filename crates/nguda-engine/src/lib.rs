@@ -13,6 +13,11 @@
 //! those whose meaning depends on the current state also carry the `expected_rev`
 //! of the snapshot the sender rendered. A stale rev, invalid input, or a domain
 //! error applies nothing and sets the [`StatusKey::CommandRejected`] status.
+//!
+//! [`EngineMsg::InsertTask`] places a new item by [`InsertAnchor`], never by index.
+//! Inserting "now" while an item runs pauses it onto the day's persisted interrupt
+//! stack, and [`nguda_core::next_task`] (used by Switch and for `next_item`) resumes
+//! the top of that stack before anything else.
 
 mod actor;
 mod batch;
@@ -83,6 +88,16 @@ pub enum EngineMsg {
         secs: u64,
         expected_rev: u64,
     },
+    /// Adds a new flexible item at `anchor` and logs `Inserted`, in one batch.
+    /// Always rev-checked. The title must not be blank and `planned_secs` must be
+    /// positive. `Now` starts the new item, first pausing any running item and
+    /// pushing it onto the interrupt stack.
+    InsertTask {
+        title: String,
+        planned_secs: u64,
+        anchor: InsertAnchor,
+        expected_rev: u64,
+    },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -91,6 +106,19 @@ pub enum EngineMsg {
 pub enum ReorderAnchor {
     Before(ItemId),
     After(ItemId),
+}
+
+/// Where [`EngineMsg::InsertTask`] puts the new item. Never a numeric index (AD-15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertAnchor {
+    /// Start it now: first in the flow, interrupting any running item.
+    Now,
+    /// Right after this item; after the running item means first in the flow.
+    After(ItemId),
+    /// Right before this non-running flexible item.
+    Before(ItemId),
+    /// After the last flexible item.
+    End,
 }
 
 /// Who owns a status entry. Each owner sets or clears only its own key (AD-14).

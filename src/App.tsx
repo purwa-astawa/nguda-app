@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
 import { events, commands } from "./bindings";
 import { nowNs } from "./elapsed";
-import { addCommand, mergeSnapshot, type Command, type Snapshot } from "./plan";
+import {
+  addCommand,
+  insertCommand,
+  insertPositions,
+  mergeSnapshot,
+  type Command,
+  type Snapshot,
+} from "./plan";
 import { PlanItemRow } from "./PlanItemRow";
 import "./App.css";
 
@@ -36,6 +43,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
     case "extendTask":
       res = await commands.extendTask(...cmd.args);
       break;
+    case "insertTask":
+      res = await commands.insertTask(...cmd.args);
+      break;
   }
   return res.status === "error" ? res.error : null;
 }
@@ -48,6 +58,9 @@ function App() {
   const [now, setNow] = useState<bigint>(nowNs);
   const [title, setTitle] = useState("");
   const [minutes, setMinutes] = useState("25");
+  const [insertTitle, setInsertTitle] = useState("");
+  const [insertMinutes, setInsertMinutes] = useState("15");
+  const [insertAt, setInsertAt] = useState("end");
   // Bumped by the tray's Extend…; the running row focuses its extend field.
   const [focusExtend, setFocusExtend] = useState(0);
 
@@ -100,6 +113,10 @@ function App() {
     );
   }
 
+  // Positions come from the snapshot; a choice that is gone falls back to the end.
+  const positions = insertPositions(snap);
+  const position = positions.find((p) => p.value === insertAt) ?? positions[positions.length - 1];
+
   return (
     <main>
       <h1>nguda{snap.day ? ` · ${snap.day.date}` : ""}</h1>
@@ -139,6 +156,43 @@ function App() {
         />
         <span>min</span>
         <button type="submit">Add</button>
+      </form>
+
+      <form
+        noValidate
+        className="add insert"
+        onSubmit={(e) => {
+          e.preventDefault();
+          send(insertCommand(snap, insertTitle, insertMinutes, position.anchor));
+          setInsertTitle("");
+        }}
+      >
+        <input
+          aria-label="Insert title"
+          placeholder="Insert task"
+          value={insertTitle}
+          onChange={(e) => setInsertTitle(e.target.value)}
+        />
+        <input
+          aria-label="Insert planned minutes"
+          type="number"
+          min="1"
+          value={insertMinutes}
+          onChange={(e) => setInsertMinutes(e.target.value)}
+        />
+        <span>min</span>
+        <select
+          aria-label="Insert position"
+          value={position.value}
+          onChange={(e) => setInsertAt(e.target.value)}
+        >
+          {positions.map((p) => (
+            <option key={p.value} value={p.value}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+        <button type="submit">Insert</button>
       </form>
 
       {snap.day === null ? (

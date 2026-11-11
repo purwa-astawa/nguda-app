@@ -23,6 +23,8 @@ export const commands = {
 	switchTask: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("switch_task", { itemId, expectedRev })),
 	/**  Adds `secs` to the running item's planned length; later items re-flow. */
 	extendTask: (itemId: string, secs: number, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("extend_task", { itemId, secs, expectedRev })),
+	/**  Inserts a new task at `anchor`; `now` starts it, pausing the running item. */
+	insertTask: (title: string, plannedSecs: number, anchor: InsertAnchorArg_Deserialize, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("insert_task", { title, plannedSecs, anchor, expectedRev })),
 	/**
 	 *  The latest snapshot, read from the engine's `watch` receiver. Sends nothing to
 	 *  the engine (AD-4), so a window that loads after the last event still renders.
@@ -53,6 +55,37 @@ export type DayView = {
  */
 export type FocusExtendEvent = null;
 
+/**
+ *  An insert target, never a numeric index (AD-15). `before` and `after` need
+ *  `itemId`; `now` and `end` ignore it.
+ */
+export type InsertAnchorArg = InsertAnchorArg_Serialize | InsertAnchorArg_Deserialize;
+
+/**
+ *  An insert target, never a numeric index (AD-15). `before` and `after` need
+ *  `itemId`; `now` and `end` ignore it.
+ */
+export type InsertAnchorArg_Deserialize = {
+	place: InsertPlace,
+	/**  UUID of the anchor item, for `before` and `after`. */
+	itemId?: string | null,
+};
+
+/**
+ *  An insert target, never a numeric index (AD-15). `before` and `after` need
+ *  `itemId`; `now` and `end` ignore it.
+ */
+export type InsertAnchorArg_Serialize = {
+	place: InsertPlace,
+	/**  UUID of the anchor item, for `before` and `after`. */
+	itemId: string | null,
+};
+
+/**  Where an inserted task goes. */
+export type InsertPlace = 
+/**  Start it now, interrupting the running item. */
+"now" | "before" | "after" | "end";
+
 export type ItemStatusView = "pending" | "running" | "paused" | "done" | "carriedOver" | "removed";
 
 export type ItemView = ItemView_Serialize | ItemView_Deserialize;
@@ -78,6 +111,11 @@ export type ItemView_Deserialize = {
 	 *  `scheduled_start` is.
 	 */
 	scheduledEnd?: string | null,
+	/**
+	 *  The item is paused on the interrupt stack: `Switch` resumes it before the
+	 *  schedule, so it is never an insert anchor.
+	 */
+	interrupted: boolean,
 };
 
 export type ItemView_Serialize = {
@@ -101,6 +139,11 @@ export type ItemView_Serialize = {
 	 *  `scheduled_start` is.
 	 */
 	scheduledEnd: string | null,
+	/**
+	 *  The item is paused on the interrupt stack: `Switch` resumes it before the
+	 *  schedule, so it is never an insert anchor.
+	 */
+	interrupted: boolean,
 };
 
 /**  A reorder target: next to another flexible item, never a numeric index (AD-15). */

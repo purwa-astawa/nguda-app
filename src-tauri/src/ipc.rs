@@ -10,8 +10,8 @@
 //! with `Err` on malformed input without sending anything; every semantic check
 //! happens in the engine, which reports rejections through `Snapshot.status`.
 
-use nguda_core::{ItemId, ItemStatus, PlanItem, Slot, Timestamp, Uuid, closed_secs};
-use nguda_engine::{EngineHandle, EngineMsg, ReorderAnchor, Snapshot, StatusKey};
+use nguda_core::{Day, ItemId, ItemStatus, PlanItem, Slot, Timestamp, Uuid, closed_secs};
+use nguda_engine::{EngineHandle, EngineMsg, InsertAnchor, ReorderAnchor, Snapshot, StatusKey};
 use serde::{Deserialize, Serialize};
 #[cfg(any(debug_assertions, test))]
 use specta_typescript::Typescript;
@@ -37,6 +37,27 @@ pub struct ReorderAnchorArg {
     pub place: AnchorPlace,
     /// UUID of the anchor item.
     pub item_id: String,
+}
+
+/// Where an inserted task goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum InsertPlace {
+    /// Start it now, interrupting the running item.
+    Now,
+    Before,
+    After,
+    End,
+}
+
+/// An insert target, never a numeric index (AD-15). `before` and `after` need
+/// `itemId`; `now` and `end` ignore it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct InsertAnchorArg {
+    pub place: InsertPlace,
+    /// UUID of the anchor item, for `before` and `after`.
+    pub item_id: Option<String>,
 }
 
 fn send(engine: &EngineHandle, msg: Result<EngineMsg, String>) -> Result<(), String> {
@@ -141,6 +162,22 @@ pub fn extend_task(
     send(&engine, extend_task_msg(&item_id, secs, expected_rev))
 }
 
+/// Inserts a new task at `anchor`; `now` starts it, pausing the running item.
+#[tauri::command]
+#[specta::specta]
+pub fn insert_task(
+    engine: State<'_, EngineHandle>,
+    title: String,
+    planned_secs: u32,
+    anchor: InsertAnchorArg,
+    expected_rev: u32,
+) -> Result<(), String> {
+    send(
+        &engine,
+        insert_task_msg(title, planned_secs, &anchor, expected_rev),
+    )
+}
+
 // --- Argument parsing: syntax only, no semantic checks ---
 
 fn parse_item_id(s: &str) -> Result<ItemId, String> {
@@ -237,6 +274,33 @@ fn extend_task_msg(item_id: &str, secs: u32, expected_rev: u32) -> Result<Engine
     })
 }
 
+fn insert_task_msg(
+    title: String,
+    planned_secs: u32,
+    anchor: &InsertAnchorArg,
+    expected_rev: u32,
+) -> Result<EngineMsg, String> {
+    let anchor_id = || {
+        anchor
+            .item_id
+            .as_deref()
+            .ok_or_else(|| "missing anchor item id".to_owned())
+            .and_then(parse_item_id)
+    };
+    let anchor = match anchor.place {
+        InsertPlace::Now => InsertAnchor::Now,
+        InsertPlace::End => InsertAnchor::End,
+        InsertPlace::Before => InsertAnchor::Before(anchor_id()?),
+        InsertPlace::After => InsertAnchor::After(anchor_id()?),
+    };
+    Ok(EngineMsg::InsertTask {
+        title,
+        planned_secs: planned_secs.into(),
+        anchor,
+        expected_rev: expected_rev.into(),
+    })
+}
+
 /// The tray's Extend… item was picked: the view focuses the running row's
 /// extend-minutes field. Carries nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type, Event)]
@@ -286,6 +350,9 @@ pub struct ItemView {
     /// RFC 3339 UTC instant the schedule puts this item's end at; set exactly when
     /// `scheduled_start` is.
     pub scheduled_end: Option<String>,
+    /// The item is paused on the interrupt stack: `Switch` resumes it before the
+    /// schedule, so it is never an insert anchor.
+    pub interrupted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type)]
@@ -355,7 +422,7 @@ impl From<&Snapshot> for SnapshotEvent {
                 s.schedule
                     .slots()
                     .iter()
-                    .filter_map(|slot| day.item(slot.item_id).map(|i| item_view(i, slot)))
+                    .filter_map(|slot| day.item(slot.item_id).map(|i| item_view(day, i, slot)))
                     .collect()
             })
             .unwrap_or_default();
@@ -384,7 +451,7 @@ impl From<&Snapshot> for SnapshotEvent {
     }
 }
 
-fn item_view(i: &PlanItem, slot: &Slot) -> ItemView {
+fn item_view(day: &Day, i: &PlanItem, slot: &Slot) -> ItemView {
     ItemView {
         id: i.id().to_string(),
         title: i.title().to_owned(),
@@ -395,6 +462,7 @@ fn item_view(i: &PlanItem, slot: &Slot) -> ItemView {
         actual_secs: saturating_u32(closed_secs(i.segments())),
         scheduled_start: slot.span.map(|sp| sp.start.to_string()),
         scheduled_end: slot.span.map(|sp| sp.end.to_string()),
+        interrupted: day.interrupt_stack().contains(&i.id()),
     }
 }
 
@@ -422,6 +490,7 @@ pub fn specta_builder() -> Builder<Wry> {
             pause_task,
             switch_task,
             extend_task,
+            insert_task,
             current_snapshot
         ])
         .events(collect_events![SnapshotEvent, FocusExtendEvent])
@@ -438,7 +507,7 @@ mod tests {
     use std::time::Duration;
 
     use nguda_adapters::{SqliteStore, SystemClock, UuidV7Ids};
-    use nguda_core::{Day, OrderKey, PlanItemRecord, Running, Segment, TimeZone};
+    use nguda_core::{OrderKey, PlanItemRecord, Running, Segment, TimeZone};
     use nguda_engine::{EngineDeps, StatusEntry};
     use tokio::time::timeout;
 
@@ -483,6 +552,7 @@ mod tests {
             "pauseTask",
             "switchTask",
             "extendTask",
+            "insertTask",
             "currentSnapshot",
         ] {
             assert!(committed.contains(&format!("\t{name}: ")), "{name}");
@@ -583,6 +653,40 @@ mod tests {
                 expected_rev: 9
             })
         );
+        let anchor = |place, id: Option<&str>| InsertAnchorArg {
+            place,
+            item_id: id.map(Into::into),
+        };
+        for (arg, expected) in [
+            (anchor(InsertPlace::Now, None), InsertAnchor::Now),
+            (anchor(InsertPlace::End, None), InsertAnchor::End),
+            (anchor(InsertPlace::Now, Some(B)), InsertAnchor::Now),
+            (
+                anchor(InsertPlace::Before, Some(B)),
+                InsertAnchor::Before(item(B)),
+            ),
+            (
+                anchor(InsertPlace::After, Some(B)),
+                InsertAnchor::After(item(B)),
+            ),
+        ] {
+            assert_eq!(
+                insert_task_msg("Call".into(), 900, &arg, 4),
+                Ok(EngineMsg::InsertTask {
+                    title: "Call".into(),
+                    planned_secs: 900,
+                    anchor: expected,
+                    expected_rev: 4
+                }),
+                "{arg:?}"
+            );
+        }
+        let arg: InsertAnchorArg =
+            serde_json::from_str(&format!(r#"{{"place":"after","itemId":"{B}"}}"#)).unwrap();
+        assert_eq!(arg, anchor(InsertPlace::After, Some(B)));
+        let arg: InsertAnchorArg =
+            serde_json::from_str(r#"{"place":"now","itemId":null}"#).unwrap();
+        assert_eq!(arg, anchor(InsertPlace::Now, None));
     }
 
     #[test]
@@ -605,6 +709,23 @@ mod tests {
                 item_id: bad.into(),
             };
             assert!(reorder_task_msg(A, &bad_anchor, 1).is_err(), "{bad}");
+            for place in [InsertPlace::Before, InsertPlace::After] {
+                let arg = InsertAnchorArg {
+                    place,
+                    item_id: Some(bad.into()),
+                };
+                assert!(insert_task_msg("t".into(), 60, &arg, 1).is_err(), "{bad}");
+            }
+        }
+        for place in [InsertPlace::Before, InsertPlace::After] {
+            let arg = InsertAnchorArg {
+                place,
+                item_id: None,
+            };
+            assert!(
+                insert_task_msg("t".into(), 60, &arg, 1).is_err(),
+                "{place:?}"
+            );
         }
         for bad in ["", "tomorrow", "2026-11-11", "2026-11-11T09:30:00"] {
             assert!(toggle_fixed_msg(A, Some(bad), 1).is_err(), "{bad}");
@@ -699,6 +820,7 @@ mod tests {
                 actual_secs: 0,
                 scheduled_start: Some("2026-11-11T08:00:00Z".into()),
                 scheduled_end: Some("2026-11-11T08:25:00Z".into()),
+                interrupted: false,
             }
         );
         // A ends at its planned end (1500 s less 60 banked); B flows after it.
@@ -732,6 +854,37 @@ mod tests {
                 key: StatusKeyView::CommandRejected,
                 message: "stale revision".into()
             }]
+        );
+    }
+
+    #[test]
+    fn snapshot_event_marks_interrupted_items() {
+        const N: &str = "0192f3a0-0000-7000-8000-00000000000e";
+        let mut day = sample_day();
+        let now = ts("2026-11-11T09:40:00Z");
+        let n = PlanItem::restore(record(N, "Call", "U")).unwrap();
+        day.interrupt(item(A), n, now).unwrap();
+        let schedule = nguda_core::reflow(&day, now);
+        let snap = Snapshot {
+            rev: 6,
+            day: Some(day),
+            schedule,
+            ..Default::default()
+        };
+        let ev = SnapshotEvent::from(&snap);
+        let flags: Vec<(&str, ItemStatusView, bool)> = ev
+            .items
+            .iter()
+            .map(|i| (i.id.as_str(), i.status, i.interrupted))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                (F, ItemStatusView::Pending, false),
+                (N, ItemStatusView::Running, false),
+                (A, ItemStatusView::Paused, true),
+                (B, ItemStatusView::Pending, false),
+            ]
         );
     }
 
