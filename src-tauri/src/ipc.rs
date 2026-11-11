@@ -592,6 +592,7 @@ mod tests {
             rev: 5,
             day: Some(day),
             running,
+            next_item: None,
             status: vec![StatusEntry {
                 key: StatusKey::CommandRejected,
                 message: "stale revision".into(),

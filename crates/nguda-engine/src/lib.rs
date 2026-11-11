@@ -101,8 +101,17 @@ pub struct Snapshot {
     /// Today's plan. `None` only before startup finishes (rev 0).
     pub day: Option<Day>,
     pub running: Option<Running>,
+    /// What to do next (`Day::next_item`). Set only while nothing runs (AD-11).
+    pub next_item: Option<NextItem>,
     /// Sorted by key.
     pub status: Vec<StatusEntry>,
+}
+
+/// The item the tray shows while nothing runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NextItem {
+    pub item_id: ItemId,
+    pub title: String,
 }
 
 /// One-time outputs, each emitted exactly once (AD-3).
