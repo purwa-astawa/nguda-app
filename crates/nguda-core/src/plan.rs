@@ -103,6 +103,7 @@ pub struct PlanItem {
     status: ItemStatus,
     removed_at: Option<Timestamp>,
     segments: Vec<Segment>,
+    carried_from: Option<ItemId>,
 }
 
 /// Every field of a [`PlanItem`], public, for rehydrating stored rows. Turn it into
@@ -118,6 +119,8 @@ pub struct PlanItemRecord {
     pub status: ItemStatus,
     pub removed_at: Option<Timestamp>,
     pub segments: Vec<Segment>,
+    /// The item on an earlier day this one was carried over from (AD-6).
+    pub carried_from: Option<ItemId>,
 }
 
 impl PlanItem {
@@ -159,6 +162,7 @@ impl PlanItem {
             status,
             removed_at,
             segments,
+            carried_from,
         } = record;
         Ok(Self {
             id,
@@ -170,6 +174,7 @@ impl PlanItem {
             status,
             removed_at,
             segments,
+            carried_from,
         })
     }
 
@@ -185,6 +190,22 @@ impl PlanItem {
             status: ItemStatus::Pending,
             removed_at: None,
             segments: Vec::new(),
+            carried_from: None,
+        }
+    }
+
+    /// A new flexible, pending item carried over from item `from` of an earlier day
+    /// (AD-6: the original stays on its day as `carried_over`).
+    pub fn carried(
+        id: ItemId,
+        title: impl Into<String>,
+        planned_secs: u64,
+        order: OrderKey,
+        from: ItemId,
+    ) -> Self {
+        Self {
+            carried_from: Some(from),
+            ..Self::new(id, title, planned_secs, order)
         }
     }
 
@@ -222,6 +243,11 @@ impl PlanItem {
 
     pub fn segments(&self) -> &[Segment] {
         &self.segments
+    }
+
+    /// The item on an earlier day this one was carried over from, if any.
+    pub fn carried_from(&self) -> Option<ItemId> {
+        self.carried_from
     }
 
     /// Pins the item at `pinned_start`, making it fixed.
@@ -1152,6 +1178,7 @@ mod tests {
             status,
             removed_at: None,
             segments: Vec::new(),
+            carried_from: None,
         }
     }
 
@@ -1185,9 +1212,25 @@ mod tests {
                 status: i.status(),
                 removed_at: i.removed_at(),
                 segments: i.segments().to_vec(),
+                carried_from: i.carried_from(),
             };
             assert_eq!(PlanItem::restore(r), Ok(i), "{s}");
         }
+    }
+
+    #[test]
+    fn carried_item_is_flexible_pending_and_restores_with_its_link() {
+        let c = PlanItem::carried(id(2), "item 1", 600, key("V"), id(1));
+        assert!(!c.fixed());
+        assert_eq!(c.status(), ItemStatus::Pending);
+        assert!(c.segments().is_empty());
+        assert_eq!(c.carried_from(), Some(id(1)));
+        assert_eq!(item(1, "V").carried_from(), None);
+        let r = PlanItemRecord {
+            carried_from: Some(id(9)),
+            ..record(ItemStatus::Pending)
+        };
+        assert_eq!(PlanItem::restore(r).unwrap().carried_from(), Some(id(9)));
     }
 
     #[test]

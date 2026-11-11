@@ -240,6 +240,7 @@ mod tests {
             status: ItemStatus::Pending,
             removed_at: None,
             segments: Vec::new(),
+            carried_from: None,
         }
     }
 

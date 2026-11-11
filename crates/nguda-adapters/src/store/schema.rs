@@ -93,6 +93,12 @@ CREATE TABLE settings (
 ) STRICT;
 "#;
 
+/// v7: the item on an earlier day a plan item was carried over from (AD-6), NULL
+/// for an item that was not carried over.
+const V7: &str = r#"
+ALTER TABLE plan_item ADD COLUMN carried_from TEXT REFERENCES plan_item (id);
+"#;
+
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -102,6 +108,7 @@ pub(super) fn migrations() -> Migrations<'static> {
         M::up(V4),
         M::up(V5),
         M::up(V6),
+        M::up(V7),
     ])
 }
 

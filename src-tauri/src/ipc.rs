@@ -187,6 +187,17 @@ pub fn set_work_end(engine: State<'_, EngineHandle>, minutes: u32) -> Result<(),
     send(&engine, Ok(set_work_end_msg(minutes)))
 }
 
+/// Carries the leftovers the snapshot at `expected_rev` lists as overflow over to
+/// tomorrow (AD-6). The engine rejects a stale rev or an empty list.
+#[tauri::command]
+#[specta::specta]
+pub fn carry_over_to_tomorrow(
+    engine: State<'_, EngineHandle>,
+    expected_rev: u32,
+) -> Result<(), String> {
+    send(&engine, Ok(carry_over_to_tomorrow_msg(expected_rev)))
+}
+
 // --- Argument parsing: syntax only, no semantic checks ---
 
 fn parse_item_id(s: &str) -> Result<ItemId, String> {
@@ -285,6 +296,12 @@ fn extend_task_msg(item_id: &str, secs: u32, expected_rev: u32) -> Result<Engine
 
 fn set_work_end_msg(minutes: u32) -> EngineMsg {
     EngineMsg::SetWorkEnd { minutes }
+}
+
+fn carry_over_to_tomorrow_msg(expected_rev: u32) -> EngineMsg {
+    EngineMsg::CarryOverToTomorrow {
+        expected_rev: expected_rev.into(),
+    }
 }
 
 fn insert_task_msg(
@@ -514,6 +531,7 @@ pub fn specta_builder() -> Builder<Wry> {
             extend_task,
             insert_task,
             set_work_end,
+            carry_over_to_tomorrow,
             current_snapshot
         ])
         .events(collect_events![SnapshotEvent, FocusExtendEvent])
@@ -577,6 +595,7 @@ mod tests {
             "extendTask",
             "insertTask",
             "setWorkEnd",
+            "carryOverToTomorrow",
             "currentSnapshot",
         ] {
             assert!(committed.contains(&format!("\t{name}: ")), "{name}");
@@ -681,6 +700,10 @@ mod tests {
             set_work_end_msg(1080),
             EngineMsg::SetWorkEnd { minutes: 1080 }
         );
+        assert_eq!(
+            carry_over_to_tomorrow_msg(7),
+            EngineMsg::CarryOverToTomorrow { expected_rev: 7 }
+        );
         let anchor = |place, id: Option<&str>| InsertAnchorArg {
             place,
             item_id: id.map(Into::into),
@@ -775,6 +798,7 @@ mod tests {
             status: ItemStatus::Pending,
             removed_at: None,
             segments: Vec::new(),
+            carried_from: None,
         }
     }
 

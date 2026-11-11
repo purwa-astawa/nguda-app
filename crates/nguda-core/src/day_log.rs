@@ -25,4 +25,6 @@ pub enum DayLogKind {
     Extended { item_id: ItemId, secs: u64 },
     /// The user inserted the new item `item_id` into the plan.
     Inserted { item_id: ItemId },
+    /// The leftover `item_id` was carried over to tomorrow as the new item `to`.
+    CarriedOver { item_id: ItemId, to: ItemId },
 }

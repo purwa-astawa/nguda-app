@@ -286,6 +286,7 @@ fn record_of(item: &PlanItem) -> PlanItemRecord {
         status: item.status(),
         removed_at: item.removed_at(),
         segments: Vec::new(),
+        carried_from: item.carried_from(),
     }
 }
 

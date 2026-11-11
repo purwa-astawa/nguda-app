@@ -28,7 +28,8 @@ export type Command =
       name: "insertTask";
       args: [title: string, plannedSecs: number, anchor: InsertAnchor, expectedRev: number];
     }
-  | { name: "setWorkEnd"; args: [minutes: number] };
+  | { name: "setWorkEnd"; args: [minutes: number] }
+  | { name: "carryOverToTomorrow"; args: [expectedRev: number] };
 
 /** Where an inserted task goes, as `insertTask` takes it. Never a numeric index. */
 export type InsertAnchor = {
@@ -165,6 +166,11 @@ export function workEndCommand(time: string): Command {
 export function overflowItems(snap: Snapshot): Item[] {
   const byId = new Map(snap.items.map((i) => [i.id, i] as const));
   return snap.overflow.flatMap((id) => byId.get(id) ?? []);
+}
+
+/** Moves the snapshot's overflow list to tomorrow, checked against its rev. */
+export function carryOverCommand(snap: Snapshot): Command {
+  return { name: "carryOverToTomorrow", args: [snap.rev] };
 }
 
 /** Everything a row offers. `null` means the button is not shown. Pin is shown

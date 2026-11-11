@@ -16,7 +16,7 @@ use nguda_core::{
 use tokio::sync::{mpsc, watch};
 
 use crate::batch::diff;
-use crate::commands::{self, domain_kind};
+use crate::commands::{self, Reject, domain_kind};
 use crate::{
     Effect, EngineDeps, EngineMsg, HEARTBEAT_EVERY, NextItem, Snapshot, StatusEntry, StatusKey,
 };
@@ -128,14 +128,7 @@ impl Actor {
         }
         self.day = match today_day {
             Some(day) => day,
-            None => match self.store.load_day(today).await {
-                Ok(Some(day)) => day,
-                Ok(None) => Day::new(today, tz_name(&self.tz)),
-                Err(e) => {
-                    self.store_failed("load today", &e);
-                    Day::new(today, tz_name(&self.tz))
-                }
-            },
+            None => self.load_or_new(today, "load today").await,
         };
         self.work_end = match self.store.load_settings().await {
             Ok(settings) => settings.work_end,
@@ -145,6 +138,36 @@ impl Actor {
             }
         };
         self.heartbeat_at = deadline_after(now);
+        self.publish();
+    }
+
+    /// The stored day `date`, or a new one in the engine's zone when it is missing
+    /// or the load fails (which sets the `Store` status as `what`).
+    async fn load_or_new(&mut self, date: Date, what: &'static str) -> Day {
+        match self.store.load_day(date).await {
+            Ok(Some(day)) => day,
+            Ok(None) => Day::new(date, tz_name(&self.tz)),
+            Err(e) => {
+                self.store_failed(what, &e);
+                Day::new(date, tz_name(&self.tz))
+            }
+        }
+    }
+
+    /// Makes the local date of `now` current when it is past today and nothing runs
+    /// (AD-8): loads that day (or starts a new one) and publishes it. Only moves
+    /// forward, possibly over several days. A running item keeps its day current.
+    async fn roll_over_if_due(&mut self, now: Timestamp) {
+        if running_of(&self.day).is_some() {
+            return;
+        }
+        let date = today(now, &self.tz);
+        if date <= self.day.date() {
+            return;
+        }
+        let day = self.load_or_new(date, "load new day").await;
+        tracing::info!(from = %self.day.date(), to = %date, "rolled over to a new day");
+        self.day = day;
         self.publish();
     }
 
@@ -211,12 +234,27 @@ impl Actor {
         next
     }
 
-    /// One command: rev check, validate and apply on copies of the day and the
-    /// work-end, commit `diff + extras` unless both are unchanged, then swap. A
-    /// rejection sets `CommandRejected`; anything that passes validation clears
-    /// it. Publishes when the day, the work-end, or the status changed, and always
-    /// on a rejection.
+    /// One command. Rollover runs first, so a command carrying a pre-rollover rev
+    /// is stale, and again after a committed change (a Pause after midnight ends
+    /// the old day). Carry-over needs tomorrow's day, so it has its own path.
     async fn handle(&mut self, msg: EngineMsg) {
+        self.roll_over_if_due(self.clock.now()).await;
+        let changed = match msg {
+            EngineMsg::CarryOverToTomorrow { expected_rev } => self.carry_over(expected_rev).await,
+            msg => self.handle_plan(msg).await,
+        };
+        if changed {
+            self.roll_over_if_due(self.clock.now()).await;
+        }
+    }
+
+    /// A command on today's day and the work-end: rev check, validate and apply on
+    /// copies of the day and the work-end, commit `diff + extras` unless both are
+    /// unchanged, then swap. A rejection sets `CommandRejected`; anything that
+    /// passes validation clears it. Publishes when the day, the work-end, or the
+    /// status changed, and always on a rejection. Returns whether a change was
+    /// committed.
+    async fn handle_plan(&mut self, msg: EngineMsg) -> bool {
         let status_before = self.status.clone();
         let name = commands::name(&msg);
         let item_id = commands::target(&msg);
@@ -238,21 +276,8 @@ impl Actor {
         );
         let changed = match applied {
             Err(reject) => {
-                match item_id {
-                    Some(item_id) => tracing::warn!(
-                        command = name,
-                        %item_id,
-                        kind = reject.kind(),
-                        "command rejected"
-                    ),
-                    None => {
-                        tracing::warn!(command = name, kind = reject.kind(), "command rejected");
-                    }
-                }
-                self.status
-                    .insert(StatusKey::CommandRejected, reject.to_string());
-                self.publish();
-                return;
+                self.reject(name, item_id, &reject);
+                return false;
             }
             Ok(extras) => {
                 self.status.remove(&StatusKey::CommandRejected);
@@ -276,6 +301,88 @@ impl Actor {
         if changed {
             self.withdraw_prompt(extend_target);
         }
+        changed
+    }
+
+    /// Logs a rejected command, sets `CommandRejected`, and publishes.
+    fn reject(&mut self, name: &'static str, item_id: Option<ItemId>, reject: &Reject) {
+        match item_id {
+            Some(item_id) => tracing::warn!(
+                command = name,
+                %item_id,
+                kind = reject.kind(),
+                "command rejected"
+            ),
+            None => {
+                tracing::warn!(command = name, kind = reject.kind(), "command rejected");
+            }
+        }
+        self.status
+            .insert(StatusKey::CommandRejected, reject.to_string());
+        self.publish();
+    }
+
+    /// Carries the current overflow list over to tomorrow (AD-6), in one batch with
+    /// tomorrow's day (loaded, or new in today's zone) and the `CarriedOver`
+    /// entries. A stale rev or an empty list is rejected; a failed load of tomorrow
+    /// sets the `Store` status and applies nothing. Always publishes. Returns
+    /// whether a change was committed.
+    async fn carry_over(&mut self, expected_rev: u64) -> bool {
+        const CMD: &str = commands::CARRY_OVER;
+        if expected_rev != self.rev {
+            let reject = Reject::StaleRev {
+                expected: expected_rev,
+                current: self.rev,
+            };
+            self.reject(CMD, None, &reject);
+            return false;
+        }
+        if self.overflow.is_empty() {
+            self.reject(CMD, None, &Reject::invalid(CMD, "nothing to carry over"));
+            return false;
+        }
+        let Ok(date) = self.day.date().tomorrow() else {
+            self.reject(CMD, None, &Reject::invalid(CMD, "today has no tomorrow"));
+            return false;
+        };
+        self.status.remove(&StatusKey::CommandRejected);
+        let tomorrow = match self.store.load_day(date).await {
+            Ok(Some(day)) => day,
+            Ok(None) => Day::new(date, self.day.tz()),
+            Err(e) => {
+                self.store_failed("load tomorrow", &e);
+                self.publish();
+                return false;
+            }
+        };
+        let now = self.clock.now();
+        let mut today_next = self.day.clone();
+        let mut tomorrow_next = tomorrow.clone();
+        let items = self.overflow.clone();
+        let extras = match commands::carry_over(
+            &mut today_next,
+            &mut tomorrow_next,
+            &items,
+            self.ids.as_ref(),
+            now,
+        ) {
+            Ok(extras) => extras,
+            Err(reject) => {
+                self.reject(CMD, None, &reject);
+                return false;
+            }
+        };
+        let mut batch = diff(&self.day, &today_next);
+        batch.extend(diff(&tomorrow, &tomorrow_next).ops().iter().cloned());
+        batch.extend(extras);
+        let changed = self
+            .swap_after_commit(today_next, self.work_end, batch)
+            .await;
+        if changed {
+            tracing::info!(count = items.len(), to = %date, "carried over to tomorrow");
+        }
+        self.publish();
+        changed
     }
 
     /// After a committed extension of `item_id`, withdraws its open prompt, if the
@@ -303,13 +410,28 @@ impl Actor {
         true
     }
 
-    /// The one deadline the loop waits on (AD-3): the earlier of the heartbeat and
-    /// the running item's unprompted planned end.
+    /// The one deadline the loop waits on (AD-3): the earliest of the heartbeat,
+    /// the running item's unprompted planned end, and the local-midnight rollover.
     fn next_deadline(&self) -> Timestamp {
-        match self.planned_end() {
-            Some((_, end)) => end.min(self.heartbeat_at),
-            None => self.heartbeat_at,
+        [
+            Some(self.heartbeat_at),
+            self.planned_end().map(|(_, end)| end),
+            self.rollover_at(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(Timestamp::MAX)
+    }
+
+    /// The next local midnight after today, in the engine's zone (AD-8), or `None`
+    /// while an item runs: its day stays current until it stops, and a past
+    /// deadline would only spin the loop.
+    fn rollover_at(&self) -> Option<Timestamp> {
+        if running_of(&self.day).is_some() {
+            return None;
         }
+        Some(next_midnight(self.day.date(), &self.tz))
     }
 
     /// The running item's planned end and its `(item_id, planned_secs)` key, unless
@@ -331,7 +453,7 @@ impl Actor {
     }
 
     /// Handles whatever is due: a planned-end prompt (an effect only: no state,
-    /// commit or snapshot), and/or the heartbeat.
+    /// commit or snapshot), the heartbeat, and/or the midnight rollover.
     async fn on_deadline(&mut self) {
         let now = self.clock.now();
         if let Some((key @ (item_id, _), end)) = self.planned_end()
@@ -355,6 +477,8 @@ impl Actor {
                 kind: PromptKind::PlannedEnd,
             });
         }
+        // Rollover first, so the heartbeat's overflow check sees the new day.
+        self.roll_over_if_due(now).await;
         if now >= self.heartbeat_at {
             self.heartbeat(now).await;
         }
@@ -501,6 +625,15 @@ fn today(now: Timestamp, tz: &TimeZone) -> Date {
 /// The IANA name fixed on new days, or `UTC` for a zone without one.
 fn tz_name(tz: &TimeZone) -> String {
     tz.iana_name().unwrap_or("UTC").to_owned()
+}
+
+/// The first instant of the day after `date` in `tz`, saturating to
+/// `Timestamp::MAX` at the end of the calendar. Never panics.
+fn next_midnight(date: Date, tz: &TimeZone) -> Timestamp {
+    date.tomorrow()
+        .and_then(|d| d.to_zoned(tz.clone()))
+        .and_then(|z| z.start_of_day())
+        .map_or(Timestamp::MAX, |z| z.timestamp())
 }
 
 fn deadline_after(now: Timestamp) -> Timestamp {

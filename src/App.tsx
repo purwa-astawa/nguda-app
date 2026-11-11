@@ -3,6 +3,7 @@ import { events, commands } from "./bindings";
 import { nowNs } from "./elapsed";
 import {
   addCommand,
+  carryOverCommand,
   insertCommand,
   insertPositions,
   mergeSnapshot,
@@ -50,6 +51,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
       break;
     case "setWorkEnd":
       res = await commands.setWorkEnd(...cmd.args);
+      break;
+    case "carryOverToTomorrow":
+      res = await commands.carryOverToTomorrow(...cmd.args);
       break;
   }
   return res.status === "error" ? res.error : null;
@@ -137,6 +141,9 @@ function App() {
                 <li key={i.id}>{i.title}</li>
               ))}
             </ul>
+            <button type="button" onClick={() => send(carryOverCommand(snap))}>
+              Move to tomorrow
+            </button>
           </div>
         ) : (
           <p key={s.key} className="status" role="alert">

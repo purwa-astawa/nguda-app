@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   addCommand,
+  carryOverCommand,
   editCommand,
   extendCommand,
   flexibleNeighbours,
@@ -286,4 +287,8 @@ test("overflow items follow snap.overflow's order and skip unknown ids", () => {
     ["B", "A"],
   );
   assert.deepEqual(overflowItems(snap(4)), []);
+});
+
+test("move to tomorrow carries over at the rendered rev", () => {
+  assert.deepEqual(carryOverCommand(snap(7)), { name: "carryOverToTomorrow", args: [7] });
 });
