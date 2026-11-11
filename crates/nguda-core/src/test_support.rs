@@ -5,6 +5,20 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use jiff::Timestamp;
 
 use crate::clock::{Clock, SleepFuture};
+use crate::segment::Segment;
+
+/// The instant `secs` whole seconds after the Unix epoch.
+pub(crate) fn ts(secs: i64) -> Timestamp {
+    Timestamp::from_second(secs).unwrap()
+}
+
+/// A closed segment from `from` to `to`, in seconds since the Unix epoch.
+pub(crate) fn closed(from: i64, to: i64) -> Segment {
+    Segment {
+        started_at: ts(from),
+        ended_at: Some(ts(to)),
+    }
+}
 
 /// A settable clock, in whole seconds since the Unix epoch.
 pub(crate) struct FakeClock(AtomicI64);
@@ -17,15 +31,11 @@ impl FakeClock {
     pub(crate) fn set(&self, secs: i64) {
         self.0.store(secs, Ordering::SeqCst);
     }
-
-    pub(crate) fn ts(secs: i64) -> Timestamp {
-        Timestamp::from_second(secs).unwrap()
-    }
 }
 
 impl Clock for FakeClock {
     fn now(&self) -> Timestamp {
-        Self::ts(self.0.load(Ordering::SeqCst))
+        ts(self.0.load(Ordering::SeqCst))
     }
 
     /// Never completes: core tests have no deadlines.

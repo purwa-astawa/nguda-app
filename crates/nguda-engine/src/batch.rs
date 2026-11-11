@@ -81,3 +81,129 @@ pub(crate) fn diff(old: &Day, new: &Day) -> StoreBatch {
     }
     batch
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{day_running_other, day1, id, item, ts};
+
+    fn ops(batch: &StoreBatch) -> Vec<StoreOp> {
+        batch.ops().to_vec()
+    }
+
+    fn put_day() -> StoreOp {
+        StoreOp::PutDay {
+            date: day1(),
+            tz: "UTC".into(),
+        }
+    }
+
+    fn put(day: &Day, n: u128) -> StoreOp {
+        StoreOp::PutItem {
+            date: day.date(),
+            item: day.item(id(n)).unwrap().clone(),
+        }
+    }
+
+    fn open_op(n: u128, at: i64) -> StoreOp {
+        StoreOp::OpenSegment {
+            item_id: id(n),
+            started_at: ts(at),
+        }
+    }
+
+    fn close_op(n: u128, from: i64, to: i64) -> StoreOp {
+        StoreOp::CloseSegment {
+            item_id: id(n),
+            started_at: ts(from),
+            ended_at: ts(to),
+        }
+    }
+
+    #[test]
+    fn diff_of_an_unchanged_day_is_only_put_day() {
+        let day = day_running_other();
+        assert_eq!(ops(&diff(&day, &day)), vec![put_day()]);
+    }
+
+    #[test]
+    fn diff_puts_a_new_item_and_opens_its_segment() {
+        let old = Day::new(day1(), "UTC");
+        let mut pending = old.clone();
+        pending.add(item(1, "a", "V")).unwrap();
+        assert_eq!(
+            ops(&diff(&old, &pending)),
+            vec![put_day(), put(&pending, 1)]
+        );
+
+        let mut started = pending.clone();
+        started.start(id(1), ts(10)).unwrap();
+        assert_eq!(
+            ops(&diff(&old, &started)),
+            vec![put_day(), put(&started, 1), open_op(1, 10)]
+        );
+    }
+
+    #[test]
+    fn diff_closes_before_it_opens() {
+        // Pause + resume of one item.
+        let old = day_running_other();
+        let mut new = old.clone();
+        new.pause(id(100), ts(1_040)).unwrap();
+        new.resume(id(100), ts(1_040)).unwrap();
+        assert_eq!(
+            ops(&diff(&old, &new)),
+            vec![
+                put_day(),
+                put(&new, 100),
+                close_op(100, 1_000, 1_040),
+                open_op(100, 1_040)
+            ]
+        );
+
+        // Pausing one item and starting a new one, listed first.
+        let mut old = Day::new(day1(), "UTC");
+        old.add(item(1, "first", "U")).unwrap();
+        old.add(item(100, "other", "V")).unwrap();
+        old.start(id(100), ts(1_000)).unwrap();
+        let mut new = old.clone();
+        new.pause(id(100), ts(1_050)).unwrap();
+        new.start(id(1), ts(1_050)).unwrap();
+        assert_eq!(
+            ops(&diff(&old, &new)),
+            vec![
+                put_day(),
+                put(&new, 1),
+                put(&new, 100),
+                close_op(100, 1_000, 1_050),
+                open_op(1, 1_050)
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_writes_new_closed_segments_before_the_new_open_one() {
+        let old = Day::new(day1(), "UTC");
+        let mut new = old.clone();
+        new.add(item(1, "a", "V")).unwrap();
+        new.add(item(2, "b", "W")).unwrap();
+        new.start(id(2), ts(10)).unwrap();
+        new.pause(id(2), ts(20)).unwrap();
+        new.start(id(1), ts(30)).unwrap();
+        new.pause(id(1), ts(40)).unwrap();
+        new.resume(id(1), ts(50)).unwrap();
+        assert_eq!(
+            ops(&diff(&old, &new)),
+            vec![
+                put_day(),
+                put(&new, 1),
+                put(&new, 2),
+                open_op(1, 30),
+                close_op(1, 30, 40),
+                open_op(2, 10),
+                close_op(2, 10, 20),
+                open_op(1, 50),
+            ]
+        );
+    }
+}

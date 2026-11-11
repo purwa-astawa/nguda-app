@@ -1,18 +1,46 @@
 //! Test doubles: an in-memory store with the SQLite adapter's semantics, a clock
-//! whose deadlines fire on `advance`, and sequential ids.
+//! whose deadlines fire on `advance`, and sequential ids. Also the fixtures shared by
+//! the engine's test modules (instants, ids, order keys, sample items and days).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nguda_core::{
-    Clock, Date, Day, DayLogEntry, IdGen, ItemId, OpenSegmentRef, PlanItem, PlanItemRecord,
-    Segment, SleepFuture, Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid,
+    Clock, Date, Day, DayLogEntry, IdGen, ItemId, OpenSegmentRef, OrderKey, PlanItem,
+    PlanItemRecord, Segment, SleepFuture, Store, StoreBatch, StoreError, StoreFuture, StoreOp,
+    Timestamp, Uuid,
 };
 use tokio::sync::watch;
 
 pub(crate) fn ts(secs: i64) -> Timestamp {
     Timestamp::from_second(secs).unwrap()
+}
+
+pub(crate) fn id(n: u128) -> ItemId {
+    ItemId(Uuid::from_u128(n))
+}
+
+pub(crate) fn key(s: &str) -> OrderKey {
+    OrderKey::new(s).unwrap()
+}
+
+/// 1970-01-01 (UTC), the day of every instant below one day of seconds.
+pub(crate) fn day1() -> Date {
+    Date::constant(1970, 1, 1)
+}
+
+/// Item ids from `SeqIds` start at 1, so seeded items use 100 and up.
+pub(crate) fn item(n: u128, title: &str, order: &str) -> PlanItem {
+    PlanItem::new(id(n), title, 600, key(order))
+}
+
+/// A day whose item 100 has been running since 1_000.
+pub(crate) fn day_running_other() -> Day {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(item(100, "other", "V")).unwrap();
+    day.start(id(100), ts(1_000)).unwrap();
+    day
 }
 
 /// A settable clock in whole seconds. `sleep_until` wakes when `advance` or `set`
@@ -78,6 +106,15 @@ struct Data {
 }
 
 impl Data {
+    /// The day log of `date`, in insertion order.
+    fn day_log(&self, date: Date) -> Vec<DayLogEntry> {
+        self.day_log
+            .iter()
+            .filter(|(d, _)| *d == date)
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
     fn item_date(&self, id: ItemId) -> Option<Date> {
         self.items.iter().find(|(_, r)| r.id == id).map(|(d, _)| *d)
     }
@@ -267,12 +304,7 @@ impl MemoryStore {
     }
 
     pub(crate) fn day_log(&self, date: Date) -> Vec<DayLogEntry> {
-        let data = self.data.lock().unwrap();
-        data.day_log
-            .iter()
-            .filter(|(d, _)| *d == date)
-            .map(|(_, e)| e.clone())
-            .collect()
+        self.data.lock().unwrap().day_log(date)
     }
 
     pub(crate) fn stored_day(&self, date: Date) -> Option<Day> {
@@ -332,12 +364,6 @@ impl Store for MemoryStore {
     }
 
     fn load_day_log(&self, date: Date) -> StoreFuture<Vec<DayLogEntry>> {
-        self.read(|d| {
-            Ok(d.day_log
-                .iter()
-                .filter(|(day, _)| *day == date)
-                .map(|(_, e)| e.clone())
-                .collect())
-        })
+        self.read(|d| Ok(d.day_log(date)))
     }
 }

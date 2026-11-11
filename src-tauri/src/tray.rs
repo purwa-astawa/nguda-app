@@ -107,7 +107,7 @@ fn render(surface: &impl Surface, text: &str) {
 
 /// `<task> · <elapsed>` while a task runs, `Next: <title>` while idle with an item
 /// left, otherwise the app name.
-pub fn title_for(snapshot: &Snapshot, now: Timestamp) -> String {
+fn title_for(snapshot: &Snapshot, now: Timestamp) -> String {
     match (&snapshot.running, &snapshot.next_item) {
         (Some(r), _) => format!("{} · {}", r.title, format_elapsed(elapsed_secs(r, now))),
         (None, Some(n)) => format!("Next: {}", n.title),

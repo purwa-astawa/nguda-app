@@ -256,7 +256,7 @@ impl PlanItem {
         self.segments.iter().any(Segment::is_open)
     }
 
-    /// The tracer/tray view of this item while it runs (AD-11).
+    /// The tray/view running state of this item while it runs (AD-11).
     pub fn running_view(&self) -> Option<Running> {
         if self.status != ItemStatus::Running {
             return None;
@@ -497,7 +497,7 @@ impl Day {
         self.apply(id, |i| i.edit(|n| n.set_planned_secs(secs)))
     }
 
-    /// Non-removed items in display order. See [`display_order`].
+    /// Non-removed items in display order. See `display_order`.
     pub fn in_order(&self) -> Vec<&PlanItem> {
         display_order(&self.items)
     }
@@ -514,7 +514,7 @@ impl Day {
 
 /// Temporary display order until re-flow (epic 2): non-removed items, fixed ones by
 /// `pinned_start`, then flexible ones by `order`. Not a schedule.
-pub fn display_order(items: &[PlanItem]) -> Vec<&PlanItem> {
+pub(crate) fn display_order(items: &[PlanItem]) -> Vec<&PlanItem> {
     let (mut fixed, mut flexible): (Vec<&PlanItem>, Vec<&PlanItem>) = items
         .iter()
         .filter(|i| i.status != ItemStatus::Removed)
@@ -530,7 +530,7 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::elapsed::elapsed_secs;
-    use crate::test_support::FakeClock;
+    use crate::test_support::{FakeClock, closed, ts};
 
     fn id(n: u128) -> ItemId {
         ItemId(Uuid::from_u128(n))
@@ -677,8 +677,8 @@ mod tests {
         assert_eq!(
             paused.segments(),
             &[Segment {
-                started_at: FakeClock::ts(1_000),
-                ended_at: Some(FakeClock::ts(1_010)),
+                started_at: ts(1_000),
+                ended_at: Some(ts(1_010)),
             }]
         );
         // The value-returning transition leaves its input untouched.
@@ -698,7 +698,7 @@ mod tests {
         let i = d.item(id(1)).unwrap();
         assert_eq!(i.status(), ItemStatus::Running);
         assert_eq!(i.segments().len(), 2);
-        assert_eq!(i.segments()[1], Segment::open(FakeClock::ts(1_020)));
+        assert_eq!(i.segments()[1], Segment::open(ts(1_020)));
     }
 
     #[test]
@@ -732,10 +732,7 @@ mod tests {
             } else {
                 1_000
             };
-            assert_eq!(
-                done.segments()[0].ended_at,
-                Some(FakeClock::ts(expected_end))
-            );
+            assert_eq!(done.segments()[0].ended_at, Some(ts(expected_end)));
         }
     }
 
@@ -764,7 +761,7 @@ mod tests {
             d.remove(id(1), clock.now()).unwrap();
             let removed = d.item(id(1)).unwrap();
             assert_eq!(removed.status(), ItemStatus::Removed);
-            assert_eq!(removed.removed_at(), Some(FakeClock::ts(2_000)));
+            assert_eq!(removed.removed_at(), Some(ts(2_000)));
         }
     }
 
@@ -860,12 +857,12 @@ mod tests {
             }
             let seg = &d.item(id(1)).unwrap().segments()[0];
             assert_eq!(seg.ended_at, Some(seg.started_at));
-            assert_eq!(d.item(id(1)).unwrap().actual_secs(FakeClock::ts(2_000)), 0);
+            assert_eq!(d.item(id(1)).unwrap().actual_secs(ts(2_000)), 0);
         }
     }
 
     #[test]
-    fn elapsed_across_pause_and_resume_matches_tracer_formula() {
+    fn elapsed_across_pause_and_resume_matches_elapsed_secs() {
         let clock = FakeClock::at(0);
         let mut d = day(vec![item(1, "V")]);
         d.start(id(1), clock.now()).unwrap();
@@ -883,12 +880,12 @@ mod tests {
 
         let running = i.running_view().unwrap();
         assert_eq!(running.title, "item 1");
-        assert_eq!(running.segment_started_at, FakeClock::ts(30));
+        assert_eq!(running.segment_started_at, ts(30));
         assert_eq!(running.accumulated_secs, 15);
         for t in [25, 30, 33, 100, 3_700] {
             assert_eq!(
-                elapsed_secs(&running, FakeClock::ts(t)),
-                i.actual_secs(FakeClock::ts(t)),
+                elapsed_secs(&running, ts(t)),
+                i.actual_secs(ts(t)),
                 "at {t}"
             );
         }
@@ -915,7 +912,7 @@ mod tests {
     /// Every by-id edit, applied to item 1 of `d`.
     fn edit_all(d: &mut Day, id: ItemId) -> Vec<Result<(), DomainError>> {
         vec![
-            d.set_fixed(id, FakeClock::ts(5_000)),
+            d.set_fixed(id, ts(5_000)),
             d.set_flexible(id),
             d.set_order(id, key("k")),
             d.set_title(id, "renamed"),
@@ -926,10 +923,10 @@ mod tests {
     #[test]
     fn fixed_requires_a_pin_and_flexible_drops_it() {
         let mut d = day(vec![item(1, "V")]);
-        d.set_fixed(id(1), FakeClock::ts(5_000)).unwrap();
+        d.set_fixed(id(1), ts(5_000)).unwrap();
         let i = d.item(id(1)).unwrap();
         assert!(i.fixed());
-        assert_eq!(i.pinned_start(), Some(FakeClock::ts(5_000)));
+        assert_eq!(i.pinned_start(), Some(ts(5_000)));
         d.set_flexible(id(1)).unwrap();
         let i = d.item(id(1)).unwrap();
         assert!(!i.fixed());
@@ -983,7 +980,7 @@ mod tests {
     fn edits_on_a_running_item_keep_it_running() {
         let clock = FakeClock::at(1_000);
         let mut d = day_with(ItemStatus::Running, &clock);
-        d.set_fixed(id(1), FakeClock::ts(900)).unwrap();
+        d.set_fixed(id(1), ts(900)).unwrap();
         d.set_title(id(1), "renamed").unwrap();
         d.set_planned_secs(id(1), 2_400).unwrap();
         d.set_order(id(1), key("k")).unwrap();
@@ -1013,9 +1010,9 @@ mod tests {
             item(2, "2"),
             item(4, "a"),
         ]);
-        d.set_fixed(id(1), FakeClock::ts(9_000)).unwrap();
-        d.set_fixed(id(2), FakeClock::ts(3_000)).unwrap();
-        d.remove(id(5), FakeClock::ts(0)).unwrap();
+        d.set_fixed(id(1), ts(9_000)).unwrap();
+        d.set_fixed(id(2), ts(3_000)).unwrap();
+        d.remove(id(5), ts(0)).unwrap();
         let ids: Vec<ItemId> = d.in_order().iter().map(|i| i.id()).collect();
         assert_eq!(ids, vec![id(2), id(1), id(4), id(3)]);
         assert_eq!(d.items().len(), 5);
@@ -1032,13 +1029,6 @@ mod tests {
             status,
             removed_at: None,
             segments: Vec::new(),
-        }
-    }
-
-    fn closed(from: i64, to: i64) -> Segment {
-        Segment {
-            started_at: FakeClock::ts(from),
-            ended_at: Some(FakeClock::ts(to)),
         }
     }
 
@@ -1059,7 +1049,7 @@ mod tests {
             let mut d = day_with(s, &clock);
             d.set_title(id(1), "t").ok();
             if s != ItemStatus::Removed {
-                d.set_fixed(id(1), FakeClock::ts(5_000)).unwrap();
+                d.set_fixed(id(1), ts(5_000)).unwrap();
             }
             let i = d.item(id(1)).unwrap().clone();
             let r = PlanItemRecord {
@@ -1090,7 +1080,7 @@ mod tests {
         r.fixed = true;
         assert_invalid(r);
         let mut r = record(ItemStatus::Pending);
-        r.pinned_start = Some(FakeClock::ts(5_000));
+        r.pinned_start = Some(ts(5_000));
         assert_invalid(r);
     }
 
@@ -1098,7 +1088,7 @@ mod tests {
     fn restore_rejects_removed_status_and_tombstone_mismatch() {
         assert_invalid(record(ItemStatus::Removed));
         let mut r = record(ItemStatus::Done);
-        r.removed_at = Some(FakeClock::ts(5_000));
+        r.removed_at = Some(ts(5_000));
         assert_invalid(r);
     }
 
@@ -1112,10 +1102,7 @@ mod tests {
     #[test]
     fn restore_rejects_two_open_segments() {
         let mut r = record(ItemStatus::Running);
-        r.segments = vec![
-            Segment::open(FakeClock::ts(10)),
-            Segment::open(FakeClock::ts(20)),
-        ];
+        r.segments = vec![Segment::open(ts(10)), Segment::open(ts(20))];
         assert_invalid(r);
     }
 
@@ -1127,7 +1114,7 @@ mod tests {
         assert_invalid(r);
         for s in [ItemStatus::Pending, ItemStatus::Paused, ItemStatus::Done] {
             let mut r = record(s);
-            r.segments = vec![Segment::open(FakeClock::ts(10))];
+            r.segments = vec![Segment::open(ts(10))];
             assert_invalid(r);
         }
     }
@@ -1173,9 +1160,9 @@ mod tests {
 
     #[test]
     fn next_item_is_the_first_pending_after_done_fixed() {
-        let t = FakeClock::ts(0);
+        let t = ts(0);
         let mut d = day(vec![item(1, "a"), item(2, "b"), item(3, "c")]);
-        d.set_fixed(id(1), FakeClock::ts(100)).unwrap();
+        d.set_fixed(id(1), ts(100)).unwrap();
         d.start(id(1), t).unwrap();
         d.finish(id(1), t).unwrap();
         assert_eq!(next_id(&d), Some(id(2)));
@@ -1184,7 +1171,7 @@ mod tests {
 
     #[test]
     fn next_item_counts_a_paused_item() {
-        let t = FakeClock::ts(0);
+        let t = ts(0);
         let mut d = day(vec![item(1, "a"), item(2, "b")]);
         d.start(id(1), t).unwrap();
         d.pause(id(1), t).unwrap();
@@ -1193,7 +1180,7 @@ mod tests {
 
     #[test]
     fn next_item_skips_done_carried_over_removed_and_running() {
-        let t = FakeClock::ts(0);
+        let t = ts(0);
         let mut d = day(vec![
             item(1, "a"),
             item(2, "b"),
@@ -1212,14 +1199,14 @@ mod tests {
     #[test]
     fn next_item_puts_a_pending_fixed_item_first() {
         let mut d = day(vec![item(1, "a"), item(2, "z")]);
-        d.set_fixed(id(2), FakeClock::ts(5_000)).unwrap();
+        d.set_fixed(id(2), ts(5_000)).unwrap();
         assert_eq!(next_id(&d), Some(id(2)));
     }
 
     #[test]
     fn next_item_is_none_when_nothing_is_left() {
         assert_eq!(next_id(&day(vec![])), None);
-        let t = FakeClock::ts(0);
+        let t = ts(0);
         let mut d = day(vec![item(1, "a"), item(2, "b")]);
         d.start(id(1), t).unwrap();
         d.finish(id(1), t).unwrap();

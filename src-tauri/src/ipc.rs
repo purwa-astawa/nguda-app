@@ -13,11 +13,13 @@
 use nguda_core::{Day, ItemId, ItemStatus, PlanItem, Timestamp, Uuid, closed_secs};
 use nguda_engine::{EngineHandle, EngineMsg, ReorderAnchor, Snapshot, StatusKey};
 use serde::{Deserialize, Serialize};
+#[cfg(any(debug_assertions, test))]
 use specta_typescript::Typescript;
 use tauri::{State, Wry};
 use tauri_specta::{Builder, Event, collect_commands, collect_events};
 
 /// Where debug builds write the bindings, relative to this crate.
+#[cfg(any(debug_assertions, test))]
 pub const BINDINGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/bindings.ts");
 
 /// Which side of the anchor item a reordered item goes.
@@ -129,14 +131,14 @@ fn parse_instant(s: &str) -> Result<Timestamp, String> {
         .map_err(|_| "invalid instant: expected an RFC 3339 timestamp".to_owned())
 }
 
-pub fn create_task_msg(title: String, planned_secs: u32) -> EngineMsg {
+fn create_task_msg(title: String, planned_secs: u32) -> EngineMsg {
     EngineMsg::CreateTask {
         title,
         planned_secs: planned_secs.into(),
     }
 }
 
-pub fn edit_task_msg(
+fn edit_task_msg(
     item_id: &str,
     title: Option<String>,
     planned_secs: Option<u32>,
@@ -148,7 +150,7 @@ pub fn edit_task_msg(
     })
 }
 
-pub fn reorder_task_msg(
+fn reorder_task_msg(
     item_id: &str,
     anchor: &ReorderAnchorArg,
     expected_rev: u32,
@@ -166,7 +168,7 @@ pub fn reorder_task_msg(
     })
 }
 
-pub fn toggle_fixed_msg(
+fn toggle_fixed_msg(
     item_id: &str,
     pinned_start: Option<&str>,
     expected_rev: u32,
@@ -178,20 +180,20 @@ pub fn toggle_fixed_msg(
     })
 }
 
-pub fn remove_task_msg(item_id: &str) -> Result<EngineMsg, String> {
+fn remove_task_msg(item_id: &str) -> Result<EngineMsg, String> {
     Ok(EngineMsg::RemoveTask {
         item_id: parse_item_id(item_id)?,
     })
 }
 
-pub fn start_task_msg(item_id: &str, expected_rev: u32) -> Result<EngineMsg, String> {
+fn start_task_msg(item_id: &str, expected_rev: u32) -> Result<EngineMsg, String> {
     Ok(EngineMsg::Start {
         item_id: parse_item_id(item_id)?,
         expected_rev: expected_rev.into(),
     })
 }
 
-pub fn pause_task_msg(item_id: &str) -> Result<EngineMsg, String> {
+fn pause_task_msg(item_id: &str) -> Result<EngineMsg, String> {
     Ok(EngineMsg::Pause {
         item_id: parse_item_id(item_id)?,
     })
@@ -372,6 +374,7 @@ pub fn specta_builder() -> Builder<Wry> {
         .events(collect_events![SnapshotEvent])
 }
 
+#[cfg(any(debug_assertions, test))]
 pub fn export_bindings(builder: &Builder<Wry>, path: &str) -> Result<(), specta_typescript::Error> {
     builder.export(Typescript::default(), path)
 }

@@ -135,18 +135,12 @@ fn batch_for(day: &Day) -> StoreBatch {
             }
         }
     }
-    for op in open {
-        b.push(op);
-    }
+    b.extend(open);
     b
 }
 
 fn batch(ops: impl IntoIterator<Item = StoreOp>) -> StoreBatch {
-    let mut b = StoreBatch::new();
-    for op in ops {
-        b.push(op);
-    }
-    b
+    ops.into_iter().collect()
 }
 
 /// A store at `path` holding `sample_day`.

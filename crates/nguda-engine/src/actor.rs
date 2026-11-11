@@ -50,7 +50,7 @@ struct Actor {
     day: Day,
     status: BTreeMap<StatusKey, String>,
     rev: u64,
-    /// The only deadline in this story: the next heartbeat.
+    /// The next deadline: currently only the heartbeat.
     next_deadline: Timestamp,
     snapshots: watch::Sender<Snapshot>,
     effects: mpsc::UnboundedSender<Effect>,
@@ -94,8 +94,7 @@ impl Actor {
         match self.find_crash().await {
             Err(e) => self.store_failed("recovery read", &e),
             Ok(None) => {
-                let mut batch = StoreBatch::new();
-                batch.push(StoreOp::SetLastAlive { at: now });
+                let batch = StoreBatch::from_iter([StoreOp::SetLastAlive { at: now }]);
                 self.commit(batch).await;
             }
             Ok(Some(crash)) => {
@@ -218,9 +217,7 @@ impl Actor {
                     false
                 } else {
                     let mut batch = diff(&self.day, &next);
-                    for op in extras {
-                        batch.push(op);
-                    }
+                    batch.extend(extras);
                     self.swap_after_commit(next, batch).await
                 }
             }
@@ -243,8 +240,7 @@ impl Actor {
     async fn heartbeat(&mut self) {
         let now = self.clock.now();
         let status_before = self.status.clone();
-        let mut batch = StoreBatch::new();
-        batch.push(StoreOp::SetLastAlive { at: now });
+        let batch = StoreBatch::from_iter([StoreOp::SetLastAlive { at: now }]);
         self.commit(batch).await;
         self.next_deadline = deadline_after(now);
         if self.status != status_before {
