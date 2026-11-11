@@ -10,6 +10,8 @@ use crate::ids::PromptId;
 pub enum PromptKind {
     /// The running item reached its planned length.
     PlannedEnd,
+    /// Re-flow pushed flexible work past the work-end time.
+    Overflow,
 }
 
 /// One notification to show. Its text may name the task (AD-14 restricts logs, not

@@ -1,5 +1,6 @@
 //! One test per row of the engine's I/O matrices (startup and recovery, and the
-//! plan commands), and the exactly-once effect check. All run against `MemoryStore`
+//! plan commands, the work-end setting and overflow), and the exactly-once effect
+//! check. All run against `MemoryStore`
 //! in UTC.
 
 use std::sync::Arc;
@@ -7,7 +8,7 @@ use std::time::Duration;
 
 use nguda_core::{
     Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OrderKey, PlanItem, PromptKind,
-    Segment, SlotKind, StoreOp, TimeZone,
+    Segment, SlotKind, StoreOp, TimeZone, WorkEnd,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -1768,4 +1769,239 @@ async fn a_bad_stored_interrupt_stack_fails_the_load_with_store_status() {
         let status = snap.status.iter().find(|e| e.key == StatusKey::Store);
         assert!(status.is_some(), "{stack:?}");
     }
+}
+
+// --- Work-end and overflow ---
+
+/// 17:00 on day 1 (UTC), the default work-end.
+const WORK_END: i64 = 61_200;
+/// 16:00 on day 1.
+const FOUR_PM: i64 = 57_600;
+
+fn work_end(minutes: u32) -> WorkEnd {
+    WorkEnd::from_minutes(minutes).unwrap()
+}
+
+fn set_work_end(minutes: u32) -> EngineMsg {
+    EngineMsg::SetWorkEnd { minutes }
+}
+
+fn notify_overflow(prompt_n: u128, item_n: u128) -> Effect {
+    Effect::Notify {
+        prompt_id: prompt(prompt_n),
+        item_id: id(item_n),
+        kind: PromptKind::Overflow,
+    }
+}
+
+fn overflow_status(snap: &Snapshot) -> Option<&str> {
+    snap.status
+        .iter()
+        .find(|e| e.key == StatusKey::Overflow)
+        .map(|e| e.message.as_str())
+}
+
+/// A (100, 15 min) running from 16:00 at rev 2 and B (101, 40 min) pending, so B
+/// ends at 16:55, just inside work-end.
+async fn a_running_at_four() -> (Harness, Arc<MemoryStore>) {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(PlanItem::new(id(100), "A", 900, key("U"))).unwrap();
+    day.add(PlanItem::new(id(101), "B", 2_400, key("V")))
+        .unwrap();
+    let (mut h, store) = running_on(FOUR_PM, Some(&day)).await;
+    h.send(start_msg(100, 1));
+    let snap = h.rev(2).await;
+    assert_eq!(
+        snap.schedule.slot(id(101)).unwrap().span.unwrap().end,
+        ts(60_900)
+    );
+    assert!(snap.overflow.is_empty());
+    (h, store)
+}
+
+/// `a_running_at_four` with A extended by 15 min at rev 3: B ends 17:10, so the
+/// episode opened with prompt 1.
+async fn b_overflowing() -> (Harness, Arc<MemoryStore>) {
+    let (mut h, store) = a_running_at_four().await;
+    h.send(extend_msg(100, 900, 2));
+    let snap = h.rev(3).await;
+    assert_eq!(snap.overflow, vec![id(101)]);
+    assert_eq!(h.next_effect().await, notify_overflow(1, 101));
+    (h, store)
+}
+
+#[tokio::test]
+async fn no_overflow_publishes_an_empty_list_and_no_status_or_notify() {
+    let (mut h, _store) = running_on(1_000, Some(&abc_day())).await;
+    let snap = h.rx.borrow().clone();
+    assert!(snap.overflow.is_empty());
+    assert_eq!(snap.work_end, WorkEnd::DEFAULT);
+    assert_eq!(overflow_status(&snap), None);
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn reflow_past_work_end_lists_the_item_sets_status_and_notifies_once() {
+    let (mut h, _store) = b_overflowing().await;
+    let snap = h.rx.borrow().clone();
+    assert_eq!(
+        snap.schedule.slot(id(101)).unwrap().span.unwrap().end,
+        ts(61_800)
+    );
+    assert_eq!(
+        overflow_status(&snap),
+        Some("1 item runs past work-end 17:00")
+    );
+    // Heartbeats pass while still overflowing: no second prompt, no new snapshot.
+    for at in [FOUR_PM + 60, FOUR_PM + 120] {
+        h.clock.set(at);
+    }
+    h.expect_no_effect().await;
+    assert_eq!(h.rx.borrow().rev, 3);
+}
+
+#[tokio::test]
+async fn a_publish_within_an_episode_updates_the_list_without_a_new_notify() {
+    let (mut h, _store) = b_overflowing().await;
+    h.send(create("C", 600));
+    let snap = h.rev(4).await;
+    assert_eq!(snap.overflow, vec![id(101), id(1)]);
+    assert_eq!(
+        overflow_status(&snap),
+        Some("2 items run past work-end 17:00")
+    );
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn removing_the_leftover_clears_status_and_withdraws_the_prompt() {
+    let (mut h, _store) = b_overflowing().await;
+    h.send(EngineMsg::RemoveTask { item_id: id(101) });
+    let snap = h.rev(4).await;
+    assert!(snap.overflow.is_empty());
+    assert_eq!(overflow_status(&snap), None);
+    assert_eq!(h.next_effect().await, withdraw(1));
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn a_later_work_end_clears_and_an_earlier_one_opens_a_new_episode() {
+    let (mut h, _store) = b_overflowing().await;
+    h.send(set_work_end(18 * 60));
+    let snap = h.rev(4).await;
+    assert_eq!(snap.work_end, work_end(18 * 60));
+    assert!(snap.overflow.is_empty());
+    assert_eq!(overflow_status(&snap), None);
+    assert_eq!(h.next_effect().await, withdraw(1));
+
+    h.send(set_work_end(17 * 60));
+    let snap = h.rev(5).await;
+    assert_eq!(snap.overflow, vec![id(101)]);
+    assert_eq!(
+        overflow_status(&snap),
+        Some("1 item runs past work-end 17:00")
+    );
+    assert_eq!(h.next_effect().await, notify_overflow(2, 101));
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn time_passing_alone_opens_an_episode_at_a_heartbeat() {
+    // Nothing runs: A flows from now and ends 16:59.
+    let mut day = Day::new(day1(), "UTC");
+    day.add(item(100, "A", "U")).unwrap();
+    let start_at = WORK_END - 660;
+    let (mut h, _store) = running_on(start_at, Some(&day)).await;
+    assert!(h.rx.borrow().overflow.is_empty());
+    // Ending exactly at work-end is not overflow: no publish.
+    h.clock.set(start_at + 60);
+    h.expect_no_effect().await;
+    assert_eq!(h.rx.borrow().rev, 1);
+    h.clock.set(start_at + 120);
+    let snap = h.rev(2).await;
+    assert_eq!(snap.overflow, vec![id(100)]);
+    assert_eq!(
+        overflow_status(&snap),
+        Some("1 item runs past work-end 17:00")
+    );
+    assert_eq!(h.next_effect().await, notify_overflow(1, 100));
+}
+
+#[tokio::test]
+async fn set_work_end_commits_one_batch_and_the_same_value_commits_nothing() {
+    let (mut h, store) = running_on(1_000, None).await;
+    h.send(set_work_end(18 * 60));
+    let snap = h.rev(2).await;
+    assert_eq!(snap.work_end, work_end(18 * 60));
+    assert!(snap.status.is_empty());
+    let batches = store.batches();
+    let with_op: Vec<_> = batches
+        .iter()
+        .filter(|b| {
+            b.ops()
+                .iter()
+                .any(|op| matches!(op, StoreOp::SetWorkEnd { .. }))
+        })
+        .collect();
+    assert_eq!(with_op.len(), 1);
+    assert_eq!(
+        with_op[0].ops(),
+        [StoreOp::SetWorkEnd {
+            work_end: work_end(18 * 60)
+        }]
+    );
+
+    let count = store.batches().len();
+    h.send(set_work_end(18 * 60));
+    h.send(create("A", 600));
+    let snap = h.rev(3).await;
+    assert_eq!(snap.day.unwrap().items().len(), 1, "rev 3 is the create");
+    assert_eq!(store.batches().len(), count + 1);
+}
+
+#[tokio::test]
+async fn set_work_end_out_of_range_is_rejected() {
+    let (mut h, store) = running_on(1_000, None).await;
+    let batches = store.batches().len();
+    h.send(set_work_end(1_440));
+    let snap = h.rev(2).await;
+    assert_eq!(
+        rejected(&snap),
+        Some("SetWorkEnd: minutes 1440 is not between 0 and 1439")
+    );
+    assert_eq!(snap.work_end, WorkEnd::DEFAULT);
+    assert_eq!(store.batches().len(), batches);
+}
+
+#[tokio::test]
+async fn a_failed_set_work_end_commit_keeps_the_old_value() {
+    let (mut h, store) = running_on(1_000, None).await;
+    store.fail_commits(true);
+    h.send(set_work_end(18 * 60));
+    let snap = h.rev(2).await;
+    assert_eq!(snap.work_end, WorkEnd::DEFAULT);
+    assert_eq!(snap.status, store_status());
+}
+
+#[tokio::test]
+async fn the_work_end_survives_an_engine_restart() {
+    let (mut h, store) = running_on(1_000, None).await;
+    h.send(set_work_end(18 * 60 + 30));
+    h.rev(2).await;
+    drop(h);
+    let mut h = start(&FakeClock::at(1_100), &store);
+    let snap = h.rev(1).await;
+    assert_eq!(snap.work_end, work_end(18 * 60 + 30));
+    assert!(snap.status.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_settings_load_uses_the_default_with_store_status() {
+    let (clock, store) = (FakeClock::at(1_000), MemoryStore::new());
+    store.seed_work_end(work_end(18 * 60 + 30));
+    store.fail_loads(true);
+    let mut h = start(&clock, &store);
+    let snap = h.rev(1).await;
+    assert_eq!(snap.work_end, WorkEnd::DEFAULT);
+    assert_eq!(snap.status, store_status());
 }

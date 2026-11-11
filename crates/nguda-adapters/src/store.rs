@@ -15,7 +15,8 @@ use std::thread::JoinHandle;
 
 use nguda_core::{
     Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OpenSegmentRef, OrderKey, PlanItem,
-    PlanItemRecord, Segment, Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid,
+    PlanItemRecord, Segment, Settings, Store, StoreBatch, StoreError, StoreFuture, StoreOp,
+    Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Params, Row, Transaction, params};
 use rusqlite_migration::{Migrations, SchemaVersion};
@@ -63,6 +64,7 @@ enum Request {
     LastAliveAt(oneshot::Sender<Result<Option<Timestamp>, StoreError>>),
     OpenSegment(oneshot::Sender<Result<Option<OpenSegmentRef>, StoreError>>),
     LoadDayLog(Date, oneshot::Sender<Result<Vec<DayLogEntry>, StoreError>>),
+    LoadSettings(oneshot::Sender<Result<Settings, StoreError>>),
 }
 
 /// The SQLite implementation of the [`Store`] port.
@@ -143,6 +145,11 @@ impl Store for SqliteStore {
     fn load_day_log(&self, date: Date) -> StoreFuture<Vec<DayLogEntry>> {
         let (tx, rx) = oneshot::channel();
         self.call(Request::LoadDayLog(date, tx), rx)
+    }
+
+    fn load_settings(&self) -> StoreFuture<Settings> {
+        let (tx, rx) = oneshot::channel();
+        self.call(Request::LoadSettings(tx), rx)
     }
 }
 
@@ -247,6 +254,9 @@ fn serve(mut conn: Connection, rx: mpsc::Receiver<Request>) {
             }
             Request::LoadDayLog(date, reply) => {
                 let _ = reply.send(load_day_log(&conn, date));
+            }
+            Request::LoadSettings(reply) => {
+                let _ = reply.send(load_settings(&conn));
             }
         }
     }
@@ -423,8 +433,41 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                 .map_err(sql_err(&ctx))?;
             }
         }
+        StoreOp::SetWorkEnd { work_end } => {
+            let ctx = "set work end";
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![SETTING_WORK_END, work_end.to_string()],
+            )
+            .map_err(sql_err(ctx))?;
+        }
     }
     Ok(())
+}
+
+/// Stored `settings.key` values.
+const SETTING_WORK_END: &str = "work_end";
+
+/// The stored settings, each missing row at its default. An unparseable value is an
+/// error, never silently defaulted.
+fn load_settings(conn: &Connection) -> Result<Settings, StoreError> {
+    let ctx = "load settings";
+    let work_end = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [SETTING_WORK_END],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_err(ctx))?
+        .map(|text| {
+            text.parse::<WorkEnd>()
+                .map_err(|_| StoreError::new(format!("{ctx}: invalid stored work_end")))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Settings { work_end })
 }
 
 /// Stored `day_log.kind` values.

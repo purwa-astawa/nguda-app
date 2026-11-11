@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use nguda_core::{
     Clock, Date, Day, DayLogEntry, DayLogKind, IdGen, ItemId, OpenSegmentRef, PlanItem, PromptId,
-    PromptKind, Running, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp, next_task,
-    reflow,
+    PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
+    WorkEnd, next_task, reflow,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -50,6 +50,13 @@ struct Actor {
     tz: TimeZone,
     /// Today's plan, as last committed.
     day: Day,
+    /// The work-end setting, as last committed or loaded.
+    work_end: WorkEnd,
+    /// The overflow list of the last publish, in schedule order.
+    overflow: Vec<ItemId>,
+    /// The prompt of the open overflow episode, if one is open: set when the list
+    /// turns non-empty, withdrawn when it empties. Not persisted.
+    overflow_prompt: Option<PromptId>,
     status: BTreeMap<StatusKey, String>,
     rev: u64,
     /// When the next heartbeat is due.
@@ -86,6 +93,9 @@ impl Actor {
             ids: deps.ids,
             tz: deps.tz,
             day,
+            work_end: WorkEnd::DEFAULT,
+            overflow: Vec::new(),
+            overflow_prompt: None,
             status: BTreeMap::new(),
             rev: 0,
             heartbeat_at: deadline_after(now),
@@ -96,8 +106,8 @@ impl Actor {
         }
     }
 
-    /// Recovers a crash-left open segment, loads today, and publishes rev 1. Runs
-    /// before any message is handled.
+    /// Recovers a crash-left open segment, loads today and the settings, and
+    /// publishes rev 1. Runs before any message is handled.
     async fn startup(&mut self) {
         let now = self.clock.now();
         let today = today(now, &self.tz);
@@ -126,6 +136,13 @@ impl Actor {
                     Day::new(today, tz_name(&self.tz))
                 }
             },
+        };
+        self.work_end = match self.store.load_settings().await {
+            Ok(settings) => settings.work_end,
+            Err(e) => {
+                self.store_failed("load settings", &e);
+                WorkEnd::DEFAULT
+            }
         };
         self.heartbeat_at = deadline_after(now);
         self.publish();
@@ -194,10 +211,11 @@ impl Actor {
         next
     }
 
-    /// One command: rev check, validate and apply on a copy, commit `diff + extras`
-    /// unless the day is unchanged, then swap. A rejection sets `CommandRejected`;
-    /// anything that passes validation clears it. Publishes when the day or the
-    /// status changed, and always on a rejection.
+    /// One command: rev check, validate and apply on copies of the day and the
+    /// work-end, commit `diff + extras` unless both are unchanged, then swap. A
+    /// rejection sets `CommandRejected`; anything that passes validation clears
+    /// it. Publishes when the day, the work-end, or the status changed, and always
+    /// on a rejection.
     async fn handle(&mut self, msg: EngineMsg) {
         let status_before = self.status.clone();
         let name = commands::name(&msg);
@@ -209,7 +227,16 @@ impl Actor {
         };
         let now = self.clock.now();
         let mut next = self.day.clone();
-        let changed = match commands::apply(msg, &mut next, now, self.ids.as_ref(), self.rev) {
+        let mut work_end = self.work_end;
+        let applied = commands::apply(
+            msg,
+            &mut next,
+            &mut work_end,
+            now,
+            self.ids.as_ref(),
+            self.rev,
+        );
+        let changed = match applied {
             Err(reject) => {
                 match item_id {
                     Some(item_id) => tracing::warn!(
@@ -229,12 +256,17 @@ impl Actor {
             }
             Ok(extras) => {
                 self.status.remove(&StatusKey::CommandRejected);
-                if next == self.day {
+                if next == self.day && work_end == self.work_end {
                     false
                 } else {
-                    let mut batch = diff(&self.day, &next);
+                    // A settings-only change touches no day row.
+                    let mut batch = if next == self.day {
+                        StoreBatch::new()
+                    } else {
+                        diff(&self.day, &next)
+                    };
                     batch.extend(extras);
-                    self.swap_after_commit(next, batch).await
+                    self.swap_after_commit(next, work_end, batch).await
                 }
             }
         };
@@ -260,12 +292,14 @@ impl Actor {
             .send(Effect::WithdrawNotification { prompt_id });
     }
 
-    /// Commits `batch`, then swaps `next` in. On failure the old state stays.
-    async fn swap_after_commit(&mut self, next: Day, batch: StoreBatch) -> bool {
+    /// Commits `batch`, then swaps `next` and `work_end` in. On failure the old
+    /// state stays.
+    async fn swap_after_commit(&mut self, next: Day, work_end: WorkEnd, batch: StoreBatch) -> bool {
         if !self.commit(batch).await {
             return false;
         }
         self.day = next;
+        self.work_end = work_end;
         true
     }
 
@@ -326,14 +360,63 @@ impl Actor {
         }
     }
 
-    /// Records `last_alive_at`. Publishes only if the store status changed.
+    /// Records `last_alive_at` and re-checks overflow, since time passing alone
+    /// re-flows pending work. Publishes only if the store status or the overflow
+    /// list changed.
     async fn heartbeat(&mut self, now: Timestamp) {
         let status_before = self.status.clone();
         let batch = StoreBatch::from_iter([StoreOp::SetLastAlive { at: now }]);
         self.commit(batch).await;
         self.heartbeat_at = deadline_after(now);
-        if self.status != status_before {
+        let overflow = self.overflow_of(&reflow(&self.day, now));
+        if self.status != status_before || overflow != self.overflow {
             self.publish();
+        }
+    }
+
+    /// The flexible items of `schedule` that end after today's work-end.
+    fn overflow_of(&self, schedule: &Schedule) -> Vec<ItemId> {
+        schedule.overflow(self.work_end.at(self.day.date(), &self.tz))
+    }
+
+    /// Sets or clears the `Overflow` status for the current list. The message holds
+    /// the count and the work-end time, never titles (AD-14).
+    fn set_overflow_status(&mut self) {
+        let message = match self.overflow.len() {
+            0 => {
+                self.status.remove(&StatusKey::Overflow);
+                return;
+            }
+            1 => format!("1 item runs past work-end {}", self.work_end),
+            n => format!("{n} items run past work-end {}", self.work_end),
+        };
+        self.status.insert(StatusKey::Overflow, message);
+    }
+
+    /// Opens an overflow episode (one `Notify`) when the list turned non-empty, or
+    /// ends it (withdrawing its prompt) when the list emptied. Runs after the
+    /// snapshot is sent, so the renderer finds the leftovers in it.
+    fn overflow_effects(&mut self) {
+        match (self.overflow.first(), self.overflow_prompt) {
+            (Some(&item_id), None) => {
+                let prompt_id = self.ids.new_prompt_id();
+                self.overflow_prompt = Some(prompt_id);
+                tracing::info!(%item_id, %prompt_id, kind = "overflow", "prompt due");
+                // A closed receiver only means nobody listens for effects.
+                let _ = self.effects.send(Effect::Notify {
+                    prompt_id,
+                    item_id,
+                    kind: PromptKind::Overflow,
+                });
+            }
+            (None, Some(prompt_id)) => {
+                self.overflow_prompt = None;
+                tracing::info!(%prompt_id, "prompt withdrawn: overflow cleared");
+                let _ = self
+                    .effects
+                    .send(Effect::WithdrawNotification { prompt_id });
+            }
+            _ => {}
         }
     }
 
@@ -364,6 +447,8 @@ impl Actor {
         let now = self.clock.now();
         let running = running_of(&self.day);
         let schedule = reflow(&self.day, now);
+        self.overflow = self.overflow_of(&schedule);
+        self.set_overflow_status();
         let next_item = if running.is_none() {
             next_item_of(&self.day, now)
         } else {
@@ -375,6 +460,8 @@ impl Actor {
             running,
             next_item,
             schedule,
+            work_end: self.work_end,
+            overflow: self.overflow.clone(),
             status: self
                 .status
                 .iter()
@@ -387,6 +474,7 @@ impl Actor {
         tracing::debug!(rev = self.rev, date = %self.day.date(), "snapshot published");
         // Every receiver may be gone; the engine keeps serving senders regardless.
         self.snapshots.send_replace(snapshot);
+        self.overflow_effects();
     }
 }
 

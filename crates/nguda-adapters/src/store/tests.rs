@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use nguda_core::{
-    Day, DayLogEntry, DayLogKind, ItemId, OpenSegmentRef, OrderKey, PlanItem, Store, StoreBatch,
-    StoreOp, Timestamp, Uuid,
+    Day, DayLogEntry, DayLogKind, ItemId, OpenSegmentRef, OrderKey, PlanItem, Settings, Store,
+    StoreBatch, StoreOp, Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
@@ -168,11 +168,12 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 5);
+    assert_eq!(user_version(&path), 6);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
     assert!(has_table(&path, "interrupt_entry"));
+    assert!(has_table(&path, "settings"));
     assert!(backups(&dir).is_empty());
 }
 
@@ -254,7 +255,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     // connection: a read-write open closing it would checkpoint them.
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-    raw.pragma_update(None, "user_version", 6).unwrap();
+    raw.pragma_update(None, "user_version", 7).unwrap();
     let copy = dir.path().join("newer.db");
     let wal = |p: &Path| PathBuf::from(format!("{}-wal", p.display()));
     std::fs::copy(&path, &copy).unwrap();
@@ -269,14 +270,14 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     assert_eq!(
         err,
         OpenError::NewerSchema {
-            found: 6,
-            supported: 5
+            found: 7,
+            supported: 6
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read(wal(&path)).unwrap(), wal_before);
     assert!(backups(&dir).is_empty());
-    assert_eq!(user_version(&path), 6);
+    assert_eq!(user_version(&path), 7);
 }
 
 #[tokio::test]
@@ -477,8 +478,67 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 5);
+    assert_eq!(user_version(&path), 6);
     assert!(has_table(&path, "engine_meta"));
+}
+
+#[tokio::test]
+async fn settings_default_when_no_row_is_stored() {
+    let dir = TempDir::new().unwrap();
+    let store = SqliteStore::open(db(&dir)).unwrap();
+    assert_eq!(store.load_settings().await.unwrap(), Settings::default());
+    assert_eq!(
+        store.load_settings().await.unwrap().work_end,
+        WorkEnd::from_minutes(17 * 60).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn work_end_round_trips_across_a_reopen_and_is_overwritten() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = SqliteStore::open(&path).unwrap();
+    let late = WorkEnd::from_minutes(18 * 60 + 30).unwrap();
+    store
+        .commit(StoreBatch::from_iter([StoreOp::SetWorkEnd {
+            work_end: late,
+        }]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.load_settings().await.unwrap().work_end, late);
+    let early = WorkEnd::from_minutes(9 * 60).unwrap();
+    store
+        .commit(StoreBatch::from_iter([StoreOp::SetWorkEnd {
+            work_end: early,
+        }]))
+        .await
+        .unwrap();
+    assert_eq!(store.load_settings().await.unwrap().work_end, early);
+    drop(store);
+    let rows: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT count(*) FROM settings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn an_unparseable_stored_work_end_is_a_store_error() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    drop(SqliteStore::open(&path).unwrap());
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO settings (key, value) VALUES ('work_end', '25:00')",
+            [],
+        )
+        .unwrap();
+    let store = SqliteStore::open(&path).unwrap();
+    let err = store.load_settings().await.unwrap_err();
+    assert_eq!(err.message, "load settings: invalid stored work_end");
 }
 
 #[tokio::test]

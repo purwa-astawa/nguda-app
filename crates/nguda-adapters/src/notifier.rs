@@ -39,6 +39,7 @@ pub(crate) struct Invocation {
 fn headline(kind: PromptKind) -> &'static str {
     match kind {
         PromptKind::PlannedEnd => "Planned time is up",
+        PromptKind::Overflow => "Plan runs past work-end",
     }
 }
 

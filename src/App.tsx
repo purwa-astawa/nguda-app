@@ -6,6 +6,8 @@ import {
   insertCommand,
   insertPositions,
   mergeSnapshot,
+  overflowItems,
+  workEndCommand,
   type Command,
   type Snapshot,
 } from "./plan";
@@ -46,6 +48,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
     case "insertTask":
       res = await commands.insertTask(...cmd.args);
       break;
+    case "setWorkEnd":
+      res = await commands.setWorkEnd(...cmd.args);
+      break;
   }
   return res.status === "error" ? res.error : null;
 }
@@ -61,6 +66,8 @@ function App() {
   const [insertTitle, setInsertTitle] = useState("");
   const [insertMinutes, setInsertMinutes] = useState("15");
   const [insertAt, setInsertAt] = useState("end");
+  // The work-end field's draft; `null` shows the snapshot's value.
+  const [workEnd, setWorkEnd] = useState<string | null>(null);
   // Bumped by the tray's Extend…; the running row focuses its extend field.
   const [focusExtend, setFocusExtend] = useState(0);
 
@@ -121,16 +128,48 @@ function App() {
     <main>
       <h1>nguda{snap.day ? ` · ${snap.day.date}` : ""}</h1>
 
-      {snap.status.map((s) => (
-        <p key={s.key} className="status" role="alert">
-          {s.message}
-        </p>
-      ))}
+      {snap.status.map((s) =>
+        s.key === "overflow" ? (
+          <div key={s.key} className="status overflow" role="alert">
+            <p>{s.message}</p>
+            <ul>
+              {overflowItems(snap).map((i) => (
+                <li key={i.id}>{i.title}</li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <p key={s.key} className="status" role="alert">
+            {s.message}
+          </p>
+        ),
+      )}
       {localError && (
         <p className="status" role="alert">
           {localError}
         </p>
       )}
+
+      <form
+        noValidate
+        className="add work-end"
+        onSubmit={(e) => {
+          e.preventDefault();
+          send(workEndCommand(workEnd ?? snap.workEnd));
+          setWorkEnd(null);
+        }}
+      >
+        <label>
+          Work ends{" "}
+          <input
+            aria-label="Work ends"
+            type="time"
+            value={workEnd ?? snap.workEnd}
+            onChange={(e) => setWorkEnd(e.target.value)}
+          />
+        </label>
+        <button type="submit">Set</button>
+      </form>
 
       <form
         noValidate

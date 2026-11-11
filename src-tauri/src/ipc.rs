@@ -4,7 +4,8 @@
 //! saturating `u32` (a TS `number`) and instants as RFC 3339 strings. `f64` was not
 //! used because specta types it `number | null` (NaN serializes as null). Command
 //! arguments follow the same convention: item ids are UUID strings, instants RFC
-//! 3339 strings, and revs and seconds `u32`.
+//! 3339 strings, revs and seconds `u32`, and the work-end time of day minutes
+//! after midnight (`u32`) in and `HH:MM` out.
 //!
 //! Commands are fire-and-forget (AD-4). Each one only parses its arguments, failing
 //! with `Err` on malformed input without sending anything; every semantic check
@@ -178,6 +179,14 @@ pub fn insert_task(
     )
 }
 
+/// Sets the work-end time of day, `minutes` after local midnight. The engine
+/// rejects values outside `0..=1439`.
+#[tauri::command]
+#[specta::specta]
+pub fn set_work_end(engine: State<'_, EngineHandle>, minutes: u32) -> Result<(), String> {
+    send(&engine, Ok(set_work_end_msg(minutes)))
+}
+
 // --- Argument parsing: syntax only, no semantic checks ---
 
 fn parse_item_id(s: &str) -> Result<ItemId, String> {
@@ -274,6 +283,10 @@ fn extend_task_msg(item_id: &str, secs: u32, expected_rev: u32) -> Result<Engine
     })
 }
 
+fn set_work_end_msg(minutes: u32) -> EngineMsg {
+    EngineMsg::SetWorkEnd { minutes }
+}
+
 fn insert_task_msg(
     title: String,
     planned_secs: u32,
@@ -318,6 +331,11 @@ pub struct SnapshotEvent {
     /// shows them as given and never re-sorts.
     pub items: Vec<ItemView>,
     pub running: Option<RunningView>,
+    /// The work-end time of day, `HH:MM` local.
+    pub work_end: String,
+    /// UUIDs of the flexible items that end after work-end, in schedule order. The
+    /// view renders them as given and never computes overflow itself.
+    pub overflow: Vec<String>,
     /// One entry per status key, sorted by key.
     pub status: Vec<StatusView>,
 }
@@ -391,6 +409,7 @@ pub struct StatusView {
 pub enum StatusKeyView {
     Store,
     CommandRejected,
+    Overflow,
 }
 
 impl From<StatusKey> for StatusKeyView {
@@ -398,6 +417,7 @@ impl From<StatusKey> for StatusKeyView {
         match k {
             StatusKey::Store => Self::Store,
             StatusKey::CommandRejected => Self::CommandRejected,
+            StatusKey::Overflow => Self::Overflow,
         }
     }
 }
@@ -439,6 +459,8 @@ impl From<&Snapshot> for SnapshotEvent {
                 segment_started_at: r.segment_started_at.to_string(),
                 accumulated_secs: saturating_u32(r.accumulated_secs),
             }),
+            work_end: s.work_end.to_string(),
+            overflow: s.overflow.iter().map(ToString::to_string).collect(),
             status: s
                 .status
                 .iter()
@@ -491,6 +513,7 @@ pub fn specta_builder() -> Builder<Wry> {
             switch_task,
             extend_task,
             insert_task,
+            set_work_end,
             current_snapshot
         ])
         .events(collect_events![SnapshotEvent, FocusExtendEvent])
@@ -507,7 +530,7 @@ mod tests {
     use std::time::Duration;
 
     use nguda_adapters::{SqliteStore, SystemClock, UuidV7Ids};
-    use nguda_core::{OrderKey, PlanItemRecord, Running, Segment, TimeZone};
+    use nguda_core::{OrderKey, PlanItemRecord, Running, Segment, TimeZone, WorkEnd};
     use nguda_engine::{EngineDeps, StatusEntry};
     use tokio::time::timeout;
 
@@ -553,6 +576,7 @@ mod tests {
             "switchTask",
             "extendTask",
             "insertTask",
+            "setWorkEnd",
             "currentSnapshot",
         ] {
             assert!(committed.contains(&format!("\t{name}: ")), "{name}");
@@ -652,6 +676,10 @@ mod tests {
                 secs: 300,
                 expected_rev: 9
             })
+        );
+        assert_eq!(
+            set_work_end_msg(1080),
+            EngineMsg::SetWorkEnd { minutes: 1080 }
         );
         let anchor = |place, id: Option<&str>| InsertAnchorArg {
             place,
@@ -792,6 +820,8 @@ mod tests {
             running,
             next_item: None,
             schedule,
+            work_end: WorkEnd::from_minutes(18 * 60 + 5).unwrap(),
+            overflow: vec![item(B)],
             status: vec![StatusEntry {
                 key: StatusKey::CommandRejected,
                 message: "stale revision".into(),
@@ -799,6 +829,8 @@ mod tests {
         };
         let ev = SnapshotEvent::from(&snap);
         assert_eq!(ev.rev, 5);
+        assert_eq!(ev.work_end, "18:05");
+        assert_eq!(ev.overflow, [B]);
         assert_eq!(
             ev.day,
             Some(DayView {
@@ -893,6 +925,7 @@ mod tests {
         let key = |k| serde_json::to_string(&StatusKeyView::from(k)).unwrap();
         assert_eq!(key(StatusKey::Store), "\"store\"");
         assert_eq!(key(StatusKey::CommandRejected), "\"commandRejected\"");
+        assert_eq!(key(StatusKey::Overflow), "\"overflow\"");
         let status = |s| serde_json::to_string(&ItemStatusView::from(s)).unwrap();
         assert_eq!(status(ItemStatus::CarriedOver), "\"carriedOver\"");
         assert_eq!(status(ItemStatus::Paused), "\"paused\"");
@@ -908,6 +941,8 @@ mod tests {
                 day: None,
                 items: vec![],
                 running: None,
+                work_end: "17:00".into(),
+                overflow: vec![],
                 status: vec![],
             }
         );
@@ -941,8 +976,8 @@ mod tests {
         }
     }
 
-    /// The Restart row: a task created through the command path survives a new
-    /// engine on the same SQLite file.
+    /// The Restart rows: a task created and a work-end set through the command path
+    /// survive a new engine on the same SQLite file.
     #[tokio::test(flavor = "multi_thread")]
     async fn created_task_survives_an_engine_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -960,8 +995,10 @@ mod tests {
         let wait = Duration::from_secs(10);
 
         let engine = spawn();
+        engine.send(set_work_end_msg(18 * 60)).unwrap();
         engine.send(create_task_msg("Write".into(), 1500)).unwrap();
         let mut rx = engine.subscribe();
+        // Handled in order: once the task shows, the work-end is committed too.
         let created = timeout(
             wait,
             rx.wait_for(|s| !SnapshotEvent::from(s).items.is_empty()),
@@ -984,9 +1021,10 @@ mod tests {
         let restored = timeout(wait, rx.wait_for(|s| s.rev >= 1))
             .await
             .expect("engine started in time")
-            .map(|s| SnapshotEvent::from(&*s).items)
+            .map(|s| SnapshotEvent::from(&*s))
             .unwrap();
-        let restored: Vec<ItemView> = restored.into_iter().map(unscheduled).collect();
+        assert_eq!(restored.work_end, "18:00");
+        let restored: Vec<ItemView> = restored.items.into_iter().map(unscheduled).collect();
         assert_eq!(restored, [created]);
     }
 }

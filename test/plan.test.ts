@@ -10,11 +10,13 @@ import {
   insertPositions,
   mergeSnapshot,
   minutesToSecs,
+  overflowItems,
   pinCommand,
   pinInstant,
   rowActions,
   rowTime,
   scheduleLabel,
+  workEndCommand,
   type Item,
   type Snapshot,
 } from "../src/plan.ts";
@@ -41,7 +43,15 @@ const A = item("A");
 const B = item("B");
 
 function snap(rev: number, items: Item[] = [F, A, B], running: Snapshot["running"] = null): Snapshot {
-  return { rev, day: { date: "2026-11-11", tz: "Europe/Berlin" }, items, running, status: [] };
+  return {
+    rev,
+    day: { date: "2026-11-11", tz: "Europe/Berlin" },
+    items,
+    running,
+    workEnd: "17:00",
+    overflow: [],
+    status: [],
+  };
 }
 
 test("merge keeps the newer rev, whatever the arrival order", () => {
@@ -258,4 +268,22 @@ test("insertCommand sends title, seconds, the anchor and the rendered rev", () =
     name: "insertTask",
     args: ["", 0, { place: "now", itemId: null }, 9],
   });
+});
+
+test("work-end sends HH:MM as minutes after midnight; anything else as 1440", () => {
+  assert.deepEqual(workEndCommand("18:00"), { name: "setWorkEnd", args: [1080] });
+  assert.deepEqual(workEndCommand("00:00"), { name: "setWorkEnd", args: [0] });
+  assert.deepEqual(workEndCommand("23:59"), { name: "setWorkEnd", args: [1439] });
+  for (const bad of ["", "7:00", "24:00", "12:60", "18:00:00", "ab:cd"]) {
+    assert.deepEqual(workEndCommand(bad), { name: "setWorkEnd", args: [1440] }, bad);
+  }
+});
+
+test("overflow items follow snap.overflow's order and skip unknown ids", () => {
+  const s = { ...snap(4), overflow: ["B", "gone", "A"] };
+  assert.deepEqual(
+    overflowItems(s).map((i) => i.id),
+    ["B", "A"],
+  );
+  assert.deepEqual(overflowItems(snap(4)), []);
 });

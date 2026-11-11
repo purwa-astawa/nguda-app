@@ -14,6 +14,7 @@ mod order;
 mod plan;
 mod reflow;
 mod segment;
+mod settings;
 mod store;
 #[cfg(test)]
 mod test_support;
@@ -32,5 +33,6 @@ pub use order::OrderKey;
 pub use plan::{Action, Day, ItemId, ItemStatus, PlanItem, PlanItemRecord};
 pub use reflow::{Schedule, Slot, SlotKind, Span, reflow};
 pub use segment::{Segment, actual_secs, closed_secs};
+pub use settings::{ParseWorkEndError, Settings, WorkEnd};
 pub use store::{OpenSegmentRef, Store, StoreBatch, StoreError, StoreFuture, StoreOp};
 pub use uuid::Uuid;
