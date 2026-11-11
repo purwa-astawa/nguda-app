@@ -17,7 +17,7 @@ use nguda_core::{
     Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OpenSegmentRef, OrderKey, PlanItem,
     PlanItemRecord, Segment, Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Params, Row, Transaction, params};
 use rusqlite_migration::{Migrations, SchemaVersion};
 use tokio::sync::oneshot;
 
@@ -256,6 +256,21 @@ fn sql_err(context: impl fmt::Display) -> impl FnOnce(rusqlite::Error) -> StoreE
     move |e| StoreError::new(format!("{context}: {e}"))
 }
 
+/// Runs `sql` and maps every row with `f`. Any SQLite error is reported under `ctx`.
+fn query_all<T>(
+    conn: &Connection,
+    sql: &str,
+    params: impl Params,
+    ctx: &str,
+    f: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>, StoreError> {
+    let mut stmt = conn.prepare(sql).map_err(sql_err(ctx))?;
+    stmt.query_map(params, f)
+        .map_err(sql_err(ctx))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_err(ctx))
+}
+
 /// One transaction per batch. Dropping the transaction on error rolls it back.
 fn commit(conn: &mut Connection, batch: &StoreBatch) -> Result<(), StoreError> {
     let tx = conn.transaction().map_err(sql_err("begin batch"))?;
@@ -431,21 +446,20 @@ fn open_segment(conn: &Connection) -> Result<Option<OpenSegmentRef>, StoreError>
 
 fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, StoreError> {
     let ctx = format!("load day log {date}");
-    let mut stmt = conn
-        .prepare("SELECT id, at, kind, item_id FROM day_log WHERE day_date = ?1 ORDER BY id")
-        .map_err(sql_err(&ctx))?;
-    let rows = stmt
-        .query_map([date.to_string()], |r| {
+    let rows = query_all(
+        conn,
+        "SELECT id, at, kind, item_id FROM day_log WHERE day_date = ?1 ORDER BY id",
+        [date.to_string()],
+        &ctx,
+        |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
             ))
-        })
-        .map_err(sql_err(&ctx))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sql_err(&ctx))?;
+        },
+    )?;
     rows.into_iter()
         .map(|(row_id, at, kind, item_id)| {
             let ctx = format!("day log entry {row_id}");
@@ -494,14 +508,13 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
         return Ok(None);
     };
 
-    let mut stmt = conn
-        .prepare(
-            r#"SELECT id, title, planned_secs, "order", fixed, pinned_start, status, removed_at
-               FROM plan_item WHERE day_date = ?1 ORDER BY rowid"#,
-        )
-        .map_err(sql_err(&ctx))?;
-    let rows = stmt
-        .query_map([&date_text], |r| {
+    let rows = query_all(
+        conn,
+        r#"SELECT id, title, planned_secs, "order", fixed, pinned_start, status, removed_at
+           FROM plan_item WHERE day_date = ?1 ORDER BY rowid"#,
+        [&date_text],
+        &ctx,
+        |r| {
             Ok(ItemRow {
                 id: r.get(0)?,
                 title: r.get(1)?,
@@ -512,30 +525,25 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
                 status: r.get(6)?,
                 removed_at: r.get(7)?,
             })
-        })
-        .map_err(sql_err(&ctx))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sql_err(&ctx))?;
+        },
+    )?;
 
     let mut segments: HashMap<ItemId, Vec<Segment>> = HashMap::new();
-    let mut stmt = conn
-        .prepare(
-            "SELECT s.item_id, s.started_at, s.ended_at
-             FROM time_segment s JOIN plan_item p ON p.id = s.item_id
-             WHERE p.day_date = ?1 ORDER BY s.started_at, s.id",
-        )
-        .map_err(sql_err(&ctx))?;
-    let segment_rows = stmt
-        .query_map([&date_text], |r| {
+    let segment_rows = query_all(
+        conn,
+        "SELECT s.item_id, s.started_at, s.ended_at
+         FROM time_segment s JOIN plan_item p ON p.id = s.item_id
+         WHERE p.day_date = ?1 ORDER BY s.started_at, s.id",
+        [&date_text],
+        &ctx,
+        |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, Option<i64>>(2)?,
             ))
-        })
-        .map_err(sql_err(&ctx))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sql_err(&ctx))?;
+        },
+    )?;
     for (item_id, started_at, ended_at) in segment_rows {
         let id = parse_id(&item_id)?;
         let ctx = format!("item {id}");

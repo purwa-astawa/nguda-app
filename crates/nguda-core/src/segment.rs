@@ -50,33 +50,23 @@ pub fn actual_secs(segments: &[Segment], now: Timestamp) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn at(secs: i64) -> Timestamp {
-        Timestamp::from_second(secs).unwrap()
-    }
-
-    fn closed(from: i64, to: i64) -> Segment {
-        Segment {
-            started_at: at(from),
-            ended_at: Some(at(to)),
-        }
-    }
+    use crate::test_support::{closed, ts};
 
     #[test]
     fn elapsed_across_pause_and_resume() {
-        let segs = [closed(0, 10), closed(20, 25), Segment::open(at(30))];
-        assert_eq!(actual_secs(&segs, at(33)), 18);
+        let segs = [closed(0, 10), closed(20, 25), Segment::open(ts(30))];
+        assert_eq!(actual_secs(&segs, ts(33)), 18);
         assert_eq!(closed_secs(&segs), 15);
     }
 
     #[test]
     fn clock_behind_open_segment_counts_zero() {
-        let segs = [closed(0, 10), Segment::open(at(100))];
-        assert_eq!(actual_secs(&segs, at(90)), 10);
+        let segs = [closed(0, 10), Segment::open(ts(100))];
+        assert_eq!(actual_secs(&segs, ts(90)), 10);
     }
 
     #[test]
     fn no_segments_is_zero() {
-        assert_eq!(actual_secs(&[], at(5)), 0);
+        assert_eq!(actual_secs(&[], ts(5)), 0);
     }
 }

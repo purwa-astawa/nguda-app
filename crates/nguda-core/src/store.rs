@@ -67,6 +67,20 @@ impl StoreBatch {
     }
 }
 
+impl Extend<StoreOp> for StoreBatch {
+    fn extend<I: IntoIterator<Item = StoreOp>>(&mut self, iter: I) {
+        self.ops.extend(iter);
+    }
+}
+
+impl FromIterator<StoreOp> for StoreBatch {
+    fn from_iter<I: IntoIterator<Item = StoreOp>>(iter: I) -> Self {
+        Self {
+            ops: iter.into_iter().collect(),
+        }
+    }
+}
+
 /// A store failure. The message carries ids and storage errors only, never titles
 /// (AD-14).
 #[derive(Clone, Debug, PartialEq, Eq)]

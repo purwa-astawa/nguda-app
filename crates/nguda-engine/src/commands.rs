@@ -74,16 +74,25 @@ pub(crate) fn domain_kind(e: &DomainError) -> &'static str {
     }
 }
 
+// Command names, shared by `name` and each command's reject messages.
+const CREATE_TASK: &str = "CreateTask";
+const EDIT_TASK: &str = "EditTask";
+const REORDER_TASK: &str = "ReorderTask";
+const TOGGLE_FIXED: &str = "ToggleFixed";
+const REMOVE_TASK: &str = "RemoveTask";
+const START: &str = "Start";
+const PAUSE: &str = "Pause";
+
 /// The message's name, for logs and reject messages.
 pub(crate) fn name(msg: &EngineMsg) -> &'static str {
     match msg {
-        EngineMsg::CreateTask { .. } => "CreateTask",
-        EngineMsg::EditTask { .. } => "EditTask",
-        EngineMsg::ReorderTask { .. } => "ReorderTask",
-        EngineMsg::ToggleFixed { .. } => "ToggleFixed",
-        EngineMsg::RemoveTask { .. } => "RemoveTask",
-        EngineMsg::Start { .. } => "Start",
-        EngineMsg::Pause { .. } => "Pause",
+        EngineMsg::CreateTask { .. } => CREATE_TASK,
+        EngineMsg::EditTask { .. } => EDIT_TASK,
+        EngineMsg::ReorderTask { .. } => REORDER_TASK,
+        EngineMsg::ToggleFixed { .. } => TOGGLE_FIXED,
+        EngineMsg::RemoveTask { .. } => REMOVE_TASK,
+        EngineMsg::Start { .. } => START,
+        EngineMsg::Pause { .. } => PAUSE,
     }
 }
 
@@ -203,13 +212,13 @@ fn check_secs(command: &'static str, secs: u64) -> Result<(), Reject> {
     Ok(())
 }
 
-pub(crate) fn create_task(
+fn create_task(
     day: &mut Day,
     ids: &dyn IdGen,
     title: String,
     planned_secs: u64,
 ) -> Result<Vec<StoreOp>, Reject> {
-    const CMD: &str = "CreateTask";
+    const CMD: &str = CREATE_TASK;
     check_title(CMD, &title)?;
     check_secs(CMD, planned_secs)?;
     let last = flexible_in_order(day).last().map(|i| i.order().clone());
@@ -219,13 +228,13 @@ pub(crate) fn create_task(
     Ok(Vec::new())
 }
 
-pub(crate) fn edit_task(
+fn edit_task(
     day: &mut Day,
     item_id: ItemId,
     title: Option<String>,
     planned_secs: Option<u64>,
 ) -> Result<Vec<StoreOp>, Reject> {
-    const CMD: &str = "EditTask";
+    const CMD: &str = EDIT_TASK;
     live_item(day, CMD, item_id, "item")?;
     if let Some(title) = &title {
         check_title(CMD, title)?;
@@ -242,12 +251,12 @@ pub(crate) fn edit_task(
     Ok(Vec::new())
 }
 
-pub(crate) fn reorder_task(
+fn reorder_task(
     day: &mut Day,
     item_id: ItemId,
     anchor: ReorderAnchor,
 ) -> Result<Vec<StoreOp>, Reject> {
-    const CMD: &str = "ReorderTask";
+    const CMD: &str = REORDER_TASK;
     let anchor_id = match anchor {
         ReorderAnchor::Before(id) | ReorderAnchor::After(id) => id,
     };
@@ -288,12 +297,12 @@ pub(crate) fn reorder_task(
     Ok(Vec::new())
 }
 
-pub(crate) fn toggle_fixed(
+fn toggle_fixed(
     day: &mut Day,
     item_id: ItemId,
     pinned_start: Option<Timestamp>,
 ) -> Result<Vec<StoreOp>, Reject> {
-    const CMD: &str = "ToggleFixed";
+    const CMD: &str = TOGGLE_FIXED;
     let item = live_item(day, CMD, item_id, "item")?;
     if item.fixed() {
         let key = item.order().clone();
@@ -321,12 +330,8 @@ pub(crate) fn toggle_fixed(
     Ok(Vec::new())
 }
 
-pub(crate) fn remove_task(
-    day: &mut Day,
-    now: Timestamp,
-    item_id: ItemId,
-) -> Result<Vec<StoreOp>, Reject> {
-    day.remove(item_id, now).map_err(domain("RemoveTask"))?;
+fn remove_task(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
+    day.remove(item_id, now).map_err(domain(REMOVE_TASK))?;
     Ok(vec![StoreOp::AppendDayLog {
         date: day.date(),
         entry: DayLogEntry {
@@ -336,19 +341,13 @@ pub(crate) fn remove_task(
     }])
 }
 
-pub(crate) fn start(
-    day: &mut Day,
-    now: Timestamp,
-    item_id: ItemId,
-) -> Result<Vec<StoreOp>, Reject> {
-    const CMD: &str = "Start";
+fn start(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
+    const CMD: &str = START;
     let status = day
         .item(item_id)
         .map(PlanItem::status)
-        .ok_or(Reject::Domain {
-            command: CMD,
-            error: DomainError::UnknownItem(item_id),
-        })?;
+        .ok_or(DomainError::UnknownItem(item_id))
+        .map_err(domain(CMD))?;
     if status == ItemStatus::Running {
         return Ok(Vec::new());
     }
@@ -369,29 +368,17 @@ pub(crate) fn start(
     Ok(Vec::new())
 }
 
-pub(crate) fn pause(
-    day: &mut Day,
-    now: Timestamp,
-    item_id: ItemId,
-) -> Result<Vec<StoreOp>, Reject> {
-    day.pause(item_id, now).map_err(domain("Pause"))?;
+fn pause(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
+    day.pause(item_id, now).map_err(domain(PAUSE))?;
     Ok(Vec::new())
 }
 
 #[cfg(test)]
 mod tests {
-    use nguda_core::{Date, Uuid};
+    use nguda_core::Date;
 
     use super::*;
-    use crate::test_support::{SeqIds, ts};
-
-    fn id(n: u128) -> ItemId {
-        ItemId(Uuid::from_u128(n))
-    }
-
-    fn key(s: &str) -> OrderKey {
-        OrderKey::new(s).unwrap()
-    }
+    use crate::test_support::{SeqIds, id, key, ts};
 
     /// Flexible items 100 (A, "U"), 101 (B, "V"), 102 (C, "W").
     fn abc() -> Day {

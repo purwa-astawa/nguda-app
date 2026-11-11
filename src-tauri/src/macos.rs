@@ -4,9 +4,8 @@
 //! monospaced digits, so the ticking title keeps a steady width. Tauri exposes no
 //! handle to that button, so the helper finds it in AppKit's private view
 //! hierarchy (a window whose class name contains `StatusBarWindow`, holding an
-//! `NSButton`). That dependency was proven in the framework spike
-//! (`spike/tauri-tray`). If the hierarchy changes, the lookup fails and the title
-//! keeps the default font.
+//! `NSButton`). That dependency was proven in an untracked framework spike. If the
+//! hierarchy changes, the lookup fails and the title keeps the default font.
 
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;

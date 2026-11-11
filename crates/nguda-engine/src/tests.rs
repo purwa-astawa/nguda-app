@@ -1,17 +1,19 @@
 //! One test per row of the engine's I/O matrices (startup and recovery, and the
-//! plan commands), the `diff` unit tests, and the exactly-once effect check. All run against `MemoryStore` in UTC.
+//! plan commands), and the exactly-once effect check. All run against `MemoryStore`
+//! in UTC.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OrderKey, PlanItem, Segment,
-    StoreBatch, StoreOp, TimeZone, Uuid,
+    Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OrderKey, PlanItem, Segment, StoreOp,
+    TimeZone,
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::batch::diff;
-use crate::test_support::{FakeClock, INJECTED, MemoryStore, SeqIds, ts};
+use crate::test_support::{
+    FakeClock, INJECTED, MemoryStore, SeqIds, day_running_other, day1, id, item, ts,
+};
 use crate::{
     Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, NextItem, ReorderAnchor, Snapshot,
     StatusEntry, StatusKey, spawn,
@@ -19,22 +21,8 @@ use crate::{
 
 const DAY_SECS: i64 = 86_400;
 
-/// 1970-01-01 (UTC), the day of every instant below `DAY_SECS`.
-fn day1() -> Date {
-    Date::constant(1970, 1, 1)
-}
-
 fn day2() -> Date {
     Date::constant(1970, 1, 2)
-}
-
-fn id(n: u128) -> ItemId {
-    ItemId(Uuid::from_u128(n))
-}
-
-/// Item ids from `SeqIds` start at 1, so seeded items use 100 and up.
-fn item(n: u128, title: &str, order: &str) -> PlanItem {
-    PlanItem::new(id(n), title, 600, OrderKey::new(order).unwrap())
 }
 
 fn closed(from: i64, to: i64) -> Segment {
@@ -183,14 +171,6 @@ async fn existing_day_is_loaded_into_rev_1() {
     let snap = h.rev(1).await;
     assert_eq!(snap.day, Some(day));
     assert_eq!(snap.running, None);
-}
-
-/// A day whose item 100 has been running since 1_000.
-fn day_running_other() -> Day {
-    let mut day = Day::new(day1(), "UTC");
-    day.add(item(100, "other", "V")).unwrap();
-    day.start(id(100), ts(1_000)).unwrap();
-    day
 }
 
 // --- Plan commands ---
@@ -876,126 +856,4 @@ async fn the_recovered_effect_is_emitted_exactly_once() {
         Ok(Effect::Recovered { item_id: id(100) })
     );
     assert!(h.effects.try_recv().is_err());
-}
-
-// --- diff ---
-
-fn ops(batch: &StoreBatch) -> Vec<StoreOp> {
-    batch.ops().to_vec()
-}
-
-fn put_day() -> StoreOp {
-    StoreOp::PutDay {
-        date: day1(),
-        tz: "UTC".into(),
-    }
-}
-
-fn put(day: &Day, n: u128) -> StoreOp {
-    StoreOp::PutItem {
-        date: day.date(),
-        item: day.item(id(n)).unwrap().clone(),
-    }
-}
-
-fn open_op(n: u128, at: i64) -> StoreOp {
-    StoreOp::OpenSegment {
-        item_id: id(n),
-        started_at: ts(at),
-    }
-}
-
-fn close_op(n: u128, from: i64, to: i64) -> StoreOp {
-    StoreOp::CloseSegment {
-        item_id: id(n),
-        started_at: ts(from),
-        ended_at: ts(to),
-    }
-}
-
-#[test]
-fn diff_of_an_unchanged_day_is_only_put_day() {
-    let day = day_running_other();
-    assert_eq!(ops(&diff(&day, &day)), vec![put_day()]);
-}
-
-#[test]
-fn diff_puts_a_new_item_and_opens_its_segment() {
-    let old = Day::new(day1(), "UTC");
-    let mut pending = old.clone();
-    pending.add(item(1, "a", "V")).unwrap();
-    assert_eq!(
-        ops(&diff(&old, &pending)),
-        vec![put_day(), put(&pending, 1)]
-    );
-
-    let mut started = pending.clone();
-    started.start(id(1), ts(10)).unwrap();
-    assert_eq!(
-        ops(&diff(&old, &started)),
-        vec![put_day(), put(&started, 1), open_op(1, 10)]
-    );
-}
-
-#[test]
-fn diff_closes_before_it_opens() {
-    // Pause + resume of one item.
-    let old = day_running_other();
-    let mut new = old.clone();
-    new.pause(id(100), ts(1_040)).unwrap();
-    new.resume(id(100), ts(1_040)).unwrap();
-    assert_eq!(
-        ops(&diff(&old, &new)),
-        vec![
-            put_day(),
-            put(&new, 100),
-            close_op(100, 1_000, 1_040),
-            open_op(100, 1_040)
-        ]
-    );
-
-    // Pausing one item and starting a new one, listed first.
-    let mut old = Day::new(day1(), "UTC");
-    old.add(item(1, "first", "U")).unwrap();
-    old.add(item(100, "other", "V")).unwrap();
-    old.start(id(100), ts(1_000)).unwrap();
-    let mut new = old.clone();
-    new.pause(id(100), ts(1_050)).unwrap();
-    new.start(id(1), ts(1_050)).unwrap();
-    assert_eq!(
-        ops(&diff(&old, &new)),
-        vec![
-            put_day(),
-            put(&new, 1),
-            put(&new, 100),
-            close_op(100, 1_000, 1_050),
-            open_op(1, 1_050)
-        ]
-    );
-}
-
-#[test]
-fn diff_writes_new_closed_segments_before_the_new_open_one() {
-    let old = Day::new(day1(), "UTC");
-    let mut new = old.clone();
-    new.add(item(1, "a", "V")).unwrap();
-    new.add(item(2, "b", "W")).unwrap();
-    new.start(id(2), ts(10)).unwrap();
-    new.pause(id(2), ts(20)).unwrap();
-    new.start(id(1), ts(30)).unwrap();
-    new.pause(id(1), ts(40)).unwrap();
-    new.resume(id(1), ts(50)).unwrap();
-    assert_eq!(
-        ops(&diff(&old, &new)),
-        vec![
-            put_day(),
-            put(&new, 1),
-            put(&new, 2),
-            open_op(1, 30),
-            close_op(1, 30, 40),
-            open_op(2, 10),
-            close_op(2, 10, 20),
-            open_op(1, 50),
-        ]
-    );
 }
