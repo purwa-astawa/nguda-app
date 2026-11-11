@@ -380,20 +380,26 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
         }
         StoreOp::AppendDayLog { date, entry } => {
             let ctx = format!("append day log for {date}");
-            let (kind, item_id, to_item_id) = match &entry.kind {
-                DayLogKind::Recovered { item_id } => (KIND_RECOVERED, item_id, None),
-                DayLogKind::Removed { item_id } => (KIND_REMOVED, item_id, None),
-                DayLogKind::Switched { from, to } => (KIND_SWITCHED, from, *to),
+            let (kind, item_id, to_item_id, secs) = match &entry.kind {
+                DayLogKind::Recovered { item_id } => (KIND_RECOVERED, item_id, None, None),
+                DayLogKind::Removed { item_id } => (KIND_REMOVED, item_id, None, None),
+                DayLogKind::Switched { from, to } => (KIND_SWITCHED, from, *to, None),
+                DayLogKind::Extended { item_id, secs } => {
+                    let secs = i64::try_from(*secs)
+                        .map_err(|_| StoreError::new(format!("{ctx}: secs out of range")))?;
+                    (KIND_EXTENDED, item_id, None, Some(secs))
+                }
             };
             tx.execute(
-                "INSERT INTO day_log (day_date, at, kind, item_id, to_item_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO day_log (day_date, at, kind, item_id, to_item_id, secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     date.to_string(),
                     to_nanos(entry.at, &ctx)?,
                     kind,
                     item_id.to_string(),
-                    to_item_id.map(|id| id.to_string())
+                    to_item_id.map(|id| id.to_string()),
+                    secs
                 ],
             )
             .map_err(sql_err(&ctx))?;
@@ -406,6 +412,7 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
 const KIND_RECOVERED: &str = "recovered";
 const KIND_REMOVED: &str = "removed";
 const KIND_SWITCHED: &str = "switched";
+const KIND_EXTENDED: &str = "extended";
 
 fn last_alive_at(conn: &Connection) -> Result<Option<Timestamp>, StoreError> {
     let ctx = "load last alive";
@@ -457,7 +464,8 @@ fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, Store
     let ctx = format!("load day log {date}");
     let rows = query_all(
         conn,
-        "SELECT id, at, kind, item_id, to_item_id FROM day_log WHERE day_date = ?1 ORDER BY id",
+        "SELECT id, at, kind, item_id, to_item_id, secs FROM day_log
+         WHERE day_date = ?1 ORDER BY id",
         [date.to_string()],
         &ctx,
         |r| {
@@ -467,11 +475,12 @@ fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, Store
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
             ))
         },
     )?;
     rows.into_iter()
-        .map(|(row_id, at, kind, item_id, to_item_id)| {
+        .map(|(row_id, at, kind, item_id, to_item_id, secs)| {
             let ctx = format!("day log entry {row_id}");
             let kind = match (kind.as_str(), item_id) {
                 (KIND_RECOVERED, Some(item_id)) => DayLogKind::Recovered {
@@ -484,7 +493,16 @@ fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, Store
                     from: parse_id(&from)?,
                     to: to_item_id.as_deref().map(parse_id).transpose()?,
                 },
-                (KIND_RECOVERED | KIND_REMOVED | KIND_SWITCHED, None) => {
+                (KIND_EXTENDED, Some(item_id)) => DayLogKind::Extended {
+                    item_id: parse_id(&item_id)?,
+                    secs: secs
+                        .and_then(|s| u64::try_from(s).ok())
+                        .filter(|s| *s > 0)
+                        .ok_or_else(|| {
+                            StoreError::new(format!("{ctx}: missing or invalid secs"))
+                        })?,
+                },
+                (KIND_RECOVERED | KIND_REMOVED | KIND_SWITCHED | KIND_EXTENDED, None) => {
                     return Err(StoreError::new(format!("{ctx}: missing item id")));
                 }
                 _ => return Err(StoreError::new(format!("{ctx}: unknown kind"))),

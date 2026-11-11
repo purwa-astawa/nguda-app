@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   editCommand,
+  extendCommand,
   pinCommand,
   rowActions,
   rowTime,
@@ -29,14 +30,29 @@ type Props = {
   item: Item;
   now: bigint;
   send: (cmd: Command) => void;
+  /** Changes each time the tray asks to focus the running row's extend field. */
+  focusExtend: number;
 };
 
 /** One plan item: its facts, and the buttons `rowActions` allows. */
-export function PlanItemRow({ snap, item, now, send }: Props) {
+export function PlanItemRow({ snap, item, now, send, focusExtend }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(item.title);
   const [minutes, setMinutes] = useState(String(secsToMinutes(item.plannedSecs)));
   const [pinTime, setPinTime] = useState("");
+  const [extendMinutes, setExtendMinutes] = useState("5");
+  const extendRef = useRef<HTMLInputElement>(null);
+  // The last tray focus request this row has handled; starts at the value at mount.
+  const handledFocus = useRef(focusExtend);
+  const running = item.status === "running";
+  const extend = extendCommand(snap, item, extendMinutes);
+
+  useEffect(() => {
+    if (focusExtend === handledFocus.current || !running) return;
+    handledFocus.current = focusExtend;
+    extendRef.current?.focus();
+    extendRef.current?.select();
+  }, [focusExtend, running]);
   const actions = rowActions(snap, item);
   const pin = pinCommand(snap, item, pinTime);
   const scheduled = snap.day ? scheduleLabel(item, snap.day.tz) : null;
@@ -89,6 +105,28 @@ export function PlanItemRow({ snap, item, now, send }: Props) {
         {actions.start && <button onClick={() => send(actions.start!)}>Start</button>}
         {actions.pause && <button onClick={() => send(actions.pause!)}>Pause</button>}
         {actions.switch && <button onClick={() => send(actions.switch!)}>Switch</button>}
+        {running && (
+          <form
+            noValidate
+            className="extend"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (extend) send(extend);
+            }}
+          >
+            <input
+              ref={extendRef}
+              aria-label="Extend minutes"
+              type="number"
+              min="1"
+              value={extendMinutes}
+              onChange={(e) => setExtendMinutes(e.target.value)}
+            />
+            <button type="submit" disabled={!extend}>
+              Extend
+            </button>
+          </form>
+        )}
         {!editing && <button onClick={startEdit}>Edit</button>}
         {actions.up && (
           <button aria-label="Move up" onClick={() => send(actions.up!)}>

@@ -61,6 +61,8 @@ pub enum Action {
     Edit,
     /// Finish the running item and move on to the next one.
     Switch,
+    /// Give the running item more planned time.
+    Extend,
 }
 
 impl fmt::Display for Action {
@@ -74,6 +76,7 @@ impl fmt::Display for Action {
             Self::Remove => "remove",
             Self::Edit => "edit",
             Self::Switch => "switch from",
+            Self::Extend => "extend",
         })
     }
 }
@@ -527,6 +530,24 @@ impl Day {
         self.apply(id, |i| i.edit(|n| n.set_planned_secs(secs)))
     }
 
+    /// Adds `secs` to the running item `id`'s planned length (AD-6: the plan grows,
+    /// not "now"), returning the new planned length. Only a running item can be
+    /// extended (AD-15). An extension that would overflow `u64` is rejected as an
+    /// [`Action::Extend`] transition; either way the day is unchanged on a reject.
+    pub fn extend(&mut self, id: ItemId, secs: u64) -> Result<u64, DomainError> {
+        let idx = self.index(id)?;
+        let item = &self.items[idx];
+        if item.status != ItemStatus::Running {
+            return Err(item.reject(Action::Extend));
+        }
+        let planned = item
+            .planned_secs
+            .checked_add(secs)
+            .ok_or_else(|| item.reject(Action::Extend))?;
+        self.items[idx].planned_secs = planned;
+        Ok(planned)
+    }
+
     /// The first pending or paused item in schedule order as of `now` (see
     /// [`crate::reflow`]), or `None` when nothing is left. Paused counts, because
     /// resuming it is a likely next step.
@@ -637,6 +658,7 @@ mod tests {
             Action::Remove => d.remove(id, now),
             Action::Edit => d.set_title(id, "edited"),
             Action::Switch => d.switch(id, now).map(|_| ()),
+            Action::Extend => d.extend(id, 60).map(|_| ()),
         }
     }
 
@@ -793,7 +815,11 @@ mod tests {
                     Action::Finish => Some(i.finish(now).map(|_| ())),
                     Action::CarryOver => Some(i.carry_over().map(|_| ())),
                     Action::Remove => Some(i.remove(now).map(|_| ())),
-                    Action::Start | Action::Resume | Action::Edit | Action::Switch => None,
+                    Action::Start
+                    | Action::Resume
+                    | Action::Edit
+                    | Action::Switch
+                    | Action::Extend => None,
                 };
                 if let Some(r) = &item_result {
                     assert_eq!(r, &result, "{s} -> {a}: item and day agree");
@@ -1294,5 +1320,57 @@ mod tests {
             Err(DomainError::UnknownItem(id(9)))
         );
         assert_eq!(d, before);
+    }
+
+    #[test]
+    fn extend_adds_to_the_running_items_planned_length() {
+        let clock = FakeClock::at(1_000);
+        let mut d = day_with(ItemStatus::Running, &clock);
+        d.add(item(2, "b")).unwrap();
+        let before = d.item(id(1)).unwrap().clone();
+        assert_eq!(d.extend(id(1), 300), Ok(1800));
+        let after = d.item(id(1)).unwrap();
+        assert_eq!(after.planned_secs(), 1800);
+        assert_eq!(after.status(), ItemStatus::Running);
+        assert_eq!(after.segments(), before.segments());
+        assert_eq!(d.item(id(2)).unwrap().planned_secs(), 1500);
+    }
+
+    #[test]
+    fn extend_a_non_running_or_unknown_item_is_rejected_unchanged() {
+        let clock = FakeClock::at(1_000);
+        for s in ALL.into_iter().filter(|s| *s != ItemStatus::Running) {
+            let mut d = day_with(s, &clock);
+            let before = d.clone();
+            assert_eq!(
+                d.extend(id(1), 300),
+                Err(DomainError::InvalidTransition {
+                    from: s,
+                    action: Action::Extend
+                }),
+                "{s}"
+            );
+            assert_eq!(d, before);
+        }
+        let mut d = day_with(ItemStatus::Running, &clock);
+        let before = d.clone();
+        assert_eq!(d.extend(id(9), 300), Err(DomainError::UnknownItem(id(9))));
+        assert_eq!(d, before);
+    }
+
+    #[test]
+    fn extend_past_u64_is_rejected_unchanged() {
+        let clock = FakeClock::at(1_000);
+        let mut d = day_with(ItemStatus::Running, &clock);
+        let before = d.clone();
+        assert_eq!(
+            d.extend(id(1), u64::MAX),
+            Err(DomainError::InvalidTransition {
+                from: ItemStatus::Running,
+                action: Action::Extend
+            })
+        );
+        assert_eq!(d, before);
+        assert_eq!(Action::Extend.to_string(), "extend");
     }
 }

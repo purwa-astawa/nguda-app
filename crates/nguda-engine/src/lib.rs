@@ -74,6 +74,15 @@ pub enum EngineMsg {
     /// logging `Switched`. Rejected unless `item_id` is the running item. The engine
     /// never switches on its own.
     Switch { item_id: ItemId, expected_rev: u64 },
+    /// Adds `secs` (positive) to the running item `item_id`'s planned length and logs
+    /// `Extended`, in one batch. Later flexible items re-flow at publish, and the
+    /// planned-end prompt re-arms at the new end; an open prompt for the item is
+    /// withdrawn after the commit. Rejected unless `item_id` is the running item.
+    ExtendTask {
+        item_id: ItemId,
+        secs: u64,
+        expected_rev: u64,
+    },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -137,6 +146,9 @@ pub enum Effect {
         item_id: ItemId,
         kind: PromptKind,
     },
+    /// Remove the prompt `prompt_id`, posted earlier this session, because its item
+    /// was extended. Emitted only after the extension committed.
+    WithdrawNotification { prompt_id: PromptId },
 }
 
 /// The ports and settings the engine runs on.

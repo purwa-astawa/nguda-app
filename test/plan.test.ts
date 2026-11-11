@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   addCommand,
   editCommand,
+  extendCommand,
   flexibleNeighbours,
   mergeSnapshot,
   minutesToSecs,
@@ -171,4 +172,17 @@ test("up and down skip done and running neighbours, which are not in order-key o
   });
   assert.deepEqual(flexibleNeighbours([C, A, R, B], "R"), { prev: null, next: null });
   assert.deepEqual(flexibleNeighbours([C, A, R, B], "C"), { prev: null, next: null });
+});
+
+test("extendCommand extends only the running item, by whole minutes, at the rendered rev", () => {
+  const R = item("R", { status: "running" });
+  const s = snap(7, [F, R, B]);
+  assert.deepEqual(extendCommand(s, R, "5"), { name: "extendTask", args: ["R", 300, 7] });
+  assert.deepEqual(extendCommand(s, R, " 15 "), { name: "extendTask", args: ["R", 900, 7] });
+  for (const status of ["pending", "paused", "done", "carriedOver"] as const) {
+    assert.equal(extendCommand(s, item("X", { status }), "5"), null, status);
+  }
+  for (const bad of ["", "0", "-5", "abc"]) {
+    assert.equal(extendCommand(s, R, bad), null, JSON.stringify(bad));
+  }
 });

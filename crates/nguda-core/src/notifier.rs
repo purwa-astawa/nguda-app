@@ -43,7 +43,10 @@ impl fmt::Display for NotifierError {
 
 impl std::error::Error for NotifierError {}
 
-/// Renders notifications. `post` must not block on the user.
+/// Renders notifications. Neither method may block on the user.
 pub trait Notifier: Send + Sync + 'static {
     fn post(&self, n: &Notification) -> Result<(), NotifierError>;
+    /// Removes the prompt `prompt_id` posted earlier, if the platform can. Required,
+    /// so each adapter decides what withdrawing means for it.
+    fn withdraw(&self, prompt_id: PromptId) -> Result<(), NotifierError>;
 }

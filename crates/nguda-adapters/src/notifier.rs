@@ -12,7 +12,7 @@
 
 use std::process::{Command, Stdio};
 
-use nguda_core::{Notification, Notifier, NotifierError, PromptKind};
+use nguda_core::{Notification, Notifier, NotifierError, PromptId, PromptKind};
 
 const APP_NAME: &str = "nguda";
 
@@ -114,11 +114,18 @@ impl Notifier for ButtonlessNotifier {
             .map_err(|e| NotifierError::new(format!("prompt {}: cannot reap: {e}", n.prompt_id)))?;
         Ok(())
     }
+
+    /// A no-op. An `osascript` or `notify-send` banner, once posted, has no handle
+    /// to remove it by, so there is nothing to withdraw; the banner times out on its
+    /// own. The real notifiers (story 4) remove their banners here.
+    fn withdraw(&self, _prompt_id: PromptId) -> Result<(), NotifierError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use nguda_core::{PromptId, Uuid};
+    use nguda_core::Uuid;
 
     use super::*;
 
@@ -177,5 +184,13 @@ mod tests {
             let err = got.unwrap_err();
             assert!(err.message.contains(&n.prompt_id.to_string()));
         }
+    }
+
+    #[test]
+    fn buttonless_withdraw_is_a_no_op() {
+        assert_eq!(
+            ButtonlessNotifier.withdraw(PromptId(Uuid::from_u128(7))),
+            Ok(())
+        );
     }
 }
