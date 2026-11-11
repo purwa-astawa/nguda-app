@@ -82,6 +82,7 @@ const TOGGLE_FIXED: &str = "ToggleFixed";
 const REMOVE_TASK: &str = "RemoveTask";
 const START: &str = "Start";
 const PAUSE: &str = "Pause";
+const SWITCH: &str = "Switch";
 
 /// The message's name, for logs and reject messages.
 pub(crate) fn name(msg: &EngineMsg) -> &'static str {
@@ -93,6 +94,7 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::RemoveTask { .. } => REMOVE_TASK,
         EngineMsg::Start { .. } => START,
         EngineMsg::Pause { .. } => PAUSE,
+        EngineMsg::Switch { .. } => SWITCH,
     }
 }
 
@@ -105,7 +107,8 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
         | EngineMsg::ToggleFixed { item_id, .. }
         | EngineMsg::RemoveTask { item_id }
         | EngineMsg::Start { item_id, .. }
-        | EngineMsg::Pause { item_id } => Some(*item_id),
+        | EngineMsg::Pause { item_id }
+        | EngineMsg::Switch { item_id, .. } => Some(*item_id),
     }
 }
 
@@ -163,6 +166,13 @@ pub(crate) fn apply(
             start(day, now, item_id)
         }
         EngineMsg::Pause { item_id } => pause(day, now, item_id),
+        EngineMsg::Switch {
+            item_id,
+            expected_rev,
+        } => {
+            check(expected_rev)?;
+            switch(day, now, item_id)
+        }
     }
 }
 
@@ -371,6 +381,18 @@ fn start(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>,
 fn pause(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
     day.pause(item_id, now).map_err(domain(PAUSE))?;
     Ok(Vec::new())
+}
+
+/// Finish, start-next and the `Switched` entry, committed as one batch (AD-15).
+fn switch(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
+    let to = day.switch(item_id, now).map_err(domain(SWITCH))?;
+    Ok(vec![StoreOp::AppendDayLog {
+        date: day.date(),
+        entry: DayLogEntry {
+            at: now,
+            kind: DayLogKind::Switched { from: item_id, to },
+        },
+    }])
 }
 
 #[cfg(test)]

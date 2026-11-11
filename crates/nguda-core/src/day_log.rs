@@ -18,4 +18,7 @@ pub enum DayLogKind {
     Recovered { item_id: ItemId },
     /// The user removed the item: it is tombstoned, never deleted.
     Removed { item_id: ItemId },
+    /// The user switched from the running item `from`, finishing it, to `to` (or to
+    /// nothing, when no item was left).
+    Switched { from: ItemId, to: Option<ItemId> },
 }

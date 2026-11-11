@@ -2,10 +2,12 @@
 //!
 //! It builds the engine with the real clock, exposes fire-and-forget commands
 //! (AD-4), mirrors snapshots to the view as a typed event, and renders the tray
-//! from a snapshot subscriber (AD-11). The tray menu (status line and Quit) and
-//! its Quit handler live in `tray`. On macOS the app runs as an accessory (no Dock
+//! from a snapshot subscriber (AD-11). The tray menu (status line, Switch, and
+//! Quit) and its handlers live in `tray`; engine effects are rendered by `effects`
+//! through the buttonless notifier (AD-10). On macOS the app runs as an accessory (no Dock
 //! icon) and the tray title gets monospaced digits once, from `macos`.
 
+mod effects;
 mod ipc;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -13,8 +15,8 @@ mod tray;
 
 use std::sync::Arc;
 
-use nguda_adapters::{SqliteStore, SystemClock, UuidV7Ids};
-use nguda_core::{Clock, Store, TimeZone};
+use nguda_adapters::{ButtonlessNotifier, SqliteStore, SystemClock, UuidV7Ids};
+use nguda_core::{Clock, Notifier, Store, TimeZone};
 use nguda_engine::{EngineDeps, EngineHandle};
 use tauri::Manager;
 
@@ -57,13 +59,13 @@ pub fn run() {
                 tz: system_time_zone(),
             };
             // `nguda_engine::spawn` uses `tokio::spawn`, so enter Tauri's runtime first.
-            // The effect receiver has no consumer until the notifier lands, so it is
-            // dropped; the engine ignores a closed effect channel.
-            let (engine, _effects) = {
+            let (engine, effects) = {
                 let _guard = tauri::async_runtime::handle().inner().enter();
                 nguda_engine::spawn(deps)
             };
             let snapshots = engine.subscribe();
+            let notifier: Arc<dyn Notifier> = Arc::new(ButtonlessNotifier);
+            tauri::async_runtime::spawn(effects::consume(effects, engine.subscribe(), notifier));
             app.manage::<EngineHandle>(engine);
 
             let tray = match tray::build(app) {

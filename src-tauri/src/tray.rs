@@ -5,17 +5,22 @@
 //! idle with something left, otherwise the app name. On Linux the title becomes
 //! the AppIndicator label, the tooltip is a no-op in Tauri's backend, and the
 //! first menu line is the fallback. Tray clicks don't fire on Linux, so every
-//! action is a menu item. The menu is built once and only edited (`set_text`),
-//! because on Linux it can't be replaced.
+//! action is a menu item. The menu is built once and only edited (`set_text`,
+//! `set_enabled`), because on Linux it can't be replaced.
+//!
+//! The Switch item is enabled only while a task runs. The subscriber records the
+//! `Switch` message for the snapshot it rendered (item and rev, AD-15) in
+//! [`SwitchTarget`]; the menu handler sends exactly that, so a click acts on what
+//! the user saw, and a stale one is rejected by the engine.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nguda_core::{Clock, Timestamp, elapsed_secs, format_elapsed, until_next_second};
-use nguda_engine::Snapshot;
+use nguda_engine::{EngineHandle, EngineMsg, Snapshot};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
-use tauri::{App, AppHandle, Wry};
+use tauri::{App, AppHandle, Manager, Wry};
 use tauri_specta::Event;
 use tokio::sync::watch;
 
@@ -24,6 +29,7 @@ use crate::ipc::SnapshotEvent;
 const TRAY_ID: &str = "main";
 const IDLE_TITLE: &str = "nguda";
 const STATUS_ID: &str = "status";
+const SWITCH_ID: &str = "switch";
 const QUIT_ID: &str = "quit";
 
 /// A black template image that macOS tints for the menu bar.
@@ -37,18 +43,37 @@ const ICON: &[u8] = include_bytes!("../icons/tray-linux.png");
 #[cfg(target_os = "linux")]
 const ICON_AS_TEMPLATE: bool = false;
 
-/// The tray icon plus the menu's status line, which the subscriber keeps in step
-/// with the title.
+/// The tray icon plus the menu items the subscriber keeps in step with the
+/// snapshot: the status line and Switch.
 pub struct Tray {
     icon: TrayIcon,
     status: MenuItem<Wry>,
+    switch: MenuItem<Wry>,
 }
 
+/// The `Switch` message for the last rendered snapshot, or `None` while nothing
+/// runs. Managed state; the lock is held only to copy in or out.
+#[derive(Default)]
+pub struct SwitchTarget(Mutex<Option<EngineMsg>>);
+
+impl SwitchTarget {
+    fn set(&self, msg: Option<EngineMsg>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = msg;
+    }
+
+    fn get(&self) -> Option<EngineMsg> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Builds the tray and manages its [`SwitchTarget`].
 pub fn build(app: &App) -> tauri::Result<Tray> {
+    app.manage(SwitchTarget::default());
     let status = MenuItem::with_id(app, STATUS_ID, IDLE_TITLE, false, None::<&str>)?;
+    let switch = MenuItem::with_id(app, SWITCH_ID, "Switch", false, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, QUIT_ID, "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&status, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&status, &switch, &separator, &quit])?;
 
     let icon = TrayIconBuilder::with_id(TRAY_ID)
         .icon(Image::from_bytes(ICON)?)
@@ -58,18 +83,44 @@ pub fn build(app: &App) -> tauri::Result<Tray> {
         .on_menu_event(|app, event| {
             if event.id() == QUIT_ID {
                 app.exit(0);
+            } else if event.id() == SWITCH_ID {
+                send_switch(app);
             }
         })
         .build(app)?;
     icon.set_title(Some(IDLE_TITLE))?;
-    Ok(Tray { icon, status })
+    Ok(Tray {
+        icon,
+        status,
+        switch,
+    })
 }
 
-/// The three places that show the tray text. A seam so the render step is testable.
+/// Fire-and-forget (AD-4): sends the recorded `Switch`, if any.
+fn send_switch(app: &AppHandle) {
+    let Some(msg) = app.state::<SwitchTarget>().get() else {
+        return;
+    };
+    if let Err(e) = app.state::<EngineHandle>().send(msg) {
+        eprintln!("nguda: failed to send Switch: {e}");
+    }
+}
+
+/// `Switch` for the running item at the snapshot's rev, or `None` while idle.
+fn switch_msg(snapshot: &Snapshot) -> Option<EngineMsg> {
+    snapshot.running.as_ref().map(|r| EngineMsg::Switch {
+        item_id: r.item_id,
+        expected_rev: snapshot.rev,
+    })
+}
+
+/// The three places that show the tray text, and the Switch item. A seam so the
+/// render steps are testable.
 trait Surface {
     fn set_title(&self, text: &str) -> tauri::Result<()>;
     fn set_status_line(&self, text: &str) -> tauri::Result<()>;
     fn set_tooltip(&self, text: &str) -> tauri::Result<()>;
+    fn set_switch_enabled(&self, enabled: bool) -> tauri::Result<()>;
 }
 
 impl Surface for Tray {
@@ -81,6 +132,20 @@ impl Surface for Tray {
     }
     fn set_tooltip(&self, text: &str) -> tauri::Result<()> {
         self.icon.set_tooltip(Some(text))
+    }
+    fn set_switch_enabled(&self, enabled: bool) -> tauri::Result<()> {
+        self.switch.set_enabled(enabled)
+    }
+}
+
+/// Records the snapshot's Switch target, then enables Switch exactly when there is
+/// one. The lock is released before the setter runs (AD-4).
+fn render_switch(surface: &impl Surface, target: &SwitchTarget, snapshot: &Snapshot) {
+    let msg = switch_msg(snapshot);
+    let enabled = msg.is_some();
+    target.set(msg);
+    if let Err(e) = surface.set_switch_enabled(enabled) {
+        eprintln!("nguda: failed to set tray Switch item: {e}");
     }
 }
 
@@ -123,7 +188,9 @@ pub async fn subscribe(
     mut rx: watch::Receiver<Snapshot>,
     clock: Arc<dyn Clock>,
 ) {
+    let target = app.state::<SwitchTarget>();
     let mut snapshot = rx.borrow_and_update().clone();
+    render_switch(&tray, &target, &snapshot);
     loop {
         let wait = snapshot
             .running
@@ -138,6 +205,7 @@ pub async fn subscribe(
                 if let Err(e) = SnapshotEvent::from(&snapshot).emit(&app) {
                     eprintln!("nguda: failed to emit snapshot: {e}");
                 }
+                render_switch(&tray, &target, &snapshot);
             }
             _ = sleep_or_forever(wait) => {}
         }
@@ -184,6 +252,12 @@ mod tests {
             self.calls.borrow_mut().push(("tooltip", text.to_owned()));
             Ok(())
         }
+        fn set_switch_enabled(&self, enabled: bool) -> tauri::Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(("switch", enabled.to_string()));
+            Ok(())
+        }
     }
 
     fn rendered(surface: &FakeSurface) -> Vec<(&'static str, String)> {
@@ -194,6 +268,7 @@ mod tests {
         Snapshot {
             rev: 1,
             running: Some(Running {
+                item_id: ItemId(Uuid::from_u128(7)),
                 title: "Demo".into(),
                 segment_started_at: Timestamp::from_second(secs).unwrap(),
                 accumulated_secs: 0,
@@ -351,5 +426,35 @@ mod tests {
     fn menu_text_escapes_ampersands() {
         assert_eq!(menu_text("R&D · 00:05"), "R&&D · 00:05");
         assert_eq!(menu_text("Demo · 00:05"), "Demo · 00:05");
+    }
+
+    #[test]
+    fn switch_targets_the_running_item_at_the_rendered_rev() {
+        assert_eq!(
+            switch_msg(&snapshot_started_at(1_000)),
+            Some(EngineMsg::Switch {
+                item_id: ItemId(Uuid::from_u128(7)),
+                expected_rev: 1,
+            })
+        );
+        assert_eq!(switch_msg(&snapshot_next("B")), None);
+        assert_eq!(switch_msg(&Snapshot::default()), None);
+    }
+
+    #[test]
+    fn render_switch_records_the_target_and_toggles_the_item() {
+        let surface = FakeSurface::default();
+        let target = SwitchTarget::default();
+        render_switch(&surface, &target, &snapshot_started_at(1_000));
+        assert_eq!(target.get(), switch_msg(&snapshot_started_at(1_000)));
+        render_switch(&surface, &target, &snapshot_next("B"));
+        assert_eq!(target.get(), None);
+        assert_eq!(
+            rendered(&surface),
+            vec![
+                ("switch", "true".to_owned()),
+                ("switch", "false".to_owned())
+            ]
+        );
     }
 }

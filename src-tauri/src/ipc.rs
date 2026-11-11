@@ -118,6 +118,17 @@ pub fn pause_task(engine: State<'_, EngineHandle>, item_id: String) -> Result<()
     send(&engine, pause_task_msg(&item_id))
 }
 
+/// Finishes the running item now and starts or resumes the next one.
+#[tauri::command]
+#[specta::specta]
+pub fn switch_task(
+    engine: State<'_, EngineHandle>,
+    item_id: String,
+    expected_rev: u32,
+) -> Result<(), String> {
+    send(&engine, switch_task_msg(&item_id, expected_rev))
+}
+
 // --- Argument parsing: syntax only, no semantic checks ---
 
 fn parse_item_id(s: &str) -> Result<ItemId, String> {
@@ -196,6 +207,13 @@ fn start_task_msg(item_id: &str, expected_rev: u32) -> Result<EngineMsg, String>
 fn pause_task_msg(item_id: &str) -> Result<EngineMsg, String> {
     Ok(EngineMsg::Pause {
         item_id: parse_item_id(item_id)?,
+    })
+}
+
+fn switch_task_msg(item_id: &str, expected_rev: u32) -> Result<EngineMsg, String> {
+    Ok(EngineMsg::Switch {
+        item_id: parse_item_id(item_id)?,
+        expected_rev: expected_rev.into(),
     })
 }
 
@@ -300,12 +318,6 @@ pub struct RunningView {
 impl From<&Snapshot> for SnapshotEvent {
     fn from(s: &Snapshot) -> Self {
         let items: Vec<&PlanItem> = s.day.as_ref().map(Day::in_order).unwrap_or_default();
-        // The engine publishes `running` exactly when the day has a running item, so
-        // its id comes from that item; `nguda_core::Running` carries no id.
-        let running_id = items
-            .iter()
-            .find(|i| i.status() == ItemStatus::Running)
-            .map(|i| i.id());
         Self {
             rev: saturating_u32(s.rev),
             day: s.day.as_ref().map(|d| DayView {
@@ -313,16 +325,12 @@ impl From<&Snapshot> for SnapshotEvent {
                 tz: d.tz().to_owned(),
             }),
             items: items.iter().map(|i| item_view(i)).collect(),
-            running: s
-                .running
-                .as_ref()
-                .zip(running_id)
-                .map(|(r, id)| RunningView {
-                    item_id: id.to_string(),
-                    title: r.title.clone(),
-                    segment_started_at: r.segment_started_at.to_string(),
-                    accumulated_secs: saturating_u32(r.accumulated_secs),
-                }),
+            running: s.running.as_ref().map(|r| RunningView {
+                item_id: r.item_id.to_string(),
+                title: r.title.clone(),
+                segment_started_at: r.segment_started_at.to_string(),
+                accumulated_secs: saturating_u32(r.accumulated_secs),
+            }),
             status: s
                 .status
                 .iter()
@@ -369,6 +377,7 @@ pub fn specta_builder() -> Builder<Wry> {
             remove_task,
             start_task,
             pause_task,
+            switch_task,
             current_snapshot
         ])
         .events(collect_events![SnapshotEvent])
@@ -428,6 +437,7 @@ mod tests {
             "removeTask",
             "startTask",
             "pauseTask",
+            "switchTask",
             "currentSnapshot",
         ] {
             assert!(committed.contains(&format!("\t{name}: ")), "{name}");
@@ -512,6 +522,13 @@ mod tests {
             })
         );
         assert_eq!(pause_task_msg(A), Ok(EngineMsg::Pause { item_id: item(A) }));
+        assert_eq!(
+            switch_task_msg(A, 9),
+            Ok(EngineMsg::Switch {
+                item_id: item(A),
+                expected_rev: 9
+            })
+        );
     }
 
     #[test]
@@ -521,6 +538,7 @@ mod tests {
             assert!(remove_task_msg(bad).is_err(), "{bad}");
             assert!(start_task_msg(bad, 1).is_err(), "{bad}");
             assert!(pause_task_msg(bad).is_err(), "{bad}");
+            assert!(switch_task_msg(bad, 1).is_err(), "{bad}");
             assert!(toggle_fixed_msg(bad, None, 1).is_err(), "{bad}");
             let anchor = ReorderAnchorArg {
                 place: AnchorPlace::After,
@@ -678,6 +696,7 @@ mod tests {
             ..Default::default()
         };
         snap.running = Some(Running {
+            item_id: item(A),
             title: "Write".into(),
             segment_started_at: Timestamp::from_millisecond(1_500).unwrap(),
             accumulated_secs: 0,

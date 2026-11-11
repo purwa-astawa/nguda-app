@@ -1,9 +1,11 @@
 //! nguda adapters: implementations of the `nguda-core` ports. Never depends on Tauri.
 
+mod notifier;
 mod store;
 
-use nguda_core::{Clock, IdGen, ItemId, SleepFuture, Timestamp, Uuid};
+use nguda_core::{Clock, IdGen, ItemId, PromptId, SleepFuture, Timestamp, Uuid};
 
+pub use notifier::ButtonlessNotifier;
 pub use store::{OpenError, SqliteStore};
 
 /// The real wall clock behind the [`Clock`] port.
@@ -32,6 +34,10 @@ impl IdGen for UuidV7Ids {
     fn new_item_id(&self) -> ItemId {
         ItemId(Uuid::now_v7())
     }
+
+    fn new_prompt_id(&self) -> PromptId {
+        PromptId(Uuid::now_v7())
+    }
 }
 
 #[cfg(test)]
@@ -58,5 +64,8 @@ mod tests {
         let (a, b) = (UuidV7Ids.new_item_id(), UuidV7Ids.new_item_id());
         assert_ne!(a, b);
         assert_eq!(a.0.get_version_num(), 7);
+        let (p, q) = (UuidV7Ids.new_prompt_id(), UuidV7Ids.new_prompt_id());
+        assert_ne!(p, q);
+        assert_eq!(p.0.get_version_num(), 7);
     }
 }

@@ -157,7 +157,7 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 2);
+    assert_eq!(user_version(&path), 3);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
@@ -246,7 +246,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
         err,
         OpenError::NewerSchema {
             found: 5,
-            supported: 2
+            supported: 3
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -453,7 +453,7 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 2);
+    assert_eq!(user_version(&path), 3);
     assert!(has_table(&path, "engine_meta"));
 }
 
@@ -547,6 +547,51 @@ async fn a_removed_day_log_entry_round_trips_across_a_reopen() {
         store.load_day_log(date()).await.unwrap(),
         vec![recovered(1, 1_100), removed]
     );
+}
+
+#[tokio::test]
+async fn switched_day_log_entries_round_trip_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let switched = |at, from, to: Option<u128>| DayLogEntry {
+        at: ts(at),
+        kind: DayLogKind::Switched {
+            from: id(from),
+            to: to.map(id),
+        },
+    };
+    let entries = [switched(1_300, 4, Some(1)), switched(1_400, 1, None)];
+    store
+        .commit(batch(entries.iter().map(|entry| StoreOp::AppendDayLog {
+            date: date(),
+            entry: entry.clone(),
+        })))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.load_day_log(date()).await.unwrap(), entries);
+}
+
+#[tokio::test]
+async fn a_switched_entry_to_an_unknown_item_rolls_back_the_batch() {
+    let dir = TempDir::new().unwrap();
+    let store = seeded(&db(&dir)).await;
+    store
+        .commit(batch([StoreOp::AppendDayLog {
+            date: date(),
+            entry: DayLogEntry {
+                at: ts(1_300),
+                kind: DayLogKind::Switched {
+                    from: id(1),
+                    to: Some(id(99)),
+                },
+            },
+        }]))
+        .await
+        .unwrap_err();
+    assert_eq!(store.load_day_log(date()).await.unwrap(), vec![]);
 }
 
 #[tokio::test]

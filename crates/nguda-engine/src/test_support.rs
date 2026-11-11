@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use nguda_core::{
     Clock, Date, Day, DayLogEntry, IdGen, ItemId, OpenSegmentRef, OrderKey, PlanItem,
-    PlanItemRecord, Segment, SleepFuture, Store, StoreBatch, StoreError, StoreFuture, StoreOp,
-    Timestamp, Uuid,
+    PlanItemRecord, PromptId, Segment, SleepFuture, Store, StoreBatch, StoreError, StoreFuture,
+    StoreOp, Timestamp, Uuid,
 };
 use tokio::sync::watch;
 
@@ -81,15 +81,31 @@ impl Clock for FakeClock {
     }
 }
 
-/// Ids 1, 2, 3, ... as `Uuid::from_u128`.
+/// Item ids 1, 2, 3, ... as `Uuid::from_u128`; prompt ids count separately from
+/// [`PROMPT_BASE`] + 1.
 #[derive(Default)]
-pub(crate) struct SeqIds(AtomicU64);
+pub(crate) struct SeqIds {
+    items: AtomicU64,
+    prompts: AtomicU64,
+}
+
+/// Prompt ids start above this, so they never equal an item id in a test.
+pub(crate) const PROMPT_BASE: u128 = 1 << 64;
+
+/// The `n`th prompt id `SeqIds` mints (1-based).
+pub(crate) fn prompt(n: u128) -> PromptId {
+    PromptId(Uuid::from_u128(PROMPT_BASE + n))
+}
 
 impl IdGen for SeqIds {
     fn new_item_id(&self) -> ItemId {
         ItemId(Uuid::from_u128(u128::from(
-            self.0.fetch_add(1, Ordering::SeqCst) + 1,
+            self.items.fetch_add(1, Ordering::SeqCst) + 1,
         )))
+    }
+
+    fn new_prompt_id(&self) -> PromptId {
+        prompt(u128::from(self.prompts.fetch_add(1, Ordering::SeqCst) + 1))
     }
 }
 

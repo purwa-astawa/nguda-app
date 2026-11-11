@@ -19,6 +19,8 @@ export const commands = {
 	startTask: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("start_task", { itemId, expectedRev })),
 	/**  Pauses the running item now. */
 	pauseTask: (itemId: string) => typedError<null, string>(__TAURI_INVOKE("pause_task", { itemId })),
+	/**  Finishes the running item now and starts or resumes the next one. */
+	switchTask: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("switch_task", { itemId, expectedRev })),
 	/**
 	 *  The latest snapshot, read from the engine's `watch` receiver. Sends nothing to
 	 *  the engine (AD-4), so a window that loads after the last event still renders.

@@ -105,6 +105,18 @@ test("start for pending or paused, pause for running", () => {
   assert.equal(rowActions(snap(2, [done]), done).start, null);
 });
 
+test("switch on the running row only, with the rendered rev", () => {
+  const running = item("A", { status: "running" });
+  assert.deepEqual(rowActions(snap(6, [running, B]), running).switch, {
+    name: "switchTask",
+    args: ["A", 6],
+  });
+  for (const status of ["pending", "paused", "done"] as const) {
+    const other = item("A", { status });
+    assert.equal(rowActions(snap(6, [other]), other).switch, null, status);
+  }
+});
+
 test("remove on non-running items only", () => {
   const running = item("A", { status: "running" });
   assert.deepEqual(rowActions(snap(1), A).remove, { name: "removeTask", args: ["A"] });

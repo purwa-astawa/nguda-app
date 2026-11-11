@@ -58,6 +58,8 @@ pub enum Action {
     Remove,
     /// A plan edit: pin, unpin, reorder, retitle, or resize.
     Edit,
+    /// Finish the running item and move on to the next one.
+    Switch,
 }
 
 impl fmt::Display for Action {
@@ -70,6 +72,7 @@ impl fmt::Display for Action {
             Self::CarryOver => "carry over",
             Self::Remove => "remove",
             Self::Edit => "edit",
+            Self::Switch => "switch from",
         })
     }
 }
@@ -263,6 +266,7 @@ impl PlanItem {
         }
         let open = self.segments.iter().find(|s| s.is_open())?;
         Some(Running {
+            item_id: self.id,
             title: self.title.clone(),
             segment_started_at: open.started_at,
             accumulated_secs: closed_secs(&self.segments),
@@ -467,6 +471,31 @@ impl Day {
         self.apply(id, PlanItem::carry_over)
     }
 
+    /// Finishes the running item `current` and starts or resumes [`Day::next_item`]
+    /// (as chosen after the finish) at `now`, all or nothing. Returns the item now
+    /// running, or `None` when nothing was left. Only a running item can be switched
+    /// from (AD-15).
+    pub fn switch(
+        &mut self,
+        current: ItemId,
+        now: Timestamp,
+    ) -> Result<Option<ItemId>, DomainError> {
+        let from = &self.items[self.index(current)?];
+        if from.status != ItemStatus::Running {
+            return Err(from.reject(Action::Switch));
+        }
+        let mut next = self.clone();
+        next.finish(current, now)?;
+        let to = next.next_item().map(|i| (i.id, i.status));
+        match to {
+            Some((id, ItemStatus::Paused)) => next.resume(id, now)?,
+            Some((id, _)) => next.start(id, now)?,
+            None => {}
+        }
+        *self = next;
+        Ok(to.map(|(id, _)| id))
+    }
+
     /// Any state except Running and Removed → Removed. See [`PlanItem::remove`].
     pub fn remove(&mut self, id: ItemId, now: Timestamp) -> Result<(), DomainError> {
         self.apply(id, |i| i.remove(now))
@@ -626,6 +655,7 @@ mod tests {
             Action::CarryOver => d.carry_over(id),
             Action::Remove => d.remove(id, now),
             Action::Edit => d.set_title(id, "edited"),
+            Action::Switch => d.switch(id, now).map(|_| ()),
         }
     }
 
@@ -782,7 +812,7 @@ mod tests {
                     Action::Finish => Some(i.finish(now).map(|_| ())),
                     Action::CarryOver => Some(i.carry_over().map(|_| ())),
                     Action::Remove => Some(i.remove(now).map(|_| ())),
-                    Action::Start | Action::Resume | Action::Edit => None,
+                    Action::Start | Action::Resume | Action::Edit | Action::Switch => None,
                 };
                 if let Some(r) = &item_result {
                     assert_eq!(r, &result, "{s} -> {a}: item and day agree");
@@ -879,6 +909,7 @@ mod tests {
         assert_eq!(i.actual_secs(clock.now()), 18);
 
         let running = i.running_view().unwrap();
+        assert_eq!(running.item_id, id(1));
         assert_eq!(running.title, "item 1");
         assert_eq!(running.segment_started_at, ts(30));
         assert_eq!(running.accumulated_secs, 15);
@@ -1212,5 +1243,69 @@ mod tests {
         d.finish(id(1), t).unwrap();
         d.remove(id(2), t).unwrap();
         assert_eq!(next_id(&d), None);
+    }
+
+    #[test]
+    fn switch_finishes_the_running_item_and_starts_the_next() {
+        let mut d = day(vec![item(1, "a"), item(2, "b"), item(3, "c")]);
+        d.start(id(1), ts(0)).unwrap();
+        assert_eq!(d.switch(id(1), ts(60)), Ok(Some(id(2))));
+        let a = d.item(id(1)).unwrap();
+        assert_eq!(a.status(), ItemStatus::Done);
+        assert_eq!(a.segments(), &[closed(0, 60)]);
+        let b = d.item(id(2)).unwrap();
+        assert_eq!(b.status(), ItemStatus::Running);
+        assert_eq!(b.segments(), &[Segment::open(ts(60))]);
+        assert_eq!(d.item(id(3)).unwrap().status(), ItemStatus::Pending);
+        assert_eq!(open_segments(&d), 1);
+    }
+
+    #[test]
+    fn switch_resumes_a_paused_next_item() {
+        let mut d = day(vec![item(1, "a"), item(2, "b")]);
+        d.start(id(1), ts(0)).unwrap();
+        d.pause(id(1), ts(10)).unwrap();
+        d.start(id(2), ts(20)).unwrap();
+        assert_eq!(d.switch(id(2), ts(30)), Ok(Some(id(1))));
+        let a = d.item(id(1)).unwrap();
+        assert_eq!(a.status(), ItemStatus::Running);
+        assert_eq!(a.segments(), &[closed(0, 10), Segment::open(ts(30))]);
+        assert_eq!(d.item(id(2)).unwrap().status(), ItemStatus::Done);
+    }
+
+    #[test]
+    fn switch_with_nothing_left_only_finishes() {
+        let mut d = day(vec![item(1, "a"), item(2, "b")]);
+        d.remove(id(2), ts(0)).unwrap();
+        d.start(id(1), ts(0)).unwrap();
+        assert_eq!(d.switch(id(1), ts(5)), Ok(None));
+        assert_eq!(d.item(id(1)).unwrap().status(), ItemStatus::Done);
+        assert_eq!(open_segments(&d), 0);
+    }
+
+    #[test]
+    fn switch_from_a_non_running_or_unknown_item_is_rejected_unchanged() {
+        let clock = FakeClock::at(1_000);
+        for s in ALL.into_iter().filter(|s| *s != ItemStatus::Running) {
+            let mut d = day_with(s, &clock);
+            d.add(item(2, "b")).unwrap();
+            let before = d.clone();
+            assert_eq!(
+                d.switch(id(1), clock.now()),
+                Err(DomainError::InvalidTransition {
+                    from: s,
+                    action: Action::Switch
+                }),
+                "{s}"
+            );
+            assert_eq!(d, before);
+        }
+        let mut d = day_with(ItemStatus::Running, &clock);
+        let before = d.clone();
+        assert_eq!(
+            d.switch(id(9), clock.now()),
+            Err(DomainError::UnknownItem(id(9)))
+        );
+        assert_eq!(d, before);
     }
 }

@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OrderKey, PlanItem, Segment, StoreOp,
-    TimeZone,
+    Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OrderKey, PlanItem, PromptKind,
+    Segment, StoreOp, TimeZone,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::test_support::{
-    FakeClock, INJECTED, MemoryStore, SeqIds, day_running_other, day1, id, item, ts,
+    FakeClock, INJECTED, MemoryStore, SeqIds, day_running_other, day1, id, item, key, prompt, ts,
 };
 use crate::{
     Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, NextItem, ReorderAnchor, Snapshot,
@@ -762,7 +762,14 @@ async fn a_failed_recovery_commit_keeps_the_loaded_state_with_store_status() {
     assert_eq!(snap.status, store_status());
     assert_eq!(store.day_log(day1()), vec![]);
     assert_eq!(store.last_alive(), Some(ts(1_030)));
-    assert!(h.effects.try_recv().is_err(), "no effect without a commit");
+    // The item still runs, past its planned end, so only its prompt may follow.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    while let Ok(effect) = h.effects.try_recv() {
+        assert!(
+            !matches!(effect, Effect::Recovered { .. }),
+            "no Recovered without a commit"
+        );
+    }
 }
 
 #[tokio::test]
@@ -856,4 +863,264 @@ async fn the_recovered_effect_is_emitted_exactly_once() {
         Ok(Effect::Recovered { item_id: id(100) })
     );
     assert!(h.effects.try_recv().is_err());
+}
+
+// --- Planned-end prompt ---
+
+fn notify(prompt_n: u128, item_n: u128) -> Effect {
+    Effect::Notify {
+        prompt_id: prompt(prompt_n),
+        item_id: id(item_n),
+        kind: PromptKind::PlannedEnd,
+    }
+}
+
+impl Harness {
+    async fn next_effect(&mut self) -> Effect {
+        tokio::time::timeout(Duration::from_secs(5), self.effects.recv())
+            .await
+            .expect("no effect in time")
+            .expect("effect channel open")
+    }
+
+    /// Gives the engine time to act, then checks it emitted nothing.
+    async fn expect_no_effect(&mut self) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(self.effects.try_recv().ok(), None);
+    }
+}
+
+/// Item 100 "A" planned 60 s and item 101 "B" planned 600 s, both pending.
+fn short_day() -> Day {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(PlanItem::new(id(100), "A", 60, key("U"))).unwrap();
+    day.add(item(101, "B", "V")).unwrap();
+    day
+}
+
+/// An engine at 1_000 on `day` with item 100 started at rev 2.
+async fn started_a(day: &Day) -> (Harness, Arc<MemoryStore>) {
+    let (mut h, store) = running_on(1_000, Some(day)).await;
+    h.send(start_msg(100, 1));
+    assert!(h.rev(2).await.running.is_some());
+    (h, store)
+}
+
+#[tokio::test]
+async fn planned_end_emits_exactly_one_notify_and_keeps_the_item_running() {
+    let (mut h, store) = started_a(&short_day()).await;
+    let before = h.rx.borrow().clone();
+    h.clock.set(1_059);
+    h.expect_no_effect().await;
+    h.clock.set(1_060);
+    assert_eq!(h.next_effect().await, notify(1, 100));
+    // An effect only: no state change, no snapshot, and only heartbeats committed.
+    h.until(|| store.last_alive() == Some(ts(1_060))).await;
+    assert_eq!(*h.rx.borrow(), before);
+    assert!(!h.rx.has_changed().unwrap());
+    assert!(
+        store.batches()[2..]
+            .iter()
+            .all(|b| b.ops() == [StoreOp::SetLastAlive { at: ts(1_060) }])
+    );
+    // Long after, heartbeats pass but there is no second prompt and no switch.
+    for at in [1_120, 1_180, 1_240, 1_300] {
+        h.clock.set(at);
+        h.until(|| store.last_alive() == Some(ts(at))).await;
+    }
+    h.expect_no_effect().await;
+    let snap = h.rx.borrow().clone();
+    assert_eq!(snap.rev, 2);
+    assert_eq!(snap.running.unwrap().item_id, id(100));
+}
+
+#[tokio::test]
+async fn a_planned_end_between_heartbeats_notifies_without_committing() {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(PlanItem::new(id(100), "A", 30, key("U"))).unwrap();
+    let (mut h, store) = started_a(&day).await;
+    let before = h.rx.borrow().clone();
+    let batches = store.batches().len();
+    h.clock.set(1_029);
+    h.expect_no_effect().await;
+    h.clock.set(1_030);
+    assert_eq!(h.next_effect().await, notify(1, 100));
+    h.expect_no_effect().await;
+    // The next heartbeat is due at 1_060: nothing was committed or published.
+    assert_eq!(store.batches().len(), batches);
+    assert_eq!(store.last_alive(), Some(ts(1_000)));
+    assert_eq!(*h.rx.borrow(), before);
+    assert!(!h.rx.has_changed().unwrap());
+}
+
+#[tokio::test]
+async fn pause_and_resume_after_the_prompt_does_not_prompt_again() {
+    let (mut h, _store) = started_a(&short_day()).await;
+    h.clock.set(1_070);
+    assert_eq!(h.next_effect().await, notify(1, 100));
+    h.send(EngineMsg::Pause { item_id: id(100) });
+    h.rev(3).await;
+    h.clock.set(1_080);
+    h.send(start_msg(100, 3));
+    assert!(h.rev(4).await.running.is_some());
+    h.clock.set(1_200);
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn raising_planned_secs_after_the_prompt_re_arms_it() {
+    let (mut h, _store) = started_a(&short_day()).await;
+    h.clock.set(1_060);
+    assert_eq!(h.next_effect().await, notify(1, 100));
+    h.send(edit(100, None, Some(120)));
+    h.rev(3).await;
+    h.clock.set(1_119);
+    h.expect_no_effect().await;
+    h.clock.set(1_120);
+    assert_eq!(h.next_effect().await, notify(2, 100));
+    h.clock.set(1_300);
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn resuming_an_item_already_over_prompts_at_once() {
+    let mut day = short_day();
+    day.start(id(100), ts(0)).unwrap();
+    day.pause(id(100), ts(90)).unwrap();
+    let (mut h, _store) = running_on(1_000, Some(&day)).await;
+    h.expect_no_effect().await;
+    h.send(start_msg(100, 1));
+    h.rev(2).await;
+    assert_eq!(h.next_effect().await, notify(1, 100));
+    h.expect_no_effect().await;
+}
+
+// --- Switch ---
+
+fn switch_msg(n: u128, expected_rev: u64) -> EngineMsg {
+    EngineMsg::Switch {
+        item_id: id(n),
+        expected_rev,
+    }
+}
+
+fn switched_at(from: u128, to: Option<u128>, at: i64) -> DayLogEntry {
+    DayLogEntry {
+        at: ts(at),
+        kind: DayLogKind::Switched {
+            from: id(from),
+            to: to.map(id),
+        },
+    }
+}
+
+#[tokio::test]
+async fn switch_finishes_the_running_item_and_starts_the_next_in_one_batch() {
+    let (mut h, store) = started_a(&abc_day()).await;
+    h.clock.set(1_030);
+    h.send(switch_msg(100, 2));
+    let snap = h.rev(3).await;
+    assert!(snap.status.is_empty());
+    let day = day_of(&snap);
+    let a = day.item(id(100)).unwrap();
+    assert_eq!(a.status(), ItemStatus::Done);
+    assert_eq!(a.segments(), &[closed(1_000, 1_030)]);
+    let b = day.item(id(101)).unwrap();
+    assert_eq!(b.status(), ItemStatus::Running);
+    assert_eq!(b.segments(), &[Segment::open(ts(1_030))]);
+    assert_eq!(snap.running.unwrap().item_id, id(101));
+    assert_eq!(store.stored_day(day1()), snap.day);
+    assert_eq!(
+        store.day_log(day1()),
+        vec![switched_at(100, Some(101), 1_030)]
+    );
+    let batches = store.batches();
+    assert_eq!(batches.len(), 3, "startup, Start, Switch");
+    let ops = batches[2].ops();
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, StoreOp::CloseSegment { .. }))
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, StoreOp::OpenSegment { .. }))
+    );
+    assert_eq!(
+        ops.last(),
+        Some(&StoreOp::AppendDayLog {
+            date: day1(),
+            entry: switched_at(100, Some(101), 1_030)
+        })
+    );
+}
+
+#[tokio::test]
+async fn switch_resumes_a_paused_next_item() {
+    let mut day = abc_day();
+    day.start(id(100), ts(10)).unwrap();
+    day.pause(id(100), ts(40)).unwrap();
+    let (mut h, store) = running_on(1_000, Some(&day)).await;
+    h.send(start_msg(101, 1));
+    h.rev(2).await;
+    h.clock.set(1_050);
+    h.send(switch_msg(101, 2));
+    let snap = h.rev(3).await;
+    let a = day_of(&snap).item(id(100)).unwrap();
+    assert_eq!(a.status(), ItemStatus::Running);
+    assert_eq!(a.segments(), &[closed(10, 40), Segment::open(ts(1_050))]);
+    assert_eq!(snap.running.as_ref().unwrap().accumulated_secs, 30);
+    assert_eq!(
+        day_of(&snap).item(id(101)).unwrap().status(),
+        ItemStatus::Done
+    );
+    assert_eq!(
+        store.day_log(day1()),
+        vec![switched_at(101, Some(100), 1_050)]
+    );
+}
+
+#[tokio::test]
+async fn switch_with_nothing_left_finishes_and_logs_no_target() {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(item(100, "A", "U")).unwrap();
+    day.add(item(101, "B", "V")).unwrap();
+    day.remove(id(101), ts(5)).unwrap();
+    let (mut h, store) = started_a(&day).await;
+    h.clock.set(1_020);
+    h.send(switch_msg(100, 2));
+    let snap = h.rev(3).await;
+    assert_eq!(
+        day_of(&snap).item(id(100)).unwrap().status(),
+        ItemStatus::Done
+    );
+    assert_eq!(snap.running, None);
+    assert_eq!(snap.next_item, None);
+    assert_eq!(store.day_log(day1()), vec![switched_at(100, None, 1_020)]);
+}
+
+#[tokio::test]
+async fn a_stale_switch_applies_nothing() {
+    let (mut h, store) = started_a(&abc_day()).await;
+    let snap = expect_rejected(&mut h, &store, switch_msg(100, 1), 3).await;
+    assert_eq!(rejected(&snap), Some("stale rev: expected 1, current 2"));
+    assert_eq!(snap.running.unwrap().item_id, id(100));
+    assert_eq!(store.day_log(day1()), vec![]);
+}
+
+#[tokio::test]
+async fn switch_from_a_non_running_item_is_rejected() {
+    let mut day = abc_day();
+    day.add(item(103, "D", "X")).unwrap();
+    day.start(id(103), ts(10)).unwrap();
+    day.finish(id(103), ts(20)).unwrap();
+    day.start(id(102), ts(30)).unwrap();
+    day.pause(id(102), ts(40)).unwrap();
+    let (mut h, store) = started_a(&day).await;
+    // Pending, paused, done, unknown; each with the current rev.
+    for (rev, n) in (2..).zip([101, 102, 103, 999]) {
+        let snap = expect_rejected(&mut h, &store, switch_msg(n, rev), rev + 1).await;
+        assert!(rejected(&snap).unwrap().starts_with("Switch: "), "{n}");
+    }
+    assert_eq!(store.day_log(day1()), vec![]);
+    assert_eq!(h.rx.borrow().running.as_ref().unwrap().item_id, id(100));
 }
