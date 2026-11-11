@@ -30,6 +30,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
     case "pauseTask":
       res = await commands.pauseTask(...cmd.args);
       break;
+    case "switchTask":
+      res = await commands.switchTask(...cmd.args);
+      break;
   }
   return res.status === "error" ? res.error : null;
 }

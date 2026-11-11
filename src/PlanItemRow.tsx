@@ -85,6 +85,7 @@ export function PlanItemRow({ snap, item, now, send }: Props) {
       <div className="actions">
         {actions.start && <button onClick={() => send(actions.start!)}>Start</button>}
         {actions.pause && <button onClick={() => send(actions.pause!)}>Pause</button>}
+        {actions.switch && <button onClick={() => send(actions.switch!)}>Switch</button>}
         {!editing && <button onClick={startEdit}>Edit</button>}
         {actions.up && (
           <button aria-label="Move up" onClick={() => send(actions.up!)}>

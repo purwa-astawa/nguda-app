@@ -5,7 +5,8 @@
 //! and swapped in only once that commit succeeds. After each change the engine bumps
 //! `rev` and publishes a [`Snapshot`] on a `watch` channel, and one-time outputs go
 //! out as [`Effect`]s. It holds no `Mutex` and runs no per-second tick: it waits on
-//! one deadline through [`Clock::sleep_until`], and rendering the ticking elapsed
+//! one deadline through [`Clock::sleep_until`] (the earlier of the heartbeat and the
+//! running item's planned end), and rendering the ticking elapsed
 //! time is the subscriber's job (AD-11).
 //!
 //! Plan commands are targeted (AD-15): each item command names its `item_id`, and
@@ -25,7 +26,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nguda_core::{Clock, Day, IdGen, ItemId, Running, Store, TimeZone, Timestamp};
+use nguda_core::{
+    Clock, Day, IdGen, ItemId, PromptId, PromptKind, Running, Store, TimeZone, Timestamp,
+};
 use tokio::sync::{mpsc, watch};
 
 /// How often the engine records `last_alive_at` for crash recovery (AD-6).
@@ -67,6 +70,10 @@ pub enum EngineMsg {
     Start { item_id: ItemId, expected_rev: u64 },
     /// Pauses the running item now.
     Pause { item_id: ItemId },
+    /// Finishes the running item `item_id` now and starts or resumes the next item,
+    /// logging `Switched`. Rejected unless `item_id` is the running item. The engine
+    /// never switches on its own.
+    Switch { item_id: ItemId, expected_rev: u64 },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -119,6 +126,13 @@ pub struct NextItem {
 pub enum Effect {
     /// A segment left open by a crash was closed at startup.
     Recovered { item_id: ItemId },
+    /// Show a prompt about `item_id`. Emitted once per `prompt_id`; it changes no
+    /// state, so no snapshot accompanies it.
+    Notify {
+        prompt_id: PromptId,
+        item_id: ItemId,
+        kind: PromptKind,
+    },
 }
 
 /// The ports and settings the engine runs on.

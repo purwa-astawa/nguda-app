@@ -4,9 +4,12 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 
+use crate::plan::ItemId;
+
 /// The running task: time already banked plus the open segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Running {
+    pub item_id: ItemId,
     pub title: String,
     pub segment_started_at: Timestamp,
     pub accumulated_secs: u64,
@@ -42,6 +45,7 @@ pub fn until_next_second(running: &Running, now: Timestamp) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Uuid;
 
     fn at(secs: i64, ms: i64) -> Timestamp {
         Timestamp::from_millisecond(secs * 1000 + ms).unwrap()
@@ -49,6 +53,7 @@ mod tests {
 
     fn running(started: Timestamp, accumulated_secs: u64) -> Running {
         Running {
+            item_id: ItemId(Uuid::from_u128(1)),
             title: "Demo".into(),
             segment_started_at: started,
             accumulated_secs,

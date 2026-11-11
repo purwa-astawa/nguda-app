@@ -4,12 +4,13 @@
 //! Logging (AD-14): events carry ids, revs, dates and kinds only. Titles, items,
 //! days and messages are never logged or `Debug`-printed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use nguda_core::{
-    Clock, Date, Day, DayLogEntry, DayLogKind, IdGen, OpenSegmentRef, PlanItem, Running, Store,
-    StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
+    Clock, Date, Day, DayLogEntry, DayLogKind, IdGen, ItemId, OpenSegmentRef, PlanItem, PromptKind,
+    Running, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -28,13 +29,13 @@ pub(crate) async fn run(
     let mut actor = Actor::new(deps, snapshots, effects);
     actor.startup().await;
     loop {
-        let deadline = actor.clock.sleep_until(actor.next_deadline);
+        let deadline = actor.clock.sleep_until(actor.next_deadline());
         tokio::select! {
             msg = rx.recv() => match msg {
                 Some(msg) => actor.handle(msg).await,
                 None => break,
             },
-            () = deadline => actor.heartbeat().await,
+            () = deadline => actor.on_deadline().await,
         }
     }
     tracing::debug!("engine stopped: every handle dropped");
@@ -50,8 +51,12 @@ struct Actor {
     day: Day,
     status: BTreeMap<StatusKey, String>,
     rev: u64,
-    /// The next deadline: currently only the heartbeat.
-    next_deadline: Timestamp,
+    /// When the next heartbeat is due.
+    heartbeat_at: Timestamp,
+    /// The `(item_id, planned_secs)` pairs already prompted for at their planned
+    /// end this session, so a pause/resume never re-prompts and a changed planned
+    /// length re-arms. Not persisted.
+    prompted: BTreeSet<(ItemId, u64)>,
     snapshots: watch::Sender<Snapshot>,
     effects: mpsc::UnboundedSender<Effect>,
 }
@@ -79,7 +84,8 @@ impl Actor {
             day,
             status: BTreeMap::new(),
             rev: 0,
-            next_deadline: deadline_after(now),
+            heartbeat_at: deadline_after(now),
+            prompted: BTreeSet::new(),
             snapshots,
             effects,
         }
@@ -116,7 +122,7 @@ impl Actor {
                 }
             },
         };
-        self.next_deadline = deadline_after(now);
+        self.heartbeat_at = deadline_after(now);
         self.publish();
     }
 
@@ -236,13 +242,61 @@ impl Actor {
         true
     }
 
-    /// Records `last_alive_at`. Publishes only if the store status changed.
-    async fn heartbeat(&mut self) {
+    /// The one deadline the loop waits on (AD-3): the earlier of the heartbeat and
+    /// the running item's unprompted planned end.
+    fn next_deadline(&self) -> Timestamp {
+        match self.planned_end() {
+            Some((_, end)) => end.min(self.heartbeat_at),
+            None => self.heartbeat_at,
+        }
+    }
+
+    /// The running item's planned end and its `(item_id, planned_secs)` key, unless
+    /// that pair was already prompted: `segment_started_at + (planned_secs −
+    /// accumulated_secs)`, saturating, so an item already over is due at once.
+    fn planned_end(&self) -> Option<((ItemId, u64), Timestamp)> {
+        let running = running_of(&self.day)?;
+        let planned = self.day.item(running.item_id)?.planned_secs();
+        let key = (running.item_id, planned);
+        if self.prompted.contains(&key) {
+            return None;
+        }
+        let left = Duration::from_secs(planned.saturating_sub(running.accumulated_secs));
+        let end = running
+            .segment_started_at
+            .checked_add(left)
+            .unwrap_or(Timestamp::MAX);
+        Some((key, end))
+    }
+
+    /// Handles whatever is due: a planned-end prompt (an effect only: no state,
+    /// commit or snapshot), and/or the heartbeat.
+    async fn on_deadline(&mut self) {
         let now = self.clock.now();
+        if let Some((key @ (item_id, _), end)) = self.planned_end()
+            && now >= end
+        {
+            self.prompted.insert(key);
+            let prompt_id = self.ids.new_prompt_id();
+            tracing::info!(%item_id, %prompt_id, kind = "planned_end", "prompt due");
+            // A closed receiver only means nobody listens for effects.
+            let _ = self.effects.send(Effect::Notify {
+                prompt_id,
+                item_id,
+                kind: PromptKind::PlannedEnd,
+            });
+        }
+        if now >= self.heartbeat_at {
+            self.heartbeat(now).await;
+        }
+    }
+
+    /// Records `last_alive_at`. Publishes only if the store status changed.
+    async fn heartbeat(&mut self, now: Timestamp) {
         let status_before = self.status.clone();
         let batch = StoreBatch::from_iter([StoreOp::SetLastAlive { at: now }]);
         self.commit(batch).await;
-        self.next_deadline = deadline_after(now);
+        self.heartbeat_at = deadline_after(now);
         if self.status != status_before {
             self.publish();
         }

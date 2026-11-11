@@ -61,9 +61,15 @@ CREATE TABLE day_log (
 CREATE INDEX day_log_day_date ON day_log (day_date);
 "#;
 
+/// v3: the second item of a day-log entry (`switched`: `item_id` is the item
+/// switched from, `to_item_id` the one switched to, NULL when none was left).
+const V3: &str = r#"
+ALTER TABLE day_log ADD COLUMN to_item_id TEXT REFERENCES plan_item (id);
+"#;
+
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2)])
+    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3)])
 }
 
 #[cfg(test)]

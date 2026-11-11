@@ -21,7 +21,8 @@ export type Command =
   | { name: "toggleFixed"; args: [itemId: string, pinnedStart: string | null, expectedRev: number] }
   | { name: "removeTask"; args: [itemId: string] }
   | { name: "startTask"; args: [itemId: string, expectedRev: number] }
-  | { name: "pauseTask"; args: [itemId: string] };
+  | { name: "pauseTask"; args: [itemId: string] }
+  | { name: "switchTask"; args: [itemId: string, expectedRev: number] };
 
 /** Keeps `next` only if it is newer than `prev`. Events and the `currentSnapshot`
  * reply can arrive in either order. */
@@ -88,6 +89,8 @@ export type RowActions = {
   unpin: Command | null;
   start: Command | null;
   pause: Command | null;
+  /** Finish this running item and move on to the next (rev-checked). */
+  switch: Command | null;
   remove: Command | null;
 };
 
@@ -110,6 +113,7 @@ export function rowActions(snap: Snapshot, item: Item): RowActions {
     unpin: item.fixed ? { name: "toggleFixed", args: [item.id, null, snap.rev] } : null,
     start: startable ? { name: "startTask", args: [item.id, snap.rev] } : null,
     pause: running ? { name: "pauseTask", args: [item.id] } : null,
+    switch: running ? { name: "switchTask", args: [item.id, snap.rev] } : null,
     remove: running ? null : { name: "removeTask", args: [item.id] },
   };
 }
