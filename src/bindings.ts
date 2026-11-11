@@ -59,6 +59,16 @@ export type ItemView_Deserialize = {
 	status: ItemStatusView,
 	/**  Closed segments only. A running item's live time comes from `running`. */
 	actualSecs: number,
+	/**
+	 *  RFC 3339 UTC instant the schedule puts this item's start at; `null` when it
+	 *  has no span (carried over, or done without time).
+	 */
+	scheduledStart?: string | null,
+	/**
+	 *  RFC 3339 UTC instant the schedule puts this item's end at; set exactly when
+	 *  `scheduled_start` is.
+	 */
+	scheduledEnd?: string | null,
 };
 
 export type ItemView_Serialize = {
@@ -72,6 +82,16 @@ export type ItemView_Serialize = {
 	status: ItemStatusView,
 	/**  Closed segments only. A running item's live time comes from `running`. */
 	actualSecs: number,
+	/**
+	 *  RFC 3339 UTC instant the schedule puts this item's start at; `null` when it
+	 *  has no span (carried over, or done without time).
+	 */
+	scheduledStart: string | null,
+	/**
+	 *  RFC 3339 UTC instant the schedule puts this item's end at; set exactly when
+	 *  `scheduled_start` is.
+	 */
+	scheduledEnd: string | null,
 };
 
 /**  A reorder target: next to another flexible item, never a numeric index (AD-15). */
@@ -105,8 +125,8 @@ export type SnapshotEvent_Deserialize = {
 	/**  Today. `null` only before startup finishes (rev 0). */
 	day?: DayView | null,
 	/**
-	 *  Today's non-removed items in display order (`Day::in_order`). The view shows
-	 *  them as given and never re-sorts.
+	 *  Today's non-removed items in schedule order (`Snapshot.schedule`). The view
+	 *  shows them as given and never re-sorts.
 	 */
 	items: ItemView_Deserialize[],
 	running?: RunningView | null,
@@ -123,8 +143,8 @@ export type SnapshotEvent_Serialize = {
 	/**  Today. `null` only before startup finishes (rev 0). */
 	day: DayView | null,
 	/**
-	 *  Today's non-removed items in display order (`Day::in_order`). The view shows
-	 *  them as given and never re-sorts.
+	 *  Today's non-removed items in schedule order (`Snapshot.schedule`). The view
+	 *  shows them as given and never re-sorts.
 	 */
 	items: ItemView_Serialize[],
 	running: RunningView | null,

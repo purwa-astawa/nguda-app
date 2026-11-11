@@ -50,12 +50,16 @@ export function pinInstant(date: string, time: string): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-/** The flexible items just before and after `id`, in the order given. */
+/** The pending or paused flexible items just before and after `id`, in the order
+ * given. Done, running and carried-over items sit at their actual times rather than
+ * in order-key order, so they are never neighbours, and have none themselves. */
 export function flexibleNeighbours(
   items: readonly Item[],
   id: string,
 ): { prev: Item | null; next: Item | null } {
-  const flexible = items.filter((i) => !i.fixed);
+  const flexible = items.filter(
+    (i) => !i.fixed && (i.status === "pending" || i.status === "paused"),
+  );
   const at = flexible.findIndex((i) => i.id === id);
   if (at < 0) return { prev: null, next: null };
   return { prev: flexible[at - 1] ?? null, next: flexible[at + 1] ?? null };
@@ -124,4 +128,23 @@ export function rowTime(snap: Snapshot, item: Item, nowNs: bigint): string {
   return r && r.itemId === item.id
     ? formatElapsed(elapsedSecs(r, nowNs))
     : formatElapsed(item.actualSecs);
+}
+
+/** Local `HH:MM` of an RFC 3339 instant in the IANA zone `tz`, 24-hour. Falls back
+ * to the browser's zone if `tz` is unknown. */
+export function zonedTime(iso: string, tz: string): string {
+  const opts: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
+  const at = new Date(iso);
+  try {
+    return at.toLocaleTimeString("en-GB", { ...opts, timeZone: tz });
+  } catch {
+    return at.toLocaleTimeString("en-GB", opts);
+  }
+}
+
+/** A row's scheduled `HH:MM–HH:MM` in the day's zone, or `null` when the schedule
+ * gives it no span. Only formats the engine's times; never computes them. */
+export function scheduleLabel(item: Item, tz: string): string | null {
+  if (!item.scheduledStart || !item.scheduledEnd) return null;
+  return `${zonedTime(item.scheduledStart, tz)}\u2013${zonedTime(item.scheduledEnd, tz)}`;
 }

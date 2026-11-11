@@ -11,6 +11,7 @@ import {
   pinInstant,
   rowActions,
   rowTime,
+  scheduleLabel,
   type Item,
   type Snapshot,
 } from "../src/plan.ts";
@@ -25,6 +26,8 @@ function item(id: string, extra: Partial<Item> = {}): Item {
     pinnedStart: null,
     status: "pending",
     actualSecs: 0,
+    scheduledStart: null,
+    scheduledEnd: null,
     ...extra,
   };
 }
@@ -135,4 +138,37 @@ test("row time ticks for the running item and shows banked time otherwise", () =
   assert.equal(rowTime(s, a, parseInstantNs("2026-11-11T09:00:05.9Z")), "01:05");
   assert.equal(rowTime(s, a, parseInstantNs("2026-11-11T09:00:06Z")), "01:06");
   assert.equal(rowTime(s, b, parseInstantNs("2026-11-11T09:00:06Z")), "1:00:00");
+});
+
+test("schedule label shows start and end as local HH:MM in the day's zone", () => {
+  const a = item("A", {
+    scheduledStart: "2026-11-11T08:00:00Z",
+    scheduledEnd: "2026-11-11T08:25:30Z",
+  });
+  assert.equal(scheduleLabel(a, "Europe/Berlin"), "09:00\u201309:25");
+  assert.equal(scheduleLabel(a, "UTC"), "08:00\u201308:25");
+  assert.equal(scheduleLabel(a, "Asia/Tokyo"), "17:00\u201317:25");
+  const late = item("L", {
+    scheduledStart: "2026-11-11T23:30:00Z",
+    scheduledEnd: "2026-11-12T00:10:00Z",
+  });
+  assert.equal(scheduleLabel(late, "UTC"), "23:30\u201300:10");
+  assert.equal(scheduleLabel(item("C"), "UTC"), null, "no span, no label");
+});
+
+test("up and down skip done and running neighbours, which are not in order-key order", () => {
+  const C = item("C", { status: "done" });
+  const R = item("R", { status: "running" });
+  const s = snap(3, [C, A, R, B]);
+  assert.equal(rowActions(s, A).up, null, "the done C is not a neighbour");
+  assert.deepEqual(rowActions(s, A).down, {
+    name: "reorderTask",
+    args: ["A", { place: "after", itemId: "B" }, 3],
+  });
+  assert.deepEqual(rowActions(s, B).up, {
+    name: "reorderTask",
+    args: ["B", { place: "before", itemId: "A" }, 3],
+  });
+  assert.deepEqual(flexibleNeighbours([C, A, R, B], "R"), { prev: null, next: null });
+  assert.deepEqual(flexibleNeighbours([C, A, R, B], "C"), { prev: null, next: null });
 });

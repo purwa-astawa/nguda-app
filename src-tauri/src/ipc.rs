@@ -10,7 +10,7 @@
 //! with `Err` on malformed input without sending anything; every semantic check
 //! happens in the engine, which reports rejections through `Snapshot.status`.
 
-use nguda_core::{Day, ItemId, ItemStatus, PlanItem, Timestamp, Uuid, closed_secs};
+use nguda_core::{ItemId, ItemStatus, PlanItem, Slot, Timestamp, Uuid, closed_secs};
 use nguda_engine::{EngineHandle, EngineMsg, ReorderAnchor, Snapshot, StatusKey};
 use serde::{Deserialize, Serialize};
 #[cfg(any(debug_assertions, test))]
@@ -225,8 +225,8 @@ pub struct SnapshotEvent {
     pub rev: u32,
     /// Today. `null` only before startup finishes (rev 0).
     pub day: Option<DayView>,
-    /// Today's non-removed items in display order (`Day::in_order`). The view shows
-    /// them as given and never re-sorts.
+    /// Today's non-removed items in schedule order (`Snapshot.schedule`). The view
+    /// shows them as given and never re-sorts.
     pub items: Vec<ItemView>,
     pub running: Option<RunningView>,
     /// One entry per status key, sorted by key.
@@ -255,6 +255,12 @@ pub struct ItemView {
     pub status: ItemStatusView,
     /// Closed segments only. A running item's live time comes from `running`.
     pub actual_secs: u32,
+    /// RFC 3339 UTC instant the schedule puts this item's start at; `null` when it
+    /// has no span (carried over, or done without time).
+    pub scheduled_start: Option<String>,
+    /// RFC 3339 UTC instant the schedule puts this item's end at; set exactly when
+    /// `scheduled_start` is.
+    pub scheduled_end: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type)]
@@ -317,14 +323,24 @@ pub struct RunningView {
 
 impl From<&Snapshot> for SnapshotEvent {
     fn from(s: &Snapshot) -> Self {
-        let items: Vec<&PlanItem> = s.day.as_ref().map(Day::in_order).unwrap_or_default();
+        let items: Vec<ItemView> = s
+            .day
+            .as_ref()
+            .map(|day| {
+                s.schedule
+                    .slots()
+                    .iter()
+                    .filter_map(|slot| day.item(slot.item_id).map(|i| item_view(i, slot)))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             rev: saturating_u32(s.rev),
             day: s.day.as_ref().map(|d| DayView {
                 date: d.date().to_string(),
                 tz: d.tz().to_owned(),
             }),
-            items: items.iter().map(|i| item_view(i)).collect(),
+            items,
             running: s.running.as_ref().map(|r| RunningView {
                 item_id: r.item_id.to_string(),
                 title: r.title.clone(),
@@ -343,7 +359,7 @@ impl From<&Snapshot> for SnapshotEvent {
     }
 }
 
-fn item_view(i: &PlanItem) -> ItemView {
+fn item_view(i: &PlanItem, slot: &Slot) -> ItemView {
     ItemView {
         id: i.id().to_string(),
         title: i.title().to_owned(),
@@ -352,6 +368,8 @@ fn item_view(i: &PlanItem) -> ItemView {
         pinned_start: i.pinned_start().map(|t| t.to_string()),
         status: i.status().into(),
         actual_secs: saturating_u32(closed_secs(i.segments())),
+        scheduled_start: slot.span.map(|sp| sp.start.to_string()),
+        scheduled_end: slot.span.map(|sp| sp.end.to_string()),
     }
 }
 
@@ -394,7 +412,7 @@ mod tests {
     use std::time::Duration;
 
     use nguda_adapters::{SqliteStore, SystemClock, UuidV7Ids};
-    use nguda_core::{OrderKey, PlanItemRecord, Running, Segment, TimeZone};
+    use nguda_core::{Day, OrderKey, PlanItemRecord, Running, Segment, TimeZone};
     use nguda_engine::{EngineDeps, StatusEntry};
     use tokio::time::timeout;
 
@@ -606,14 +624,16 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_event_carries_the_day_in_display_order() {
+    fn snapshot_event_carries_the_day_in_schedule_order() {
         let day = sample_day();
         let running = day.item(item(A)).unwrap().running_view();
+        let schedule = nguda_core::reflow(&day, ts("2026-11-11T09:40:00Z"));
         let snap = Snapshot {
             rev: 5,
             day: Some(day),
             running,
             next_item: None,
+            schedule,
             status: vec![StatusEntry {
                 key: StatusKey::CommandRejected,
                 message: "stale revision".into(),
@@ -629,7 +649,7 @@ mod tests {
             })
         );
         let ids: Vec<&str> = ev.items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, [F, A, B], "display order, removed R excluded");
+        assert_eq!(ids, [F, A, B], "schedule order, removed R excluded");
         assert_eq!(
             ev.items[0],
             ItemView {
@@ -640,7 +660,22 @@ mod tests {
                 pinned_start: Some("2026-11-11T08:00:00Z".into()),
                 status: ItemStatusView::Pending,
                 actual_secs: 0,
+                scheduled_start: Some("2026-11-11T08:00:00Z".into()),
+                scheduled_end: Some("2026-11-11T08:25:00Z".into()),
             }
+        );
+        // A ends at its planned end (1500 s less 60 banked); B flows after it.
+        let times = |n: usize| {
+            let i = &ev.items[n];
+            (i.scheduled_start.as_deref(), i.scheduled_end.as_deref())
+        };
+        assert_eq!(
+            times(1),
+            (Some("2026-11-11T09:30:00Z"), Some("2026-11-11T09:54:00Z"))
+        );
+        assert_eq!(
+            times(2),
+            (Some("2026-11-11T09:54:00Z"), Some("2026-11-11T10:19:00Z"))
         );
         assert_eq!(ev.items[1].status, ItemStatusView::Running);
         assert_eq!(ev.items[1].actual_secs, 60, "closed segments only");
@@ -706,6 +741,16 @@ mod tests {
         assert_eq!(r.segment_started_at, "1970-01-01T00:00:01.5Z");
     }
 
+    /// The item without its scheduled times, which follow the system clock.
+    fn unscheduled(i: ItemView) -> ItemView {
+        assert!(i.scheduled_start.is_some() && i.scheduled_end.is_some());
+        ItemView {
+            scheduled_start: None,
+            scheduled_end: None,
+            ..i
+        }
+    }
+
     /// The Restart row: a task created through the command path survives a new
     /// engine on the same SQLite file.
     #[tokio::test(flavor = "multi_thread")]
@@ -733,7 +778,7 @@ mod tests {
         )
         .await
         .expect("task created in time")
-        .map(|s| SnapshotEvent::from(&*s).items[0].clone())
+        .map(|s| unscheduled(SnapshotEvent::from(&*s).items[0].clone()))
         .unwrap();
         assert_eq!(
             (created.title.as_str(), created.planned_secs),
@@ -751,6 +796,7 @@ mod tests {
             .expect("engine started in time")
             .map(|s| SnapshotEvent::from(&*s).items)
             .unwrap();
+        let restored: Vec<ItemView> = restored.into_iter().map(unscheduled).collect();
         assert_eq!(restored, [created]);
     }
 }
