@@ -8,6 +8,25 @@ body {
   color: #b00020;
 }
 
+.status.overflow {
+  color: #6b4500;
+  background: #fff4d6;
+  border: 1px solid #e0b040;
+  border-radius: 4px;
+  padding: 0.4rem 0.8rem;
+  margin: 0.5rem 0;
+}
+
+.status.overflow p {
+  margin: 0 0 0.2rem;
+  font-weight: bold;
+}
+
+.status.overflow ul {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
 .add,
 .edit,
 .extend,

@@ -84,9 +84,25 @@ CREATE TABLE interrupt_entry (
 ) STRICT;
 "#;
 
+/// v6: user settings (Config convention), one row per key. `work_end` holds the
+/// work-end time of day as `HH:MM`; a missing row means the default.
+const V6: &str = r#"
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+) STRICT;
+"#;
+
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4), M::up(V5)])
+    Migrations::new(vec![
+        M::up(V1),
+        M::up(V2),
+        M::up(V3),
+        M::up(V4),
+        M::up(V5),
+        M::up(V6),
+    ])
 }
 
 #[cfg(test)]

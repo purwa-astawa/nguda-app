@@ -12,6 +12,7 @@ use jiff::civil::Date;
 
 use crate::day_log::DayLogEntry;
 use crate::plan::{Day, ItemId, PlanItem};
+use crate::settings::{Settings, WorkEnd};
 
 /// One write in a [`StoreBatch`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +41,8 @@ pub enum StoreOp {
     /// Replaces the stored day `date`'s interrupt stack with `items`, bottom first.
     /// An empty list clears it.
     SetInterruptStack { date: Date, items: Vec<ItemId> },
+    /// Stores the work-end setting, replacing any earlier value.
+    SetWorkEnd { work_end: WorkEnd },
 }
 
 /// Where the one open segment is: its item's day, the item, and its start.
@@ -127,4 +130,7 @@ pub trait Store: Send + Sync + 'static {
 
     /// The day's log entries in append order. Empty for an unknown day.
     fn load_day_log(&self, date: Date) -> StoreFuture<Vec<DayLogEntry>>;
+
+    /// The stored user settings, each missing one at its default.
+    fn load_settings(&self) -> StoreFuture<Settings>;
 }

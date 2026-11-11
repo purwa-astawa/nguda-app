@@ -1,7 +1,8 @@
 //! The engine's effect consumer (AD-10): the engine decides, this task renders.
 //!
 //! For each `Notify` it looks up the task title in the latest snapshot and posts
-//! once per `prompt_id`. Each `WithdrawNotification` is passed to the notifier;
+//! once per `prompt_id`; an overflow prompt names the first leftover, plus how many
+//! more the snapshot's overflow list holds. Each `WithdrawNotification` is passed to the notifier;
 //! the prompt id stays in `posted`, so a withdrawn prompt is never re-posted.
 //! Failures are logged with ids and kinds only (AD-14), never titles. `Recovered`
 //! needs no rendering yet and is ignored.
@@ -61,10 +62,14 @@ impl Consumer {
             );
             return;
         };
+        let task_title = match (kind, snapshot.overflow.len()) {
+            (PromptKind::Overflow, n) if n > 1 => format!("{} and {} more", item.title(), n - 1),
+            _ => item.title().to_owned(),
+        };
         let note = Notification {
             prompt_id,
             kind,
-            task_title: item.title().to_owned(),
+            task_title,
         };
         if let Err(e) = self.notifier.post(&note) {
             // NotifierError messages carry ids and OS errors only.
@@ -79,6 +84,7 @@ impl Consumer {
 fn kind_name(kind: PromptKind) -> &'static str {
     match kind {
         PromptKind::PlannedEnd => "planned_end",
+        PromptKind::Overflow => "overflow",
     }
 }
 
@@ -242,6 +248,40 @@ mod tests {
         c.handle(notify(1), &snapshot());
         assert_eq!(*fake.withdrawn.lock().unwrap(), vec![prompt(1)]);
         assert_eq!(fake.posted.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_overflow_prompt_names_the_first_leftover_and_counts_the_rest() {
+        let fake = Arc::new(FakeNotifier::default());
+        let mut c = Consumer::new(fake.clone());
+        let overflow = |n: u128| Effect::Notify {
+            prompt_id: prompt(n),
+            item_id: item_id(),
+            kind: PromptKind::Overflow,
+        };
+        let mut snap = snapshot();
+        snap.overflow = vec![item_id()];
+        c.handle(overflow(1), &snap);
+        snap.overflow = vec![
+            item_id(),
+            ItemId(Uuid::from_u128(2)),
+            ItemId(Uuid::from_u128(3)),
+        ];
+        c.handle(overflow(2), &snap);
+        let titles: Vec<(PromptKind, String)> = fake
+            .posted
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|n| (n.kind, n.task_title.clone()))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                (PromptKind::Overflow, "Write".to_owned()),
+                (PromptKind::Overflow, "Write and 2 more".to_owned()),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -1,14 +1,15 @@
 //! Plan commands as pure functions on a copy of the day (AD-3, AD-15).
 //!
-//! Each command validates its input and applies domain transitions to `day`,
-//! returning the store ops to append after [`crate::batch::diff`] (the extras), or a
+//! Each command validates its input and applies domain transitions to `day` (or,
+//! for [`EngineMsg::SetWorkEnd`], changes the work-end setting), returning the
+//! store ops to append after [`crate::batch::diff`] (the extras), or a
 //! [`Reject`]. On a reject `day` may be half-changed: callers pass a copy and drop it.
 
 use std::fmt;
 
 use nguda_core::{
     Day, DayLogEntry, DayLogKind, DomainError, IdGen, ItemId, ItemStatus, OrderKey, PlanItem,
-    StoreOp, Timestamp,
+    StoreOp, Timestamp, WorkEnd,
 };
 
 use crate::{EngineMsg, InsertAnchor, ReorderAnchor};
@@ -85,6 +86,7 @@ const PAUSE: &str = "Pause";
 const SWITCH: &str = "Switch";
 const EXTEND_TASK: &str = "ExtendTask";
 const INSERT_TASK: &str = "InsertTask";
+const SET_WORK_END: &str = "SetWorkEnd";
 
 /// The message's name, for logs and reject messages.
 pub(crate) fn name(msg: &EngineMsg) -> &'static str {
@@ -99,13 +101,14 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::Switch { .. } => SWITCH,
         EngineMsg::ExtendTask { .. } => EXTEND_TASK,
         EngineMsg::InsertTask { .. } => INSERT_TASK,
+        EngineMsg::SetWorkEnd { .. } => SET_WORK_END,
     }
 }
 
 /// The item a message targets, for logs.
 pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
     match msg {
-        EngineMsg::CreateTask { .. } => None,
+        EngineMsg::CreateTask { .. } | EngineMsg::SetWorkEnd { .. } => None,
         EngineMsg::InsertTask { anchor, .. } => match anchor {
             InsertAnchor::After(id) | InsertAnchor::Before(id) => Some(*id),
             InsertAnchor::Now | InsertAnchor::End => None,
@@ -121,11 +124,12 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
     }
 }
 
-/// Applies `msg` to `day` at `now`. A rev-checked command whose `expected_rev` is
-/// not `rev` is rejected before anything else.
+/// Applies `msg` to `day` and `work_end` at `now`. A rev-checked command whose
+/// `expected_rev` is not `rev` is rejected before anything else.
 pub(crate) fn apply(
     msg: EngineMsg,
     day: &mut Day,
+    work_end: &mut WorkEnd,
     now: Timestamp,
     ids: &dyn IdGen,
     rev: u64,
@@ -199,7 +203,24 @@ pub(crate) fn apply(
             check(expected_rev)?;
             insert_task(day, now, ids, title, planned_secs, anchor)
         }
+        EngineMsg::SetWorkEnd { minutes } => set_work_end(work_end, minutes),
     }
+}
+
+/// The new work-end and its store op. Outside `0..=1439` is invalid input; the
+/// current value changes nothing and needs no op.
+fn set_work_end(work_end: &mut WorkEnd, minutes: u32) -> Result<Vec<StoreOp>, Reject> {
+    let next = WorkEnd::from_minutes(minutes).ok_or_else(|| {
+        Reject::invalid(
+            SET_WORK_END,
+            format!("minutes {minutes} is not between 0 and 1439"),
+        )
+    })?;
+    if next == *work_end {
+        return Ok(Vec::new());
+    }
+    *work_end = next;
+    Ok(vec![StoreOp::SetWorkEnd { work_end: next }])
 }
 
 fn domain(command: &'static str) -> impl Fn(DomainError) -> Reject {
@@ -723,6 +744,7 @@ mod tests {
                 expected_rev: 3,
             },
             &mut day,
+            &mut WorkEnd::default(),
             ts(0),
             &SeqIds::default(),
             5,
@@ -738,5 +760,24 @@ mod tests {
             "Pause: cannot pause an item that is pending"
         );
         assert!(!err.to_string().contains("t100"));
+    }
+
+    #[test]
+    fn set_work_end_validates_and_skips_the_current_value() {
+        let mut we = WorkEnd::DEFAULT;
+        let err = set_work_end(&mut we, 1440).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "SetWorkEnd: minutes 1440 is not between 0 and 1439"
+        );
+        assert_eq!(err.kind(), "invalid_input");
+        assert_eq!(we, WorkEnd::DEFAULT);
+        assert_eq!(set_work_end(&mut we, 17 * 60), Ok(vec![]));
+        let late = WorkEnd::from_minutes(18 * 60).unwrap();
+        assert_eq!(
+            set_work_end(&mut we, 18 * 60),
+            Ok(vec![StoreOp::SetWorkEnd { work_end: late }])
+        );
+        assert_eq!(we, late);
     }
 }

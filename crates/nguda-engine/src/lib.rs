@@ -9,6 +9,13 @@
 //! running item's planned end), and rendering the ticking elapsed
 //! time is the subscriber's job (AD-11).
 //!
+//! Overflow: every publish re-flows the day and lists the flexible items that end
+//! after the work-end setting ([`EngineMsg::SetWorkEnd`], persisted, default 17:00
+//! in the engine's zone). A non-empty list sets the [`StatusKey::Overflow`] status
+//! and opens an episode with one [`Effect::Notify`] of [`PromptKind::Overflow`];
+//! when the list empties again the status clears and that prompt is withdrawn. The
+//! heartbeat re-checks the list, so time passing alone can open an episode.
+//!
 //! Plan commands are targeted (AD-15): each item command names its `item_id`, and
 //! those whose meaning depends on the current state also carry the `expected_rev`
 //! of the snapshot the sender rendered. A stale rev, invalid input, or a domain
@@ -33,6 +40,7 @@ use std::time::Duration;
 
 use nguda_core::{
     Clock, Day, IdGen, ItemId, PromptId, PromptKind, Running, Schedule, Store, TimeZone, Timestamp,
+    WorkEnd,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -98,6 +106,9 @@ pub enum EngineMsg {
         anchor: InsertAnchor,
         expected_rev: u64,
     },
+    /// Sets the work-end time of day to `minutes` after local midnight
+    /// (`0..=1439`), persisted. Not rev-checked; the same value changes nothing.
+    SetWorkEnd { minutes: u32 },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -129,6 +140,9 @@ pub enum StatusKey {
     /// The last command was rejected (stale rev, invalid input, or a domain rule).
     /// Cleared by the next command that passes validation.
     CommandRejected,
+    /// Re-flow ends flexible items after work-end. Owned by the overflow check
+    /// alone: set while the list is non-empty, removed when it is empty.
+    Overflow,
 }
 
 /// One problem the user should see. At most one entry per key.
@@ -151,6 +165,11 @@ pub struct Snapshot {
     /// Today's schedule, re-flowed at publish time (`nguda_core::reflow`). Empty
     /// only before startup finishes (rev 0).
     pub schedule: Schedule,
+    /// The work-end setting the overflow check used.
+    pub work_end: WorkEnd,
+    /// Pending or paused flexible items of `schedule` that end after today's
+    /// work-end, in schedule order (`Schedule::overflow`).
+    pub overflow: Vec<ItemId>,
     /// Sorted by key.
     pub status: Vec<StatusEntry>,
 }
@@ -174,8 +193,9 @@ pub enum Effect {
         item_id: ItemId,
         kind: PromptKind,
     },
-    /// Remove the prompt `prompt_id`, posted earlier this session, because its item
-    /// was extended. Emitted only after the extension committed.
+    /// Remove the prompt `prompt_id`, posted earlier this session: a planned-end
+    /// prompt whose item was extended (emitted only after the extension committed)
+    /// or was superseded, or the overflow prompt of an episode that just ended.
     WithdrawNotification { prompt_id: PromptId },
 }
 

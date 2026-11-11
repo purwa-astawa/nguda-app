@@ -26,6 +26,11 @@ export const commands = {
 	/**  Inserts a new task at `anchor`; `now` starts it, pausing the running item. */
 	insertTask: (title: string, plannedSecs: number, anchor: InsertAnchorArg_Deserialize, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("insert_task", { title, plannedSecs, anchor, expectedRev })),
 	/**
+	 *  Sets the work-end time of day, `minutes` after local midnight. The engine
+	 *  rejects values outside `0..=1439`.
+	 */
+	setWorkEnd: (minutes: number) => typedError<null, string>(__TAURI_INVOKE("set_work_end", { minutes })),
+	/**
 	 *  The latest snapshot, read from the engine's `watch` receiver. Sends nothing to
 	 *  the engine (AD-4), so a window that loads after the last event still renders.
 	 */
@@ -182,6 +187,13 @@ export type SnapshotEvent_Deserialize = {
 	 */
 	items: ItemView_Deserialize[],
 	running?: RunningView | null,
+	/**  The work-end time of day, `HH:MM` local. */
+	workEnd: string,
+	/**
+	 *  UUIDs of the flexible items that end after work-end, in schedule order. The
+	 *  view renders them as given and never computes overflow itself.
+	 */
+	overflow: string[],
 	/**  One entry per status key, sorted by key. */
 	status: StatusView[],
 };
@@ -200,11 +212,18 @@ export type SnapshotEvent_Serialize = {
 	 */
 	items: ItemView_Serialize[],
 	running: RunningView | null,
+	/**  The work-end time of day, `HH:MM` local. */
+	workEnd: string,
+	/**
+	 *  UUIDs of the flexible items that end after work-end, in schedule order. The
+	 *  view renders them as given and never computes overflow itself.
+	 */
+	overflow: string[],
 	/**  One entry per status key, sorted by key. */
 	status: StatusView[],
 };
 
-export type StatusKeyView = "store" | "commandRejected";
+export type StatusKeyView = "store" | "commandRejected" | "overflow";
 
 export type StatusView = {
 	key: StatusKeyView,

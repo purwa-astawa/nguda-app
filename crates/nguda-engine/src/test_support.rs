@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use nguda_core::{
     Clock, Date, Day, DayLogEntry, IdGen, ItemId, OpenSegmentRef, OrderKey, PlanItem,
-    PlanItemRecord, PromptId, Segment, SleepFuture, Store, StoreBatch, StoreError, StoreFuture,
-    StoreOp, Timestamp, Uuid,
+    PlanItemRecord, PromptId, Segment, Settings, SleepFuture, Store, StoreBatch, StoreError,
+    StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
 };
 use tokio::sync::watch;
 
@@ -121,6 +121,8 @@ struct Data {
     day_log: Vec<(Date, DayLogEntry)>,
     /// date → interrupt stack, bottom first.
     stacks: BTreeMap<Date, Vec<ItemId>>,
+    /// `None` until a work-end is stored.
+    work_end: Option<WorkEnd>,
 }
 
 impl Data {
@@ -229,6 +231,7 @@ impl Data {
                 }
                 self.stacks.insert(*date, items.clone());
             }
+            StoreOp::SetWorkEnd { work_end } => self.work_end = Some(*work_end),
         }
         Ok(())
     }
@@ -337,6 +340,11 @@ impl MemoryStore {
         self.data.lock().unwrap().stacks.insert(date, items);
     }
 
+    /// Stores `work_end` as is, bypassing batches.
+    pub(crate) fn seed_work_end(&self, work_end: WorkEnd) {
+        self.data.lock().unwrap().work_end = Some(work_end);
+    }
+
     pub(crate) fn seed_last_alive(&self, at: Option<Timestamp>) {
         self.data.lock().unwrap().last_alive = at;
     }
@@ -407,5 +415,13 @@ impl Store for MemoryStore {
 
     fn load_day_log(&self, date: Date) -> StoreFuture<Vec<DayLogEntry>> {
         self.read(|d| Ok(d.day_log(date)))
+    }
+
+    fn load_settings(&self) -> StoreFuture<Settings> {
+        self.read(|d| {
+            Ok(Settings {
+                work_end: d.work_end.unwrap_or_default(),
+            })
+        })
     }
 }

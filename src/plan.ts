@@ -27,7 +27,8 @@ export type Command =
   | {
       name: "insertTask";
       args: [title: string, plannedSecs: number, anchor: InsertAnchor, expectedRev: number];
-    };
+    }
+  | { name: "setWorkEnd"; args: [minutes: number] };
 
 /** Where an inserted task goes, as `insertTask` takes it. Never a numeric index. */
 export type InsertAnchor = {
@@ -149,6 +150,21 @@ export function insertCommand(
   anchor: InsertAnchor,
 ): Command {
   return { name: "insertTask", args: [title, minutesToSecs(minutes), anchor, snap.rev] };
+}
+
+/** Sets the work-end from a time field's `HH:MM`. Anything else is sent as 1440,
+ * out of range, so the engine rejects it. */
+export function workEndCommand(time: string): Command {
+  const m = /^(\d{2}):(\d{2})$/.exec(time);
+  const [h, min] = m ? [Number(m[1]), Number(m[2])] : [24, 0];
+  return { name: "setWorkEnd", args: [h < 24 && min < 60 ? h * 60 + min : 1440] };
+}
+
+/** The items the engine listed in `snap.overflow`, in that order. Only looks them
+ * up; never decides what overflows. */
+export function overflowItems(snap: Snapshot): Item[] {
+  const byId = new Map(snap.items.map((i) => [i.id, i] as const));
+  return snap.overflow.flatMap((id) => byId.get(id) ?? []);
 }
 
 /** Everything a row offers. `null` means the button is not shown. Pin is shown
