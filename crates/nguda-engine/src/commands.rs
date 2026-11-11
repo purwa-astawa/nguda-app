@@ -11,7 +11,7 @@ use nguda_core::{
     StoreOp, Timestamp,
 };
 
-use crate::{EngineMsg, ReorderAnchor};
+use crate::{EngineMsg, InsertAnchor, ReorderAnchor};
 
 /// Why a command was rejected. Its message holds ids, revs and kinds only, never
 /// titles (AD-14).
@@ -84,6 +84,7 @@ const START: &str = "Start";
 const PAUSE: &str = "Pause";
 const SWITCH: &str = "Switch";
 const EXTEND_TASK: &str = "ExtendTask";
+const INSERT_TASK: &str = "InsertTask";
 
 /// The message's name, for logs and reject messages.
 pub(crate) fn name(msg: &EngineMsg) -> &'static str {
@@ -97,6 +98,7 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::Pause { .. } => PAUSE,
         EngineMsg::Switch { .. } => SWITCH,
         EngineMsg::ExtendTask { .. } => EXTEND_TASK,
+        EngineMsg::InsertTask { .. } => INSERT_TASK,
     }
 }
 
@@ -104,6 +106,10 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
 pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
     match msg {
         EngineMsg::CreateTask { .. } => None,
+        EngineMsg::InsertTask { anchor, .. } => match anchor {
+            InsertAnchor::After(id) | InsertAnchor::Before(id) => Some(*id),
+            InsertAnchor::Now | InsertAnchor::End => None,
+        },
         EngineMsg::EditTask { item_id, .. }
         | EngineMsg::ReorderTask { item_id, .. }
         | EngineMsg::ToggleFixed { item_id, .. }
@@ -183,6 +189,15 @@ pub(crate) fn apply(
         } => {
             check(expected_rev)?;
             extend_task(day, now, item_id, secs)
+        }
+        EngineMsg::InsertTask {
+            title,
+            planned_secs,
+            anchor,
+            expected_rev,
+        } => {
+            check(expected_rev)?;
+            insert_task(day, now, ids, title, planned_secs, anchor)
         }
     }
 }
@@ -290,6 +305,13 @@ fn reorder_task(
     for (id, role) in [(item_id, "item"), (anchor_id, "anchor")] {
         if live_item(day, CMD, id, role)?.fixed() {
             return Err(Reject::invalid(CMD, format!("{role} {id} is fixed")));
+        }
+    }
+    // Re-flow puts stacked items first, so a key move by or next to one could
+    // not be honoured in the schedule.
+    for (id, role) in [(item_id, "item"), (anchor_id, "anchor")] {
+        if day.interrupt_stack().contains(&id) {
+            return Err(Reject::invalid(CMD, format!("{role} {id} is interrupted")));
         }
     }
     let all = flexible_in_order(day);
@@ -433,6 +455,111 @@ fn extend_task(
         entry: DayLogEntry {
             at: now,
             kind: DayLogKind::Extended { item_id, secs },
+        },
+    }])
+}
+
+/// The key that puts a new item first in the flow: just before the first pending
+/// or paused flexible item that is not on the interrupt stack, or after the last
+/// flexible item when there is none.
+fn first_in_flow_key(day: &Day) -> Result<OrderKey, DomainError> {
+    let all = flexible_in_order(day);
+    let first = all.iter().position(|i| {
+        matches!(i.status(), ItemStatus::Pending | ItemStatus::Paused)
+            && !day.interrupt_stack().contains(&i.id())
+    });
+    match first {
+        Some(at) => OrderKey::between(
+            at.checked_sub(1).map(|p| all[p].order()),
+            Some(all[at].order()),
+        ),
+        None => OrderKey::between(all.last().map(|i| i.order()), None),
+    }
+}
+
+/// The new item, any pause, start or stack change, and the `Inserted` entry,
+/// committed as one batch (AD-15). Placement is by anchor only:
+///
+/// - `End`, and `Now` with nothing running: after the last flexible item;
+/// - `Now` with an item running, and `After(running item)`: first in the flow;
+/// - `After`/`Before` a non-running flexible item: right next to it.
+///
+/// A fixed non-running, removed or unknown anchor, and `Before` the running item,
+/// are rejected.
+fn insert_task(
+    day: &mut Day,
+    now: Timestamp,
+    ids: &dyn IdGen,
+    title: String,
+    planned_secs: u64,
+    anchor: InsertAnchor,
+) -> Result<Vec<StoreOp>, Reject> {
+    const CMD: &str = INSERT_TASK;
+    check_title(CMD, &title)?;
+    check_secs(CMD, planned_secs)?;
+    let running = day
+        .items()
+        .iter()
+        .find(|i| i.status() == ItemStatus::Running)
+        .map(PlanItem::id);
+    let after_last = |day: &Day| {
+        let all = flexible_in_order(day);
+        OrderKey::between(all.last().map(|i| i.order()), None)
+    };
+    let order = match anchor {
+        InsertAnchor::End => after_last(day),
+        InsertAnchor::Now => match running {
+            Some(_) => first_in_flow_key(day),
+            None => after_last(day),
+        },
+        InsertAnchor::After(id) | InsertAnchor::Before(id) => {
+            let target = live_item(day, CMD, id, "anchor")?;
+            if day.interrupt_stack().contains(&id) {
+                // Re-flow puts stacked items first, so a place next to one
+                // could not be honoured.
+                return Err(Reject::invalid(CMD, format!("anchor {id} is interrupted")));
+            }
+            let is_after = matches!(anchor, InsertAnchor::After(_));
+            if target.status() == ItemStatus::Running {
+                if !is_after {
+                    return Err(Reject::invalid(
+                        CMD,
+                        format!("anchor {id} is running: insert after it instead"),
+                    ));
+                }
+                first_in_flow_key(day)
+            } else if target.fixed() {
+                return Err(Reject::invalid(CMD, format!("anchor {id} is fixed")));
+            } else {
+                let all = flexible_in_order(day);
+                let at = all
+                    .iter()
+                    .position(|i| i.id() == id)
+                    .expect("anchor is a live flexible item");
+                let key = |p: usize| all.get(p).map(|i| i.order());
+                let (low, high) = if is_after {
+                    (key(at), key(at + 1))
+                } else {
+                    (at.checked_sub(1).and_then(key), key(at))
+                };
+                OrderKey::between(low, high)
+            }
+        }
+    }
+    .map_err(domain(CMD))?;
+    let item_id = ids.new_item_id();
+    let item = PlanItem::new(item_id, title, planned_secs, order);
+    match (anchor, running) {
+        (InsertAnchor::Now, Some(current)) => day.interrupt(current, item, now),
+        (InsertAnchor::Now, None) => day.add(item).and_then(|()| day.start(item_id, now)),
+        _ => day.add(item),
+    }
+    .map_err(domain(CMD))?;
+    Ok(vec![StoreOp::AppendDayLog {
+        date: day.date(),
+        entry: DayLogEntry {
+            at: now,
+            kind: DayLogKind::Inserted { item_id },
         },
     }])
 }

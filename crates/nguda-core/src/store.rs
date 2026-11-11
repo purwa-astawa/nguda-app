@@ -37,6 +37,9 @@ pub enum StoreOp {
     SetLastAlive { at: Timestamp },
     /// Appends `entry` to the stored day `date`'s log.
     AppendDayLog { date: Date, entry: DayLogEntry },
+    /// Replaces the stored day `date`'s interrupt stack with `items`, bottom first.
+    /// An empty list clears it.
+    SetInterruptStack { date: Date, items: Vec<ItemId> },
 }
 
 /// Where the one open segment is: its item's day, the item, and its start.

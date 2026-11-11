@@ -6,6 +6,8 @@ import {
   editCommand,
   extendCommand,
   flexibleNeighbours,
+  insertCommand,
+  insertPositions,
   mergeSnapshot,
   minutesToSecs,
   pinCommand,
@@ -29,6 +31,7 @@ function item(id: string, extra: Partial<Item> = {}): Item {
     actualSecs: 0,
     scheduledStart: null,
     scheduledEnd: null,
+    interrupted: false,
     ...extra,
   };
 }
@@ -174,6 +177,26 @@ test("up and down skip done and running neighbours, which are not in order-key o
   assert.deepEqual(flexibleNeighbours([C, A, R, B], "C"), { prev: null, next: null });
 });
 
+test("up and down skip interrupted items, and an interrupted row has neither", () => {
+  // The window shows N, Z, B, C: stacked Z flows first whatever its key.
+  const N = item("N", { status: "running" });
+  const Z = item("Z", { status: "paused", interrupted: true });
+  const C = item("C");
+  const s = snap(6, [N, Z, B, C]);
+  assert.equal(rowActions(s, B).up, null, "the interrupted Z is not a neighbour");
+  assert.deepEqual(rowActions(s, B).down, {
+    name: "reorderTask",
+    args: ["B", { place: "after", itemId: "C" }, 6],
+  });
+  assert.deepEqual(rowActions(s, C).up, {
+    name: "reorderTask",
+    args: ["C", { place: "before", itemId: "B" }, 6],
+  });
+  assert.equal(rowActions(s, Z).up, null, "no Up on an interrupted row");
+  assert.equal(rowActions(s, Z).down, null, "no Down on an interrupted row");
+  assert.deepEqual(flexibleNeighbours([N, Z, B, C], "Z"), { prev: null, next: null });
+});
+
 test("extendCommand extends only the running item, by whole minutes, at the rendered rev", () => {
   const R = item("R", { status: "running" });
   const s = snap(7, [F, R, B]);
@@ -185,4 +208,54 @@ test("extendCommand extends only the running item, by whole minutes, at the rend
   for (const bad of ["", "0", "-5", "abc"]) {
     assert.equal(extendCommand(s, R, bad), null, JSON.stringify(bad));
   }
+});
+
+test("insert positions: Now and After current only while running, then each pending or paused flexible item, then At end", () => {
+  const R = item("R", { status: "running", title: "Run" });
+  const P = item("P", { status: "paused", title: "Paused" });
+  const D = item("D", { status: "done" });
+  const running = { itemId: "R", title: "Run", segmentStartedAt: "2026-11-11T09:00:00Z", accumulatedSecs: 0 };
+  const s = snap(4, [D, R, F, P, B], running);
+  assert.deepEqual(
+    insertPositions(s).map((p) => [p.value, p.label, p.anchor]),
+    [
+      ["now", "Now", { place: "now", itemId: null }],
+      ["after-current", "After current", { place: "after", itemId: "R" }],
+      ["before:P", "Before \u201cPaused\u201d", { place: "before", itemId: "P" }],
+      ["after:P", "After \u201cPaused\u201d", { place: "after", itemId: "P" }],
+      ["before:B", "Before \u201cB\u201d", { place: "before", itemId: "B" }],
+      ["after:B", "After \u201cB\u201d", { place: "after", itemId: "B" }],
+      ["end", "At end", { place: "end", itemId: null }],
+    ],
+  );
+  const idle = insertPositions(snap(4, [F, A]));
+  assert.deepEqual(
+    idle.map((p) => p.value),
+    ["before:A", "after:A", "end"],
+    "no Now or After current while idle; fixed F is not an anchor",
+  );
+  assert.deepEqual(insertPositions(snap(1, [])).map((p) => p.label), ["At end"]);
+});
+
+test("insert positions skip interrupted items", () => {
+  const N = item("N", { status: "running", title: "N" });
+  const A2 = item("A", { status: "paused", interrupted: true });
+  const running = { itemId: "N", title: "N", segmentStartedAt: "2026-11-11T09:00:00Z", accumulatedSecs: 0 };
+  assert.deepEqual(
+    insertPositions(snap(3, [N, A2, B], running)).map((p) => p.label),
+    ["Now", "After current", "Before \u201cB\u201d", "After \u201cB\u201d", "At end"],
+  );
+});
+
+test("insertCommand sends title, seconds, the anchor and the rendered rev", () => {
+  const s = snap(9);
+  const anchor = { place: "before", itemId: "B" } as const;
+  assert.deepEqual(insertCommand(s, "Call", "15", anchor), {
+    name: "insertTask",
+    args: ["Call", 900, { place: "before", itemId: "B" }, 9],
+  });
+  assert.deepEqual(insertCommand(s, "", "", { place: "now", itemId: null }), {
+    name: "insertTask",
+    args: ["", 0, { place: "now", itemId: null }, 9],
+  });
 });

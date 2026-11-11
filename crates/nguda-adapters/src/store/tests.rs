@@ -75,6 +75,17 @@ fn has_table(path: &Path, table: &str) -> bool {
         == 1
 }
 
+/// Every stored plan item row, every column, sorted by id.
+fn plan_item_rows(path: &Path) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn.prepare("SELECT * FROM plan_item ORDER BY id").unwrap();
+    let columns = stmt.column_count();
+    stmt.query_map([], |r| (0..columns).map(|c| r.get(c)).collect())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
 fn backups(dir: &TempDir) -> Vec<PathBuf> {
     std::fs::read_dir(dir.path())
         .unwrap()
@@ -157,10 +168,11 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 4);
+    assert_eq!(user_version(&path), 5);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
+    assert!(has_table(&path, "interrupt_entry"));
     assert!(backups(&dir).is_empty());
 }
 
@@ -195,14 +207,26 @@ async fn upgrade_writes_a_backup_of_the_old_schema_then_migrates() {
     // The backup holds the v1 data and predates the v2 migration.
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "v2_marker"));
-    let backed_up = SqliteStore::open_with(&bak, &v1()).unwrap();
-    assert_eq!(
-        backed_up.load_day(date()).await.unwrap(),
-        Some(sample_day())
-    );
-    drop(backed_up);
+    // Both hold every item. (A whole-day load needs the current schema, so the
+    // rows are compared directly, column by column.)
+    let backed_up = plan_item_rows(&bak);
+    // Checked against the seed too, not only against the migrated rows.
+    let mut seeded: Vec<String> = sample_day()
+        .items()
+        .iter()
+        .map(|i| i.id().to_string())
+        .collect();
+    seeded.sort();
+    let backed_up_ids: Vec<String> = backed_up
+        .iter()
+        .map(|row| match &row[0] {
+            rusqlite::types::Value::Text(id) => id.clone(),
+            other => panic!("plan_item.id is not text: {other:?}"),
+        })
+        .collect();
+    assert_eq!(backed_up_ids, seeded);
     // The database is at v2 with its data intact.
-    assert_eq!(store.load_day(date()).await.unwrap(), Some(sample_day()));
+    assert_eq!(plan_item_rows(&path), backed_up);
     drop(store);
     assert_eq!(user_version(&path), 2);
     assert!(has_table(&path, "v2_marker"));
@@ -230,7 +254,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     // connection: a read-write open closing it would checkpoint them.
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-    raw.pragma_update(None, "user_version", 5).unwrap();
+    raw.pragma_update(None, "user_version", 6).unwrap();
     let copy = dir.path().join("newer.db");
     let wal = |p: &Path| PathBuf::from(format!("{}-wal", p.display()));
     std::fs::copy(&path, &copy).unwrap();
@@ -245,14 +269,14 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     assert_eq!(
         err,
         OpenError::NewerSchema {
-            found: 5,
-            supported: 4
+            found: 6,
+            supported: 5
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read(wal(&path)).unwrap(), wal_before);
     assert!(backups(&dir).is_empty());
-    assert_eq!(user_version(&path), 5);
+    assert_eq!(user_version(&path), 6);
 }
 
 #[tokio::test]
@@ -453,7 +477,7 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 4);
+    assert_eq!(user_version(&path), 5);
     assert!(has_table(&path, "engine_meta"));
 }
 
@@ -719,4 +743,110 @@ async fn open_segment_is_none_open_or_none_after_close() {
         .await
         .unwrap();
     assert_eq!(store.open_segment().await.unwrap(), None);
+}
+
+/// Item 10 interrupted by 11, which was interrupted by 12 (running): stack [10, 11].
+fn stacked_day() -> Day {
+    let mut d = Day::new(date(), "UTC");
+    d.add(item(10, "V")).unwrap();
+    d.start(id(10), ts(100)).unwrap();
+    d.interrupt(id(10), item(11, "W"), ts(200)).unwrap();
+    d.interrupt(id(11), item(12, "X"), ts(300)).unwrap();
+    assert_eq!(d.interrupt_stack(), &[id(10), id(11)]);
+    d
+}
+
+fn set_stack(items: Vec<ItemId>) -> StoreOp {
+    StoreOp::SetInterruptStack {
+        date: date(),
+        items,
+    }
+}
+
+#[tokio::test]
+async fn the_interrupt_stack_round_trips_and_is_replaced() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let day = stacked_day();
+    let store = SqliteStore::open(&path).unwrap();
+    let mut b = batch_for(&day);
+    b.push(set_stack(vec![id(10), id(11)]));
+    store.commit(b).await.unwrap();
+    drop(store);
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.load_day(date()).await.unwrap(), Some(day));
+    // Replacing keeps only the new entries, in order.
+    store
+        .commit(batch([set_stack(vec![id(11)])]))
+        .await
+        .unwrap();
+    let loaded = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(loaded.interrupt_stack(), &[id(11)]);
+    store.commit(batch([set_stack(vec![])])).await.unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let loaded = store.load_day(date()).await.unwrap().unwrap();
+    assert!(loaded.interrupt_stack().is_empty());
+}
+
+#[tokio::test]
+async fn a_stored_non_paused_stack_entry_fails_the_load() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = SqliteStore::open(&path).unwrap();
+    store.commit(batch_for(&stacked_day())).await.unwrap();
+    // The running item 12 is not paused.
+    store
+        .commit(batch([set_stack(vec![id(10), id(12)])]))
+        .await
+        .unwrap();
+    let err = store.load_day(date()).await.unwrap_err();
+    assert!(err.message.contains(&id(12).to_string()), "{err}");
+    assert!(!err.message.contains(TITLE), "{err}");
+}
+
+/// A duplicate or unknown entry never reaches a load: the schema refuses it at
+/// commit (`UNIQUE (item_id)`, the foreign key) and the batch rolls back.
+#[tokio::test]
+async fn a_duplicate_or_unknown_stack_entry_is_refused_at_commit() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = SqliteStore::open(&path).unwrap();
+    let day = stacked_day();
+    let mut b = batch_for(&day);
+    b.push(set_stack(vec![id(10), id(11)]));
+    store.commit(b).await.unwrap();
+    for bad in [vec![id(10), id(10)], vec![id(99)]] {
+        store
+            .commit(batch([set_stack(bad.clone())]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            store.load_day(date()).await.unwrap(),
+            Some(day.clone()),
+            "unchanged after {bad:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inserted_day_log_entries_round_trip_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let entry = DayLogEntry {
+        at: ts(1_500),
+        kind: DayLogKind::Inserted { item_id: id(2) },
+    };
+    store
+        .commit(batch([StoreOp::AppendDayLog {
+            date: date(),
+            entry: entry.clone(),
+        }]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.load_day_log(date()).await.unwrap(), vec![entry]);
 }

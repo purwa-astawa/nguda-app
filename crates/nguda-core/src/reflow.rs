@@ -6,9 +6,11 @@
 //! - a done item spans its actual time, first segment start to last segment end;
 //! - the running item ends at its segment start plus its remaining planned time;
 //! - pending and paused fixed items sit at `[pinned_start, pinned_start + planned]`;
-//! - pending and paused flexible items flow from `max(now, running end)` in
-//!   order-key order, each with its remaining time, moved past any fixed span they
-//!   would overlap and never split;
+//! - pending and paused flexible items flow from `max(now, running end)`, each
+//!   with its remaining time, moved past any fixed span they would overlap and never
+//!   split: first the flexible items on the interrupt stack, top first (the order
+//!   [`crate::next_task()`] resumes them in), then the others in order-key order;
+//!   stacked fixed items stay at their pin;
 //! - carried-over items have no span and come last; removed items are left out.
 
 use std::time::Duration;
@@ -168,7 +170,16 @@ pub fn reflow(day: &Day, now: Timestamp) -> Schedule {
         .filter(open)
         .filter(|i| !i.fixed())
         .collect();
-    flexible.sort_by(|a, b| a.order().cmp(b.order()));
+    // Stacked items first, top first; then the rest by order key.
+    let stack = day.interrupt_stack();
+    let rank = |i: &PlanItem| {
+        stack
+            .iter()
+            .rev()
+            .position(|s| *s == i.id())
+            .unwrap_or(usize::MAX)
+    };
+    flexible.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.order().cmp(b.order())));
     for item in flexible {
         let len = item
             .planned_secs()
@@ -465,6 +476,38 @@ mod tests {
         let near_max = Timestamp::MAX.as_second() - 10;
         let s = reflow(&day(vec![flexible(3, 600, "a")]), ts(near_max));
         assert_eq!(s.slot(id(3)).unwrap().span.unwrap().end, Timestamp::MAX);
+    }
+
+    fn paused(n: u128, planned_secs: u64, order: &str) -> PlanItemRecord {
+        PlanItemRecord {
+            status: ItemStatus::Paused,
+            segments: vec![closed(-100, -100)],
+            ..flexible(n, planned_secs, order)
+        }
+    }
+
+    #[test]
+    fn stacked_flexible_items_flow_first_top_first_and_stacked_fixed_keep_their_pin() {
+        let clock = FakeClock::at(0);
+        let mut d = day(vec![
+            flexible(1, 100, "a"),
+            paused(2, 100, "b"),
+            paused(3, 100, "c"),
+            PlanItemRecord {
+                fixed: true,
+                pinned_start: Some(ts(5_000)),
+                ..paused(4, 100, "V")
+            },
+            flexible(5, 100, "d"),
+        ]);
+        d.restore_interrupt_stack([id(2), id(4), id(3)]).unwrap();
+        let s = reflow(&d, clock.now());
+        assert_eq!(span(&s, 3), Some((0, 100)), "top of the stack first");
+        assert_eq!(span(&s, 2), Some((100, 200)));
+        assert_eq!(span(&s, 1), Some((200, 300)));
+        assert_eq!(span(&s, 5), Some((300, 400)));
+        assert_eq!(span(&s, 4), Some((5_000, 5_100)), "fixed stays at its pin");
+        assert_eq!(order(&s), vec![id(3), id(2), id(1), id(5), id(4)]);
     }
 
     #[test]

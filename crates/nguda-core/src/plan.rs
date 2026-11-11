@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::elapsed::Running;
 use crate::error::DomainError;
+use crate::next_task::next_task;
 use crate::order::OrderKey;
-use crate::reflow::reflow;
 use crate::segment::{Segment, actual_secs, closed_secs};
 
 /// Identity of a plan item. Generation lives outside core.
@@ -63,6 +63,9 @@ pub enum Action {
     Switch,
     /// Give the running item more planned time.
     Extend,
+    /// Pause the running item, push it onto the interrupt stack, and start a new
+    /// item in its place.
+    Interrupt,
 }
 
 impl fmt::Display for Action {
@@ -77,6 +80,7 @@ impl fmt::Display for Action {
             Self::Edit => "edit",
             Self::Switch => "switch from",
             Self::Extend => "extend",
+            Self::Interrupt => "interrupt",
         })
     }
 }
@@ -357,11 +361,16 @@ impl PlanItem {
 /// `items` is private: the day is the only way to change its items, so item ids stay
 /// unique and at most one segment is open across the day (AD-6). Every operation
 /// leaves the day unchanged when it fails.
+///
+/// The interrupt stack (AD-15) holds distinct ids of **paused** items of this day,
+/// bottom first. Any transition that makes a stacked item running, done, carried
+/// over or removed drops it from the stack; pausing and plan edits leave it alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Day {
     date: Date,
     tz: String,
     items: Vec<PlanItem>,
+    interrupt_stack: Vec<ItemId>,
 }
 
 impl Day {
@@ -370,6 +379,7 @@ impl Day {
             date,
             tz: tz.into(),
             items: Vec::new(),
+            interrupt_stack: Vec::new(),
         }
     }
 
@@ -385,6 +395,44 @@ impl Day {
             day.add(item)?;
         }
         Ok(day)
+    }
+
+    /// Sets the stored interrupt stack (bottom first) of a restored day. Rejects an
+    /// unknown id (`UnknownItem`), and a non-paused or duplicate entry
+    /// (`InvalidRecord`), leaving the day unchanged.
+    pub fn restore_interrupt_stack(
+        &mut self,
+        items: impl IntoIterator<Item = ItemId>,
+    ) -> Result<(), DomainError> {
+        let mut stack: Vec<ItemId> = Vec::new();
+        for id in items {
+            let item = self.item(id).ok_or(DomainError::UnknownItem(id))?;
+            if item.status != ItemStatus::Paused {
+                return Err(DomainError::InvalidRecord {
+                    id,
+                    reason: "interrupt entry is not paused",
+                });
+            }
+            if stack.contains(&id) {
+                return Err(DomainError::InvalidRecord {
+                    id,
+                    reason: "duplicate interrupt entry",
+                });
+            }
+            stack.push(id);
+        }
+        self.interrupt_stack = stack;
+        Ok(())
+    }
+
+    /// The interrupted items, bottom first: the last one resumes first.
+    pub fn interrupt_stack(&self) -> &[ItemId] {
+        &self.interrupt_stack
+    }
+
+    /// Drops `id` from the interrupt stack, if it is there.
+    fn unstack(&mut self, id: ItemId) {
+        self.interrupt_stack.retain(|s| *s != id);
     }
 
     pub fn date(&self) -> Date {
@@ -457,6 +505,7 @@ impl Day {
             return Err(DomainError::AnotherItemRunning);
         }
         self.items[idx] = next;
+        self.unstack(id);
         Ok(())
     }
 
@@ -467,18 +516,45 @@ impl Day {
 
     /// Running or Paused → Done. See [`PlanItem::finish`].
     pub fn finish(&mut self, id: ItemId, now: Timestamp) -> Result<(), DomainError> {
-        self.apply(id, |i| i.finish(now))
+        self.apply(id, |i| i.finish(now))?;
+        self.unstack(id);
+        Ok(())
     }
 
     /// Pending or Paused → CarriedOver. See [`PlanItem::carry_over`].
     pub fn carry_over(&mut self, id: ItemId) -> Result<(), DomainError> {
-        self.apply(id, PlanItem::carry_over)
+        self.apply(id, PlanItem::carry_over)?;
+        self.unstack(id);
+        Ok(())
+    }
+
+    /// Pauses the running item `current`, pushes it onto the interrupt stack, adds
+    /// `item` and starts it at `now`, all or nothing (AD-15). Only a running item
+    /// can be interrupted.
+    pub fn interrupt(
+        &mut self,
+        current: ItemId,
+        item: PlanItem,
+        now: Timestamp,
+    ) -> Result<(), DomainError> {
+        let from = &self.items[self.index(current)?];
+        if from.status != ItemStatus::Running {
+            return Err(from.reject(Action::Interrupt));
+        }
+        let id = item.id;
+        let mut next = self.clone();
+        next.pause(current, now)?;
+        next.interrupt_stack.push(current);
+        next.add(item)?;
+        next.start(id, now)?;
+        *self = next;
+        Ok(())
     }
 
     /// Finishes the running item `current` and starts or resumes [`Day::next_item`]
-    /// (as chosen after the finish, as of `now`) at `now`, all or nothing. Returns the item now
-    /// running, or `None` when nothing was left. Only a running item can be switched
-    /// from (AD-15).
+    /// (as chosen after the finish, as of `now`: the top of the interrupt stack
+    /// first) at `now`, all or nothing. Returns the item now running, or `None` when
+    /// nothing was left. Only a running item can be switched from (AD-15).
     pub fn switch(
         &mut self,
         current: ItemId,
@@ -502,7 +578,9 @@ impl Day {
 
     /// Any state except Running and Removed → Removed. See [`PlanItem::remove`].
     pub fn remove(&mut self, id: ItemId, now: Timestamp) -> Result<(), DomainError> {
-        self.apply(id, |i| i.remove(now))
+        self.apply(id, |i| i.remove(now))?;
+        self.unstack(id);
+        Ok(())
     }
 
     /// Pins item `id` at `pinned_start`, making it fixed.
@@ -548,11 +626,11 @@ impl Day {
         Ok(planned)
     }
 
-    /// The first pending or paused item in schedule order as of `now` (see
-    /// [`crate::reflow`]), or `None` when nothing is left. Paused counts, because
-    /// resuming it is a likely next step.
+    /// The item to run next as of `now` (see [`next_task`]): the top of the
+    /// interrupt stack, else the first pending or paused item in schedule order, or
+    /// `None` when nothing is left.
     pub fn next_item(&self, now: Timestamp) -> Option<&PlanItem> {
-        reflow(self, now).next().and_then(|id| self.item(id))
+        next_task(self, now).and_then(|id| self.item(id))
     }
 }
 
@@ -561,6 +639,7 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::elapsed::elapsed_secs;
+    use crate::reflow::reflow;
     use crate::test_support::{FakeClock, closed, ts};
 
     fn id(n: u128) -> ItemId {
@@ -659,6 +738,7 @@ mod tests {
             Action::Edit => d.set_title(id, "edited"),
             Action::Switch => d.switch(id, now).map(|_| ()),
             Action::Extend => d.extend(id, 60).map(|_| ()),
+            Action::Interrupt => d.interrupt(id, item(50, "z"), now),
         }
     }
 
@@ -819,7 +899,8 @@ mod tests {
                     | Action::Resume
                     | Action::Edit
                     | Action::Switch
-                    | Action::Extend => None,
+                    | Action::Extend
+                    | Action::Interrupt => None,
                 };
                 if let Some(r) = &item_result {
                     assert_eq!(r, &result, "{s} -> {a}: item and day agree");
@@ -1372,5 +1453,141 @@ mod tests {
         );
         assert_eq!(d, before);
         assert_eq!(Action::Extend.to_string(), "extend");
+    }
+
+    // --- Interrupt stack ---
+
+    /// A (1) running from 0, B (2) pending; N (9) interrupts A at 100.
+    fn interrupted() -> Day {
+        let mut d = day(vec![item(1, "a"), item(2, "b")]);
+        d.start(id(1), ts(0)).unwrap();
+        d.interrupt(id(1), item(9, "Z"), ts(100)).unwrap();
+        d
+    }
+
+    #[test]
+    fn interrupt_pauses_pushes_and_starts_the_new_item() {
+        let d = interrupted();
+        let a = d.item(id(1)).unwrap();
+        assert_eq!(a.status(), ItemStatus::Paused);
+        assert_eq!(a.segments(), &[closed(0, 100)]);
+        let n = d.item(id(9)).unwrap();
+        assert_eq!(n.status(), ItemStatus::Running);
+        assert_eq!(n.segments(), &[Segment::open(ts(100))]);
+        assert_eq!(d.interrupt_stack(), &[id(1)]);
+        assert_eq!(open_segments(&d), 1);
+        assert_eq!(Action::Interrupt.to_string(), "interrupt");
+    }
+
+    #[test]
+    fn interrupt_of_a_non_running_or_unknown_item_is_rejected_unchanged() {
+        let clock = FakeClock::at(1_000);
+        for s in ALL.into_iter().filter(|s| *s != ItemStatus::Running) {
+            let mut d = day_with(s, &clock);
+            let before = d.clone();
+            assert_eq!(
+                d.interrupt(id(1), item(9, "z"), clock.now()),
+                Err(DomainError::InvalidTransition {
+                    from: s,
+                    action: Action::Interrupt
+                }),
+                "{s}"
+            );
+            assert_eq!(d, before);
+        }
+        let mut d = day_with(ItemStatus::Running, &clock);
+        let before = d.clone();
+        assert_eq!(
+            d.interrupt(id(5), item(9, "z"), clock.now()),
+            Err(DomainError::UnknownItem(id(5)))
+        );
+        // A duplicate new item fails after the pause: still all or nothing.
+        assert_eq!(
+            d.interrupt(id(1), item(1, "z"), clock.now()),
+            Err(DomainError::DuplicateItem(id(1)))
+        );
+        assert_eq!(d, before);
+    }
+
+    #[test]
+    fn switch_resumes_the_top_of_the_stack_before_the_schedule() {
+        let mut d = interrupted();
+        // B comes first by order key, but A was interrupted.
+        assert_eq!(d.next_item(ts(200)).map(PlanItem::id), Some(id(1)));
+        assert_eq!(d.switch(id(9), ts(200)), Ok(Some(id(1))));
+        assert_eq!(d.item(id(1)).unwrap().status(), ItemStatus::Running);
+        assert_eq!(d.item(id(9)).unwrap().status(), ItemStatus::Done);
+        assert!(d.interrupt_stack().is_empty());
+        assert_eq!(d.switch(id(1), ts(300)), Ok(Some(id(2))));
+    }
+
+    #[test]
+    fn nested_interrupts_resume_in_reverse_order() {
+        let mut d = interrupted();
+        d.interrupt(id(9), item(8, "Y"), ts(150)).unwrap();
+        assert_eq!(d.interrupt_stack(), &[id(1), id(9)]);
+        assert_eq!(d.switch(id(8), ts(200)), Ok(Some(id(9))));
+        assert_eq!(d.interrupt_stack(), &[id(1)]);
+        assert_eq!(d.switch(id(9), ts(250)), Ok(Some(id(1))));
+        assert!(d.interrupt_stack().is_empty());
+    }
+
+    #[test]
+    fn resume_finish_carry_over_and_remove_drop_the_entry_and_pause_keeps_it() {
+        type Op = fn(&mut Day) -> Result<(), DomainError>;
+        let ops: [Op; 4] = [
+            |d| {
+                d.pause(id(9), ts(200))?;
+                d.resume(id(1), ts(200))
+            },
+            |d| d.finish(id(1), ts(200)),
+            |d| d.carry_over(id(1)),
+            |d| d.remove(id(1), ts(200)),
+        ];
+        for op in ops {
+            let mut d = interrupted();
+            op(&mut d).unwrap();
+            assert!(d.interrupt_stack().is_empty());
+        }
+        let mut d = interrupted();
+        d.pause(id(9), ts(200)).unwrap();
+        d.set_title(id(1), "renamed").unwrap();
+        d.set_planned_secs(id(1), 60).unwrap();
+        assert_eq!(d.interrupt_stack(), &[id(1)]);
+        // A rejected transition leaves the stack alone.
+        assert!(d.start(id(1), ts(200)).is_err());
+        assert_eq!(d.interrupt_stack(), &[id(1)]);
+    }
+
+    #[test]
+    fn restore_interrupt_stack_accepts_paused_entries_and_rejects_bad_ones_unchanged() {
+        let base = {
+            let mut d = interrupted();
+            d.pause(id(9), ts(200)).unwrap();
+            d.add(item(3, "c")).unwrap();
+            d.restore_interrupt_stack([]).unwrap();
+            d
+        };
+        let mut d = base.clone();
+        d.restore_interrupt_stack([id(1), id(9)]).unwrap();
+        assert_eq!(d.interrupt_stack(), &[id(1), id(9)]);
+
+        let mut d = base.clone();
+        assert_eq!(
+            d.restore_interrupt_stack([id(1), id(7)]),
+            Err(DomainError::UnknownItem(id(7)))
+        );
+        assert_eq!(d, base);
+        for bad in [vec![id(3)], vec![id(1), id(1)]] {
+            let mut d = base.clone();
+            assert!(
+                matches!(
+                    d.restore_interrupt_stack(bad.clone()),
+                    Err(DomainError::InvalidRecord { .. })
+                ),
+                "{bad:?}"
+            );
+            assert_eq!(d, base);
+        }
     }
 }

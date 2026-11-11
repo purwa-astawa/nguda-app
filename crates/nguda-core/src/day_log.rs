@@ -23,4 +23,6 @@ pub enum DayLogKind {
     Switched { from: ItemId, to: Option<ItemId> },
     /// The user gave the running item `secs` more planned seconds.
     Extended { item_id: ItemId, secs: u64 },
+    /// The user inserted the new item `item_id` into the plan.
+    Inserted { item_id: ItemId },
 }

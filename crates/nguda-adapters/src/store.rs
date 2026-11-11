@@ -389,6 +389,7 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                         .map_err(|_| StoreError::new(format!("{ctx}: secs out of range")))?;
                     (KIND_EXTENDED, item_id, None, Some(secs))
                 }
+                DayLogKind::Inserted { item_id } => (KIND_INSERTED, item_id, None, None),
             };
             tx.execute(
                 "INSERT INTO day_log (day_date, at, kind, item_id, to_item_id, secs)
@@ -404,6 +405,24 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
             )
             .map_err(sql_err(&ctx))?;
         }
+        StoreOp::SetInterruptStack { date, items } => {
+            let ctx = format!("set interrupt stack for {date}");
+            tx.execute(
+                "DELETE FROM interrupt_entry WHERE day_date = ?1",
+                [date.to_string()],
+            )
+            .map_err(sql_err(&ctx))?;
+            for (position, item_id) in items.iter().enumerate() {
+                let position = i64::try_from(position)
+                    .map_err(|_| StoreError::new(format!("{ctx}: stack too deep")))?;
+                tx.execute(
+                    "INSERT INTO interrupt_entry (day_date, position, item_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![date.to_string(), position, item_id.to_string()],
+                )
+                .map_err(sql_err(&ctx))?;
+            }
+        }
     }
     Ok(())
 }
@@ -413,6 +432,7 @@ const KIND_RECOVERED: &str = "recovered";
 const KIND_REMOVED: &str = "removed";
 const KIND_SWITCHED: &str = "switched";
 const KIND_EXTENDED: &str = "extended";
+const KIND_INSERTED: &str = "inserted";
 
 fn last_alive_at(conn: &Connection) -> Result<Option<Timestamp>, StoreError> {
     let ctx = "load last alive";
@@ -502,7 +522,13 @@ fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, Store
                             StoreError::new(format!("{ctx}: missing or invalid secs"))
                         })?,
                 },
-                (KIND_RECOVERED | KIND_REMOVED | KIND_SWITCHED | KIND_EXTENDED, None) => {
+                (KIND_INSERTED, Some(item_id)) => DayLogKind::Inserted {
+                    item_id: parse_id(&item_id)?,
+                },
+                (
+                    KIND_RECOVERED | KIND_REMOVED | KIND_SWITCHED | KIND_EXTENDED | KIND_INSERTED,
+                    None,
+                ) => {
                     return Err(StoreError::new(format!("{ctx}: missing item id")));
                 }
                 _ => return Err(StoreError::new(format!("{ctx}: unknown kind"))),
@@ -593,7 +619,18 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
             restore_item(id, row, segments)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let stack = query_all(
+        conn,
+        "SELECT item_id FROM interrupt_entry WHERE day_date = ?1 ORDER BY position",
+        [&date_text],
+        &ctx,
+        |r| r.get::<_, String>(0),
+    )?
+    .iter()
+    .map(|s| parse_id(s))
+    .collect::<Result<Vec<_>, _>>()?;
     Day::restore(date, tz, items)
+        .and_then(|mut day| day.restore_interrupt_stack(stack).map(|()| day))
         .map(Some)
         .map_err(|e| StoreError::new(format!("{ctx}: {e}")))
 }

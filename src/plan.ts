@@ -23,7 +23,20 @@ export type Command =
   | { name: "startTask"; args: [itemId: string, expectedRev: number] }
   | { name: "pauseTask"; args: [itemId: string] }
   | { name: "switchTask"; args: [itemId: string, expectedRev: number] }
-  | { name: "extendTask"; args: [itemId: string, secs: number, expectedRev: number] };
+  | { name: "extendTask"; args: [itemId: string, secs: number, expectedRev: number] }
+  | {
+      name: "insertTask";
+      args: [title: string, plannedSecs: number, anchor: InsertAnchor, expectedRev: number];
+    };
+
+/** Where an inserted task goes, as `insertTask` takes it. Never a numeric index. */
+export type InsertAnchor = {
+  place: "now" | "before" | "after" | "end";
+  itemId: string | null;
+};
+
+/** One choice of the Insert form's position picker. */
+export type InsertPosition = { value: string; label: string; anchor: InsertAnchor };
 
 /** Keeps `next` only if it is newer than `prev`. Events and the `currentSnapshot`
  * reply can arrive in either order. */
@@ -53,13 +66,15 @@ export function pinInstant(date: string, time: string): string | null {
 
 /** The pending or paused flexible items just before and after `id`, in the order
  * given. Done, running and carried-over items sit at their actual times rather than
- * in order-key order, so they are never neighbours, and have none themselves. */
+ * in order-key order, so they are never neighbours, and have none themselves.
+ * Interrupted items flow first whatever their key, and the engine rejects them in
+ * a reorder, so they are skipped the same way. */
 export function flexibleNeighbours(
   items: readonly Item[],
   id: string,
 ): { prev: Item | null; next: Item | null } {
   const flexible = items.filter(
-    (i) => !i.fixed && (i.status === "pending" || i.status === "paused"),
+    (i) => !i.fixed && !i.interrupted && (i.status === "pending" || i.status === "paused"),
   );
   const at = flexible.findIndex((i) => i.id === id);
   if (at < 0) return { prev: null, next: null };
@@ -93,6 +108,49 @@ export function extendCommand(snap: Snapshot, item: Item, minutes: string): Comm
   return secs > 0 ? { name: "extendTask", args: [item.id, secs, snap.rev] } : null;
 }
 
+/** The Insert form's positions, in this order: "Now" and "After current" while an
+ * item runs; "Before" and "After" each pending or paused flexible item that is not
+ * `interrupted`, in the order given; then "At end". Only lists anchors; the engine
+ * places the item. */
+export function insertPositions(snap: Snapshot): InsertPosition[] {
+  const out: InsertPosition[] = [];
+  const running = snap.running;
+  if (running) {
+    out.push({ value: "now", label: "Now", anchor: { place: "now", itemId: null } });
+    out.push({
+      value: "after-current",
+      label: "After current",
+      anchor: { place: "after", itemId: running.itemId },
+    });
+  }
+  for (const i of snap.items) {
+    if (i.fixed || i.interrupted || (i.status !== "pending" && i.status !== "paused")) continue;
+    out.push({
+      value: `before:${i.id}`,
+      label: `Before \u201c${i.title}\u201d`,
+      anchor: { place: "before", itemId: i.id },
+    });
+    out.push({
+      value: `after:${i.id}`,
+      label: `After \u201c${i.title}\u201d`,
+      anchor: { place: "after", itemId: i.id },
+    });
+  }
+  out.push({ value: "end", label: "At end", anchor: { place: "end", itemId: null } });
+  return out;
+}
+
+/** Inserts a task at `anchor` with the rendered rev. Blank or invalid minutes are
+ * sent as 0 so the engine can reject them. */
+export function insertCommand(
+  snap: Snapshot,
+  title: string,
+  minutes: string,
+  anchor: InsertAnchor,
+): Command {
+  return { name: "insertTask", args: [title, minutesToSecs(minutes), anchor, snap.rev] };
+}
+
 /** Everything a row offers. `null` means the button is not shown. Pin is shown
  * (`canPin`) on flexible items and is built with `pinCommand` once a time exists. */
 export type RowActions = {
@@ -108,7 +166,7 @@ export type RowActions = {
 };
 
 export function rowActions(snap: Snapshot, item: Item): RowActions {
-  const { prev, next } = item.fixed
+  const { prev, next } = item.fixed || item.interrupted
     ? { prev: null, next: null }
     : flexibleNeighbours(snap.items, item.id);
   const running = item.status === "running";
