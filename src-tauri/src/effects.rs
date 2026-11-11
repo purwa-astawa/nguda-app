@@ -1,13 +1,15 @@
 //! The engine's effect consumer (AD-10): the engine decides, this task renders.
 //!
 //! For each `Notify` it looks up the task title in the latest snapshot and posts
-//! once per `prompt_id`. Failures are logged with ids and kinds only (AD-14), never
-//! titles. `Recovered` needs no rendering yet and is ignored.
+//! once per `prompt_id`. Each `WithdrawNotification` is passed to the notifier;
+//! the prompt id stays in `posted`, so a withdrawn prompt is never re-posted.
+//! Failures are logged with ids and kinds only (AD-14), never titles. `Recovered`
+//! needs no rendering yet and is ignored.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use nguda_core::{Notification, Notifier, PromptId, PromptKind};
+use nguda_core::{ItemId, Notification, Notifier, PromptId, PromptKind};
 use nguda_engine::{Effect, Snapshot};
 use tokio::sync::{mpsc, watch};
 
@@ -26,14 +28,29 @@ impl Consumer {
     }
 
     fn handle(&mut self, effect: Effect, snapshot: &Snapshot) {
-        let Effect::Notify {
-            prompt_id,
-            item_id,
-            kind,
-        } = effect
-        else {
-            return;
-        };
+        match effect {
+            Effect::Notify {
+                prompt_id,
+                item_id,
+                kind,
+            } => self.post(prompt_id, item_id, kind, snapshot),
+            Effect::WithdrawNotification { prompt_id } => {
+                if let Err(e) = self.notifier.withdraw(prompt_id) {
+                    // NotifierError messages carry ids and OS errors only.
+                    eprintln!("nguda: failed to withdraw prompt {prompt_id}: {e}");
+                }
+            }
+            Effect::Recovered { .. } => {}
+        }
+    }
+
+    fn post(
+        &mut self,
+        prompt_id: PromptId,
+        item_id: ItemId,
+        kind: PromptKind,
+        snapshot: &Snapshot,
+    ) {
         if !self.posted.insert(prompt_id) {
             return;
         }
@@ -83,7 +100,7 @@ pub async fn consume(
 mod tests {
     use std::sync::Mutex;
 
-    use nguda_core::{Date, Day, ItemId, NotifierError, OrderKey, PlanItem, Uuid};
+    use nguda_core::{Date, Day, NotifierError, OrderKey, PlanItem, Uuid};
 
     use super::*;
 
@@ -91,11 +108,21 @@ mod tests {
     struct FakeNotifier {
         fail: bool,
         posted: Mutex<Vec<Notification>>,
+        withdrawn: Mutex<Vec<PromptId>>,
     }
 
     impl Notifier for FakeNotifier {
         fn post(&self, n: &Notification) -> Result<(), NotifierError> {
             self.posted.lock().unwrap().push(n.clone());
+            if self.fail {
+                Err(NotifierError::new("boom"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn withdraw(&self, prompt_id: PromptId) -> Result<(), NotifierError> {
+            self.withdrawn.lock().unwrap().push(prompt_id);
             if self.fail {
                 Err(NotifierError::new("boom"))
             } else {
@@ -180,6 +207,41 @@ mod tests {
         c.handle(Effect::Recovered { item_id: item_id() }, &snapshot());
         c.handle(notify(1), &Snapshot::default());
         assert!(fake.posted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn withdraw_reaches_the_notifier_once_and_never_re_posts() {
+        let fake = Arc::new(FakeNotifier::default());
+        let mut c = Consumer::new(fake.clone());
+        c.handle(notify(1), &snapshot());
+        c.handle(
+            Effect::WithdrawNotification {
+                prompt_id: prompt(1),
+            },
+            &snapshot(),
+        );
+        c.handle(notify(1), &snapshot());
+        assert_eq!(*fake.withdrawn.lock().unwrap(), vec![prompt(1)]);
+        assert_eq!(fake.posted.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_withdraw_is_logged_and_keeps_the_prompt_posted() {
+        let fake = Arc::new(FakeNotifier {
+            fail: true,
+            ..Default::default()
+        });
+        let mut c = Consumer::new(fake.clone());
+        c.handle(notify(1), &snapshot());
+        c.handle(
+            Effect::WithdrawNotification {
+                prompt_id: prompt(1),
+            },
+            &snapshot(),
+        );
+        c.handle(notify(1), &snapshot());
+        assert_eq!(*fake.withdrawn.lock().unwrap(), vec![prompt(1)]);
+        assert_eq!(fake.posted.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

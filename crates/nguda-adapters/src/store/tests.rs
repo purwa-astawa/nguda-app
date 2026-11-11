@@ -157,7 +157,7 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), 4);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
@@ -246,7 +246,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
         err,
         OpenError::NewerSchema {
             found: 5,
-            supported: 3
+            supported: 4
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -453,7 +453,7 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), 4);
     assert!(has_table(&path, "engine_meta"));
 }
 
@@ -572,6 +572,68 @@ async fn switched_day_log_entries_round_trip_across_a_reopen() {
     drop(store);
     let store = SqliteStore::open(&path).unwrap();
     assert_eq!(store.load_day_log(date()).await.unwrap(), entries);
+}
+
+#[tokio::test]
+async fn extended_day_log_entries_round_trip_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let extended = |at, n, secs| DayLogEntry {
+        at: ts(at),
+        kind: DayLogKind::Extended {
+            item_id: id(n),
+            secs,
+        },
+    };
+    let entries = [extended(1_300, 1, 300), extended(1_400, 1, 900)];
+    store
+        .commit(batch(entries.iter().map(|entry| StoreOp::AppendDayLog {
+            date: date(),
+            entry: entry.clone(),
+        })))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.load_day_log(date()).await.unwrap(), entries);
+}
+
+#[tokio::test]
+async fn an_extended_entry_without_secs_fails_the_load() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    drop(seeded(&path).await);
+    let raw = Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO day_log (day_date, at, kind, item_id) VALUES (?1, 0, 'extended', ?2)",
+        [date().to_string(), id(1).to_string()],
+    )
+    .unwrap();
+    drop(raw);
+    let store = SqliteStore::open(&path).unwrap();
+    let err = store.load_day_log(date()).await.unwrap_err();
+    assert!(err.message.contains("missing or invalid secs"), "{err}");
+}
+
+#[tokio::test]
+async fn an_extended_entry_past_i64_rolls_back_the_batch() {
+    let dir = TempDir::new().unwrap();
+    let store = seeded(&db(&dir)).await;
+    store
+        .commit(batch([StoreOp::AppendDayLog {
+            date: date(),
+            entry: DayLogEntry {
+                at: ts(1_300),
+                kind: DayLogKind::Extended {
+                    item_id: id(1),
+                    secs: u64::MAX,
+                },
+            },
+        }]))
+        .await
+        .unwrap_err();
+    assert_eq!(store.load_day_log(date()).await.unwrap(), vec![]);
 }
 
 #[tokio::test]

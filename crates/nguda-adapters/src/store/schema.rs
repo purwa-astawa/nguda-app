@@ -67,9 +67,15 @@ const V3: &str = r#"
 ALTER TABLE day_log ADD COLUMN to_item_id TEXT REFERENCES plan_item (id);
 "#;
 
+/// v4: the seconds of a day-log entry (`extended`: how many seconds were added to
+/// `item_id`'s planned length). NULL for kinds without one.
+const V4: &str = r#"
+ALTER TABLE day_log ADD COLUMN secs INTEGER CHECK (secs IS NULL OR secs > 0);
+"#;
+
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3)])
+    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4)])
 }
 
 #[cfg(test)]

@@ -83,6 +83,7 @@ const REMOVE_TASK: &str = "RemoveTask";
 const START: &str = "Start";
 const PAUSE: &str = "Pause";
 const SWITCH: &str = "Switch";
+const EXTEND_TASK: &str = "ExtendTask";
 
 /// The message's name, for logs and reject messages.
 pub(crate) fn name(msg: &EngineMsg) -> &'static str {
@@ -95,6 +96,7 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::Start { .. } => START,
         EngineMsg::Pause { .. } => PAUSE,
         EngineMsg::Switch { .. } => SWITCH,
+        EngineMsg::ExtendTask { .. } => EXTEND_TASK,
     }
 }
 
@@ -108,7 +110,8 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
         | EngineMsg::RemoveTask { item_id }
         | EngineMsg::Start { item_id, .. }
         | EngineMsg::Pause { item_id }
-        | EngineMsg::Switch { item_id, .. } => Some(*item_id),
+        | EngineMsg::Switch { item_id, .. }
+        | EngineMsg::ExtendTask { item_id, .. } => Some(*item_id),
     }
 }
 
@@ -172,6 +175,14 @@ pub(crate) fn apply(
         } => {
             check(expected_rev)?;
             switch(day, now, item_id)
+        }
+        EngineMsg::ExtendTask {
+            item_id,
+            secs,
+            expected_rev,
+        } => {
+            check(expected_rev)?;
+            extend_task(day, now, item_id, secs)
         }
     }
 }
@@ -391,6 +402,37 @@ fn switch(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>
         entry: DayLogEntry {
             at: now,
             kind: DayLogKind::Switched { from: item_id, to },
+        },
+    }])
+}
+
+/// The longer planned length and the `Extended` entry, committed as one batch
+/// (AD-15). Zero seconds, or a planned length past `u64`, is invalid input.
+fn extend_task(
+    day: &mut Day,
+    now: Timestamp,
+    item_id: ItemId,
+    secs: u64,
+) -> Result<Vec<StoreOp>, Reject> {
+    const CMD: &str = EXTEND_TASK;
+    if secs == 0 {
+        return Err(Reject::invalid(CMD, "secs must be positive"));
+    }
+    if let Some(item) = day.item(item_id)
+        && item.status() == ItemStatus::Running
+        && item.planned_secs().checked_add(secs).is_none()
+    {
+        return Err(Reject::invalid(
+            CMD,
+            format!("item {item_id} planned_secs would overflow"),
+        ));
+    }
+    day.extend(item_id, secs).map_err(domain(CMD))?;
+    Ok(vec![StoreOp::AppendDayLog {
+        date: day.date(),
+        entry: DayLogEntry {
+            at: now,
+            kind: DayLogKind::Extended { item_id, secs },
         },
     }])
 }

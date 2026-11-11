@@ -11,7 +11,7 @@ pub struct DayLogEntry {
     pub kind: DayLogKind,
 }
 
-/// What happened. Later kinds (extended, inserted, carried over, ...) join here.
+/// What happened. Later kinds (inserted, carried over, ...) join here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DayLogKind {
     /// An open segment left by a crash was closed at the last heartbeat.
@@ -21,4 +21,6 @@ pub enum DayLogKind {
     /// The user switched from the running item `from`, finishing it, to `to` (or to
     /// nothing, when no item was left).
     Switched { from: ItemId, to: Option<ItemId> },
+    /// The user gave the running item `secs` more planned seconds.
+    Extended { item_id: ItemId, secs: u64 },
 }

@@ -129,6 +129,18 @@ pub fn switch_task(
     send(&engine, switch_task_msg(&item_id, expected_rev))
 }
 
+/// Adds `secs` to the running item's planned length; later items re-flow.
+#[tauri::command]
+#[specta::specta]
+pub fn extend_task(
+    engine: State<'_, EngineHandle>,
+    item_id: String,
+    secs: u32,
+    expected_rev: u32,
+) -> Result<(), String> {
+    send(&engine, extend_task_msg(&item_id, secs, expected_rev))
+}
+
 // --- Argument parsing: syntax only, no semantic checks ---
 
 fn parse_item_id(s: &str) -> Result<ItemId, String> {
@@ -216,6 +228,19 @@ fn switch_task_msg(item_id: &str, expected_rev: u32) -> Result<EngineMsg, String
         expected_rev: expected_rev.into(),
     })
 }
+
+fn extend_task_msg(item_id: &str, secs: u32, expected_rev: u32) -> Result<EngineMsg, String> {
+    Ok(EngineMsg::ExtendTask {
+        item_id: parse_item_id(item_id)?,
+        secs: secs.into(),
+        expected_rev: expected_rev.into(),
+    })
+}
+
+/// The tray's Extend… item was picked: the view focuses the running row's
+/// extend-minutes field. Carries nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type, Event)]
+pub struct FocusExtendEvent;
 
 /// The last engine snapshot, as the view sees it. Also the reply of
 /// [`current_snapshot`], so a window that loads late still gets the latest state.
@@ -396,9 +421,10 @@ pub fn specta_builder() -> Builder<Wry> {
             start_task,
             pause_task,
             switch_task,
+            extend_task,
             current_snapshot
         ])
-        .events(collect_events![SnapshotEvent])
+        .events(collect_events![SnapshotEvent, FocusExtendEvent])
 }
 
 #[cfg(any(debug_assertions, test))]
@@ -456,11 +482,13 @@ mod tests {
             "startTask",
             "pauseTask",
             "switchTask",
+            "extendTask",
             "currentSnapshot",
         ] {
             assert!(committed.contains(&format!("\t{name}: ")), "{name}");
         }
         assert!(!committed.contains("startDemo"));
+        assert!(committed.contains("focusExtendEvent"));
     }
 
     #[test]
@@ -547,6 +575,14 @@ mod tests {
                 expected_rev: 9
             })
         );
+        assert_eq!(
+            extend_task_msg(A, 300, 9),
+            Ok(EngineMsg::ExtendTask {
+                item_id: item(A),
+                secs: 300,
+                expected_rev: 9
+            })
+        );
     }
 
     #[test]
@@ -557,6 +593,7 @@ mod tests {
             assert!(start_task_msg(bad, 1).is_err(), "{bad}");
             assert!(pause_task_msg(bad).is_err(), "{bad}");
             assert!(switch_task_msg(bad, 1).is_err(), "{bad}");
+            assert!(extend_task_msg(bad, 300, 1).is_err(), "{bad}");
             assert!(toggle_fixed_msg(bad, None, 1).is_err(), "{bad}");
             let anchor = ReorderAnchorArg {
                 place: AnchorPlace::After,

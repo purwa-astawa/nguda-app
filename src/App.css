@@ -10,6 +10,7 @@ body {
 
 .add,
 .edit,
+.extend,
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -18,7 +19,8 @@ body {
 }
 
 .add input[type="number"],
-.edit input[type="number"] {
+.edit input[type="number"],
+.extend input[type="number"] {
   width: 4.5rem;
 }
 

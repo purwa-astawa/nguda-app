@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Date, Day, DayLogEntry, DayLogKind, IdGen, ItemId, OpenSegmentRef, PlanItem, PromptKind,
-    Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp, reflow,
+    Clock, Date, Day, DayLogEntry, DayLogKind, IdGen, ItemId, OpenSegmentRef, PlanItem, PromptId,
+    PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
+    reflow,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -57,6 +58,9 @@ struct Actor {
     /// end this session, so a pause/resume never re-prompts and a changed planned
     /// length re-arms. Not persisted.
     prompted: BTreeSet<(ItemId, u64)>,
+    /// The prompt last posted for each item and not yet withdrawn this session,
+    /// so an extension can withdraw it. Not persisted.
+    open_prompts: BTreeMap<ItemId, PromptId>,
     snapshots: watch::Sender<Snapshot>,
     effects: mpsc::UnboundedSender<Effect>,
 }
@@ -86,6 +90,7 @@ impl Actor {
             rev: 0,
             heartbeat_at: deadline_after(now),
             prompted: BTreeSet::new(),
+            open_prompts: BTreeMap::new(),
             snapshots,
             effects,
         }
@@ -197,6 +202,11 @@ impl Actor {
         let status_before = self.status.clone();
         let name = commands::name(&msg);
         let item_id = commands::target(&msg);
+        // `msg` moves into `apply`, so note an extension's target first.
+        let extend_target = match &msg {
+            EngineMsg::ExtendTask { item_id, .. } => Some(*item_id),
+            _ => None,
+        };
         let now = self.clock.now();
         let mut next = self.day.clone();
         let changed = match commands::apply(msg, &mut next, now, self.ids.as_ref(), self.rev) {
@@ -231,6 +241,23 @@ impl Actor {
         if changed || self.status != status_before {
             self.publish();
         }
+        if changed {
+            self.withdraw_prompt(extend_target);
+        }
+    }
+
+    /// After a committed extension of `item_id`, withdraws its open prompt, if the
+    /// engine posted one this session that is not withdrawn yet (AD-10).
+    fn withdraw_prompt(&mut self, item_id: Option<ItemId>) {
+        let Some(item_id) = item_id else { return };
+        let Some(prompt_id) = self.open_prompts.remove(&item_id) else {
+            return;
+        };
+        tracing::info!(%item_id, %prompt_id, "prompt withdrawn after extend");
+        // A closed receiver only means nobody listens for effects.
+        let _ = self
+            .effects
+            .send(Effect::WithdrawNotification { prompt_id });
     }
 
     /// Commits `batch`, then swaps `next` in. On failure the old state stays.
@@ -278,6 +305,14 @@ impl Actor {
         {
             self.prompted.insert(key);
             let prompt_id = self.ids.new_prompt_id();
+            // A still-open earlier prompt for this item (a re-arm after an edit) is
+            // withdrawn first, so it is never left behind.
+            if let Some(old) = self.open_prompts.insert(item_id, prompt_id) {
+                tracing::info!(%item_id, prompt_id = %old, "prompt withdrawn: superseded");
+                let _ = self
+                    .effects
+                    .send(Effect::WithdrawNotification { prompt_id: old });
+            }
             tracing::info!(%item_id, %prompt_id, kind = "planned_end", "prompt due");
             // A closed receiver only means nobody listens for effects.
             let _ = self.effects.send(Effect::Notify {

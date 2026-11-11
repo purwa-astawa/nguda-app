@@ -972,6 +972,8 @@ async fn raising_planned_secs_after_the_prompt_re_arms_it() {
     h.clock.set(1_119);
     h.expect_no_effect().await;
     h.clock.set(1_120);
+    // The superseded prompt is withdrawn before the new one is posted.
+    assert_eq!(h.next_effect().await, withdraw(1));
     assert_eq!(h.next_effect().await, notify(2, 100));
     h.clock.set(1_300);
     h.expect_no_effect().await;
@@ -1185,4 +1187,219 @@ async fn next_item_and_switch_follow_the_schedule_past_a_due_pin() {
     h.send(switch_msg(100, 2));
     let snap = h.rev(3).await;
     assert_eq!(snap.running.as_ref().map(|r| r.item_id), Some(id(102)));
+}
+
+// --- Extend ---
+
+fn extend_msg(n: u128, secs: u64, expected_rev: u64) -> EngineMsg {
+    EngineMsg::ExtendTask {
+        item_id: id(n),
+        secs,
+        expected_rev,
+    }
+}
+
+fn extended_at(n: u128, secs: u64, at: i64) -> DayLogEntry {
+    DayLogEntry {
+        at: ts(at),
+        kind: DayLogKind::Extended {
+            item_id: id(n),
+            secs,
+        },
+    }
+}
+
+fn withdraw(prompt_n: u128) -> Effect {
+    Effect::WithdrawNotification {
+        prompt_id: prompt(prompt_n),
+    }
+}
+
+/// R (100) running from 1_000 at rev 2, planned 600 s, so it is due at 1_600.
+async fn r_running() -> (Harness, Arc<MemoryStore>) {
+    started_a(&abc_day()).await
+}
+
+/// R prompted at its planned end 1_600 (prompt 1).
+async fn r_prompted() -> (Harness, Arc<MemoryStore>) {
+    let (mut h, store) = r_running().await;
+    h.clock.set(1_600);
+    assert_eq!(h.next_effect().await, notify(1, 100));
+    (h, store)
+}
+
+#[tokio::test]
+async fn extend_shifts_later_flexible_items_and_logs_in_one_batch() {
+    // R and A flexible, F fixed at 5_000; all 600 s.
+    let mut day = abc_day();
+    day.set_fixed(id(102), ts(5_000)).unwrap();
+    let (mut h, store) = started_a(&day).await;
+    h.clock.set(1_100);
+    h.send(extend_msg(100, 300, 2));
+    let snap = h.rev(3).await;
+    assert!(snap.status.is_empty());
+    assert_eq!(day_of(&snap).item(id(100)).unwrap().planned_secs(), 900);
+    assert_eq!(
+        spans(&snap),
+        vec![
+            (id(100), SlotKind::Running, Some((1_000, 1_900))),
+            (id(101), SlotKind::Flexible, Some((1_900, 2_500))),
+            (id(102), SlotKind::Fixed, Some((5_000, 5_600))),
+        ]
+    );
+    assert_eq!(store.stored_day(day1()), snap.day);
+    assert_eq!(store.day_log(day1()), vec![extended_at(100, 300, 1_100)]);
+    // The heartbeat due at 1_060 may commit before or after the extension (the
+    // loop's select picks either), so find the extension's batch by its entry: the
+    // planned-length change and the log entry share that one batch.
+    let entry = StoreOp::AppendDayLog {
+        date: day1(),
+        entry: extended_at(100, 300, 1_100),
+    };
+    let batches = store.batches();
+    let with_entry: Vec<_> = batches
+        .iter()
+        .filter(|b| b.ops().contains(&entry))
+        .collect();
+    assert_eq!(with_entry.len(), 1);
+    let ops = with_entry[0].ops();
+    assert!(ops.iter().any(|op| matches!(op, StoreOp::PutItem { .. })));
+    assert_eq!(ops.last(), Some(&entry));
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn extend_keeps_a_fixed_item_in_place_and_flows_flexible_past_it() {
+    // R 600 s, A flexible 300 s, F fixed at 1_900 for 300 s.
+    let mut day = Day::new(day1(), "UTC");
+    day.add(item(100, "R", "U")).unwrap();
+    day.add(PlanItem::new(id(101), "A", 300, key("V"))).unwrap();
+    day.add(PlanItem::new(id(102), "F", 300, key("W"))).unwrap();
+    day.set_fixed(id(102), ts(1_900)).unwrap();
+    let (mut h, _store) = started_a(&day).await;
+    assert_eq!(
+        spans(&h.rx.borrow()),
+        vec![
+            (id(100), SlotKind::Running, Some((1_000, 1_600))),
+            (id(101), SlotKind::Flexible, Some((1_600, 1_900))),
+            (id(102), SlotKind::Fixed, Some((1_900, 2_200))),
+        ]
+    );
+    h.clock.set(1_100);
+    h.send(extend_msg(100, 300, 2));
+    let snap = h.rev(3).await;
+    assert_eq!(
+        spans(&snap),
+        vec![
+            (id(100), SlotKind::Running, Some((1_000, 1_900))),
+            (id(102), SlotKind::Fixed, Some((1_900, 2_200))),
+            (id(101), SlotKind::Flexible, Some((2_200, 2_500))),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn extend_after_the_prompt_withdraws_it_and_re_arms_at_the_new_end() {
+    let (mut h, _store) = r_prompted().await;
+    h.clock.set(1_610);
+    h.send(extend_msg(100, 300, 2));
+    h.rev(3).await;
+    assert_eq!(h.next_effect().await, withdraw(1));
+    h.clock.set(1_899);
+    h.expect_no_effect().await;
+    h.clock.set(1_900);
+    assert_eq!(h.next_effect().await, notify(2, 100));
+    h.clock.set(2_100);
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn extend_before_the_prompt_withdraws_nothing_and_prompts_at_the_new_end() {
+    let (mut h, _store) = r_running().await;
+    h.clock.set(1_100);
+    h.send(extend_msg(100, 300, 2));
+    h.rev(3).await;
+    h.expect_no_effect().await;
+    h.clock.set(1_600);
+    h.expect_no_effect().await;
+    h.clock.set(1_899);
+    h.expect_no_effect().await;
+    h.clock.set(1_900);
+    assert_eq!(h.next_effect().await, notify(1, 100));
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn extend_that_leaves_the_item_over_withdraws_then_prompts_at_once() {
+    let (mut h, _store) = r_prompted().await;
+    h.clock.set(2_500);
+    h.send(extend_msg(100, 300, 2));
+    h.rev(3).await;
+    assert_eq!(h.next_effect().await, withdraw(1));
+    assert_eq!(h.next_effect().await, notify(2, 100));
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn a_stale_extend_applies_nothing_and_emits_nothing() {
+    let (mut h, store) = r_prompted().await;
+    let snap = expect_rejected(&mut h, &store, extend_msg(100, 300, 1), 3).await;
+    assert_eq!(rejected(&snap), Some("stale rev: expected 1, current 2"));
+    assert_eq!(day_of(&snap).item(id(100)).unwrap().planned_secs(), 600);
+    assert_eq!(store.day_log(day1()), vec![]);
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn extend_of_a_non_running_or_unknown_item_is_rejected() {
+    let mut day = abc_day();
+    day.add(item(103, "D", "X")).unwrap();
+    day.start(id(103), ts(10)).unwrap();
+    day.finish(id(103), ts(20)).unwrap();
+    day.start(id(102), ts(30)).unwrap();
+    day.pause(id(102), ts(40)).unwrap();
+    let (mut h, store) = started_a(&day).await;
+    // Pending, paused, done, unknown; each with the current rev.
+    for (rev, n) in (2..).zip([101, 102, 103, 999]) {
+        let snap = expect_rejected(&mut h, &store, extend_msg(n, 300, rev), rev + 1).await;
+        assert!(rejected(&snap).unwrap().starts_with("ExtendTask: "), "{n}");
+    }
+    // A huge extension of a non-running item is a transition reject, not overflow.
+    let snap = expect_rejected(&mut h, &store, extend_msg(101, u64::MAX, 6), 7).await;
+    assert_eq!(
+        rejected(&snap),
+        Some("ExtendTask: cannot extend an item that is pending")
+    );
+    assert_eq!(store.day_log(day1()), vec![]);
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn extend_by_zero_or_past_u64_is_invalid_input() {
+    let (mut h, store) = r_prompted().await;
+    let snap = expect_rejected(&mut h, &store, extend_msg(100, 0, 2), 3).await;
+    assert_eq!(rejected(&snap), Some("ExtendTask: secs must be positive"));
+    let snap = expect_rejected(&mut h, &store, extend_msg(100, u64::MAX, 3), 4).await;
+    assert_eq!(
+        rejected(&snap),
+        Some(format!("ExtendTask: item {} planned_secs would overflow", id(100)).as_str())
+    );
+    assert_eq!(day_of(&snap).item(id(100)).unwrap().planned_secs(), 600);
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn a_failed_extend_commit_keeps_the_plan_and_withdraws_nothing() {
+    let (mut h, store) = r_prompted().await;
+    store.fail_commits(true);
+    h.clock.set(1_610);
+    h.send(extend_msg(100, 300, 2));
+    let snap = h.rev(3).await;
+    assert_eq!(snap.status, store_status());
+    assert_eq!(day_of(&snap).item(id(100)).unwrap().planned_secs(), 600);
+    assert_eq!(store.day_log(day1()), vec![]);
+    h.expect_no_effect().await;
+    // Not re-armed: the old end was already prompted.
+    h.clock.set(1_900);
+    h.expect_no_effect().await;
 }

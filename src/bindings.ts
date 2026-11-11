@@ -21,6 +21,8 @@ export const commands = {
 	pauseTask: (itemId: string) => typedError<null, string>(__TAURI_INVOKE("pause_task", { itemId })),
 	/**  Finishes the running item now and starts or resumes the next one. */
 	switchTask: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("switch_task", { itemId, expectedRev })),
+	/**  Adds `secs` to the running item's planned length; later items re-flow. */
+	extendTask: (itemId: string, secs: number, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("extend_task", { itemId, secs, expectedRev })),
 	/**
 	 *  The latest snapshot, read from the engine's `watch` receiver. Sends nothing to
 	 *  the engine (AD-4), so a window that loads after the last event still renders.
@@ -30,6 +32,7 @@ export const commands = {
 
 /** Events */
 export const events = {
+	focusExtendEvent: makeEvent<FocusExtendEvent, FocusExtendEvent>("focus-extend-event"),
 	snapshotEvent: makeEvent<SnapshotEvent_Serialize, SnapshotEvent_Deserialize>("snapshot-event"),
 };
 
@@ -43,6 +46,12 @@ export type DayView = {
 	/**  The IANA zone fixed for this day. */
 	tz: string,
 };
+
+/**
+ *  The tray's Extend… item was picked: the view focuses the running row's
+ *  extend-minutes field. Carries nothing.
+ */
+export type FocusExtendEvent = null;
 
 export type ItemStatusView = "pending" | "running" | "paused" | "done" | "carriedOver" | "removed";
 

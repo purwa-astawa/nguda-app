@@ -33,6 +33,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
     case "switchTask":
       res = await commands.switchTask(...cmd.args);
       break;
+    case "extendTask":
+      res = await commands.extendTask(...cmd.args);
+      break;
   }
   return res.status === "error" ? res.error : null;
 }
@@ -45,6 +48,15 @@ function App() {
   const [now, setNow] = useState<bigint>(nowNs);
   const [title, setTitle] = useState("");
   const [minutes, setMinutes] = useState("25");
+  // Bumped by the tray's Extend…; the running row focuses its extend field.
+  const [focusExtend, setFocusExtend] = useState(0);
+
+  useEffect(() => {
+    const unlisten = events.focusExtendEvent.listen(() => setFocusExtend((n) => n + 1));
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  }, []);
 
   useEffect(() => {
     // Subscribe first, then fetch, so no snapshot falls between the two. Either
@@ -136,7 +148,14 @@ function App() {
       ) : (
         <ol className="plan">
           {snap.items.map((item) => (
-            <PlanItemRow key={item.id} snap={snap} item={item} now={now} send={send} />
+            <PlanItemRow
+              key={item.id}
+              snap={snap}
+              item={item}
+              now={now}
+              send={send}
+              focusExtend={focusExtend}
+            />
           ))}
         </ol>
       )}

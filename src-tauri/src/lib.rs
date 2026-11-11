@@ -2,10 +2,11 @@
 //!
 //! It builds the engine with the real clock, exposes fire-and-forget commands
 //! (AD-4), mirrors snapshots to the view as a typed event, and renders the tray
-//! from a snapshot subscriber (AD-11). The tray menu (status line, Switch, and
-//! Quit) and its handlers live in `tray`; engine effects are rendered by `effects`
-//! through the buttonless notifier (AD-10). On macOS the app runs as an accessory (no Dock
-//! icon) and the tray title gets monospaced digits once, from `macos`.
+//! from a snapshot subscriber (AD-11). The tray menu (status line, Switch, Extend
+//! +5 min, Extend +15 min, Extend…, and Quit) and its handlers live in `tray`;
+//! engine effects are rendered by `effects` through the buttonless notifier
+//! (AD-10). On macOS the app runs as an accessory (no Dock icon) and the tray
+//! title gets monospaced digits once, from `macos`.
 
 mod effects;
 mod ipc;

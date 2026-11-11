@@ -22,7 +22,8 @@ export type Command =
   | { name: "removeTask"; args: [itemId: string] }
   | { name: "startTask"; args: [itemId: string, expectedRev: number] }
   | { name: "pauseTask"; args: [itemId: string] }
-  | { name: "switchTask"; args: [itemId: string, expectedRev: number] };
+  | { name: "switchTask"; args: [itemId: string, expectedRev: number] }
+  | { name: "extendTask"; args: [itemId: string, secs: number, expectedRev: number] };
 
 /** Keeps `next` only if it is newer than `prev`. Events and the `currentSnapshot`
  * reply can arrive in either order. */
@@ -82,6 +83,14 @@ export function pinCommand(snap: Snapshot, item: Item, time: string): Command | 
   if (item.fixed || !snap.day) return null;
   const at = pinInstant(snap.day.date, time);
   return at === null ? null : { name: "toggleFixed", args: [item.id, at, snap.rev] };
+}
+
+/** Extends the running `item` by `minutes` at the rendered rev. `null` when the
+ * item is not running or the minutes are blank, invalid or not positive. */
+export function extendCommand(snap: Snapshot, item: Item, minutes: string): Command | null {
+  if (item.status !== "running") return null;
+  const secs = minutesToSecs(minutes);
+  return secs > 0 ? { name: "extendTask", args: [item.id, secs, snap.rev] } : null;
 }
 
 /** Everything a row offers. `null` means the button is not shown. Pin is shown
