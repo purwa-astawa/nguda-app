@@ -5,7 +5,7 @@ mod store;
 
 use nguda_core::{Clock, IdGen, ItemId, PromptId, SleepFuture, Timestamp, Uuid};
 
-pub use notifier::ButtonlessNotifier;
+pub use notifier::{ActionCallback, SystemNotifier};
 pub use store::{OpenError, SqliteStore};
 
 /// The real wall clock behind the [`Clock`] port.

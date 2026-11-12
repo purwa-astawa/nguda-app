@@ -14,6 +14,30 @@ pub enum PromptKind {
     Overflow,
 }
 
+/// A button on a notification. Each one acts like the tray item of the same name
+/// (AD-10): the shell maps it to a targeted command for the prompt's item (AD-15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PromptAction {
+    /// Extend the item by 5 minutes.
+    Extend5,
+    /// Extend the item by 15 minutes.
+    Extend15,
+    /// Open the window's extend field for a custom length.
+    ExtendCustom,
+    /// Finish the item and move on.
+    Switch,
+}
+
+impl PromptAction {
+    /// Every action, in the order a notification shows them.
+    pub const ALL: [PromptAction; 4] = [
+        PromptAction::Extend5,
+        PromptAction::Extend15,
+        PromptAction::ExtendCustom,
+        PromptAction::Switch,
+    ];
+}
+
 /// One notification to show. Its text may name the task (AD-14 restricts logs, not
 /// the notification itself).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +45,8 @@ pub struct Notification {
     pub prompt_id: PromptId,
     pub kind: PromptKind,
     pub task_title: String,
+    /// The buttons to offer, in order. Empty: a plain banner.
+    pub actions: Vec<PromptAction>,
 }
 
 /// A notifier failure. The message carries ids and OS errors only, never titles.

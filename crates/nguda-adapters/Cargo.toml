@@ -13,6 +13,15 @@ rusqlite_migration.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 uuid = { workspace = true, features = ["v7", "std"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSError", "NSSet", "NSString", "NSObject"] }
+objc2-user-notifications = { workspace = true, features = ["std", "block2", "bitflags", "UNNotification", "UNNotificationAction", "UNNotificationCategory", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationTrigger", "UNUserNotificationCenter"] }
+block2.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
