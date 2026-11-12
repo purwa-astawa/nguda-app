@@ -4,8 +4,10 @@
 //! (AD-4), mirrors snapshots to the view as a typed event, and renders the tray
 //! from a snapshot subscriber (AD-11). The tray menu (status line, Switch, Extend
 //! +5 min, Extend +15 min, Extend…, and Quit) and its handlers live in `tray`;
-//! engine effects are rendered by `effects` through the buttonless notifier
-//! (AD-10). On macOS the app runs as an accessory (no Dock icon) and the tray
+//! engine effects are rendered by `effects` through the system notifier (AD-10),
+//! whose planned-end buttons come back here as `(prompt_id, action)` and are
+//! turned by `effects::resolve` into the same targeted commands as the tray's
+//! (AD-15). On macOS the app runs as an accessory (no Dock icon) and the tray
 //! title gets monospaced digits once, from `macos`.
 
 mod effects;
@@ -16,10 +18,10 @@ mod tray;
 
 use std::sync::Arc;
 
-use nguda_adapters::{ButtonlessNotifier, SqliteStore, SystemClock, UuidV7Ids};
+use nguda_adapters::{ActionCallback, SqliteStore, SystemClock, SystemNotifier, UuidV7Ids};
 use nguda_core::{Clock, Notifier, Store, TimeZone};
 use nguda_engine::{EngineDeps, EngineHandle};
-use tauri::Manager;
+use tauri::{AppHandle, Manager};
 
 /// The database file, in the app data directory.
 const DB_FILE: &str = "nguda.sqlite3";
@@ -65,8 +67,18 @@ pub fn run() {
                 nguda_engine::spawn(deps)
             };
             let snapshots = engine.subscribe();
-            let notifier: Arc<dyn Notifier> = Arc::new(ButtonlessNotifier);
-            tauri::async_runtime::spawn(effects::consume(effects, engine.subscribe(), notifier));
+            let targets = effects::PromptTargets::default();
+            let notifier: Arc<dyn Notifier> = Arc::new(SystemNotifier::new(on_action(
+                targets.clone(),
+                engine.clone(),
+                app.handle().clone(),
+            )));
+            tauri::async_runtime::spawn(effects::consume(
+                effects,
+                engine.subscribe(),
+                notifier,
+                targets,
+            ));
             app.manage::<EngineHandle>(engine);
 
             let tray = match tray::build(app) {
@@ -99,6 +111,33 @@ pub fn run() {
             std::process::exit(1);
         }
     }
+}
+
+/// The notifier's action callback: resolves a click against the recorded prompt
+/// targets and sends the message (fire-and-forget, AD-4), or shows the window and
+/// focuses the extend field while the prompt's item still runs.
+fn on_action(
+    targets: effects::PromptTargets,
+    engine: EngineHandle,
+    app: AppHandle,
+) -> ActionCallback {
+    Arc::new(
+        move |prompt_id, action| match effects::resolve(&targets, prompt_id, action) {
+            Some(effects::ActionOutcome::Send(msg)) => {
+                if let Err(e) = engine.send(msg) {
+                    eprintln!("nguda: failed to send the action for prompt {prompt_id}: {e}");
+                }
+            }
+            Some(effects::ActionOutcome::FocusExtend { item_id }) => {
+                if effects::focuses_extend(item_id, &engine.subscribe().borrow()) {
+                    tray::focus_extend(&app);
+                } else {
+                    tray::show_main_window(&app);
+                }
+            }
+            None => {}
+        },
+    )
 }
 
 /// Opens (creating and migrating) `<app_data_dir>/nguda.sqlite3`, or exits: the app

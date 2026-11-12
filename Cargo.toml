@@ -28,6 +28,11 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rusqlite_migration = "2.6.0"
 tempfile = "3"
+notify-rust = { version = "4.19.0", default-features = false, features = ["z"] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false }
+block2 = { version = "0.6", default-features = false, features = ["std"] }
 
 [profile.release]
 codegen-units = 1

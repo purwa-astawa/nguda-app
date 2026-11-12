@@ -28,7 +28,7 @@ pub use jiff::Timestamp;
 pub use jiff::civil::Date;
 pub use jiff::tz::TimeZone;
 pub use next_task::next_task;
-pub use notifier::{Notification, Notifier, NotifierError, PromptKind};
+pub use notifier::{Notification, Notifier, NotifierError, PromptAction, PromptKind};
 pub use order::OrderKey;
 pub use plan::{Action, Day, ItemId, ItemStatus, PlanItem, PlanItemRecord};
 pub use reflow::{Schedule, Slot, SlotKind, Span, reflow};

@@ -14,11 +14,12 @@
 //! the menu handlers send exactly those, so a click acts on what the user saw, and
 //! a stale one is rejected by the engine. Extend… sends nothing: it brings the plan
 //! window forward and emits [`FocusExtendEvent`] so the view focuses the running
-//! row's extend-minutes field.
+//! row's extend-minutes field. The notification actions (in `effects`) reuse the
+//! same message shapes and `focus_extend`, so each acts like its tray item.
 
 use std::sync::{Arc, Mutex};
 
-use nguda_core::{Clock, Timestamp, elapsed_secs, format_elapsed, until_next_second};
+use nguda_core::{Clock, ItemId, Timestamp, elapsed_secs, format_elapsed, until_next_second};
 use nguda_engine::{EngineHandle, EngineMsg, Snapshot};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -162,8 +163,17 @@ fn send_target(app: &AppHandle, action: Action) {
 }
 
 /// Extend…: brings the plan window forward and asks the view to focus the running
-/// row's extend-minutes field. Sends nothing to the engine.
-fn focus_extend(app: &AppHandle) {
+/// row's extend-minutes field. Sends nothing to the engine. Shared with the
+/// notification's Extend… action.
+pub(crate) fn focus_extend(app: &AppHandle) {
+    show_main_window(app);
+    if let Err(e) = FocusExtendEvent.emit(app) {
+        eprintln!("nguda: failed to emit focus-extend: {e}");
+    }
+}
+
+/// Restores, shows and focuses the plan window.
+pub(crate) fn show_main_window(app: &AppHandle) {
     match app.get_webview_window("main") {
         Some(window) => {
             // macOS ignores focus on a minimized window, so restore it first.
@@ -179,35 +189,55 @@ fn focus_extend(app: &AppHandle) {
         }
         None => eprintln!("nguda: no main window to focus for Extend"),
     }
-    if let Err(e) = FocusExtendEvent.emit(app) {
-        eprintln!("nguda: failed to emit focus-extend: {e}");
+}
+
+/// Extend +5 min, in seconds. Shared with the notification actions.
+pub(crate) const EXTEND_5_SECS: u64 = 5 * 60;
+/// Extend +15 min, in seconds. Shared with the notification actions.
+pub(crate) const EXTEND_15_SECS: u64 = 15 * 60;
+
+/// The `Switch` for `item_id` as rendered at `rev` (AD-15). Shared with the
+/// notification actions, which pass the target recorded when they posted.
+pub(crate) fn switch_target(item_id: ItemId, rev: u64) -> EngineMsg {
+    EngineMsg::Switch {
+        item_id,
+        expected_rev: rev,
+    }
+}
+
+/// The `ExtendTask` by `secs` for `item_id` as rendered at `rev` (AD-15). Shared
+/// with the notification actions.
+pub(crate) fn extend_target(item_id: ItemId, secs: u64, rev: u64) -> EngineMsg {
+    EngineMsg::ExtendTask {
+        item_id,
+        secs,
+        expected_rev: rev,
     }
 }
 
 /// `Switch` for the running item at the snapshot's rev, or `None` while idle.
 fn switch_msg(snapshot: &Snapshot) -> Option<EngineMsg> {
-    snapshot.running.as_ref().map(|r| EngineMsg::Switch {
-        item_id: r.item_id,
-        expected_rev: snapshot.rev,
-    })
+    snapshot
+        .running
+        .as_ref()
+        .map(|r| switch_target(r.item_id, snapshot.rev))
 }
 
 /// `ExtendTask` by `secs` for the running item at the snapshot's rev, or `None`
 /// while idle.
 fn extend_msg(snapshot: &Snapshot, secs: u64) -> Option<EngineMsg> {
-    snapshot.running.as_ref().map(|r| EngineMsg::ExtendTask {
-        item_id: r.item_id,
-        secs,
-        expected_rev: snapshot.rev,
-    })
+    snapshot
+        .running
+        .as_ref()
+        .map(|r| extend_target(r.item_id, secs, snapshot.rev))
 }
 
 /// Every message the menu sends for `snapshot`.
 fn targets_for(snapshot: &Snapshot) -> Targets {
     Targets {
         switch: switch_msg(snapshot),
-        extend5: extend_msg(snapshot, 5 * 60),
-        extend15: extend_msg(snapshot, 15 * 60),
+        extend5: extend_msg(snapshot, EXTEND_5_SECS),
+        extend15: extend_msg(snapshot, EXTEND_15_SECS),
     }
 }
 
@@ -324,7 +354,7 @@ async fn sleep_or_forever(wait: Option<std::time::Duration>) {
 mod tests {
     use std::cell::RefCell;
 
-    use nguda_core::{ItemId, Running, Uuid};
+    use nguda_core::{Running, Uuid};
     use nguda_engine::NextItem;
 
     use super::*;
