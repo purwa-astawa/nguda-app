@@ -7,7 +7,9 @@
 //! `WithdrawNotification` is passed to the notifier; the prompt id stays in
 //! `posted`, so a withdrawn prompt is never re-posted. Failures are logged with
 //! ids and kinds only (AD-14), never titles. `Recovered` needs no rendering
-//! and is ignored.
+//! and is ignored. `AskLockOnStart` is only logged, with its item id: the window
+//! asks for the lock choice itself before it sends a Start, and no other surface
+//! sends a choiceless one yet.
 //!
 //! Actions (AD-15): when it posts, the consumer records the prompt's target, the
 //! item and the rev of the snapshot it rendered from, in [`PromptTargets`]. The
@@ -131,6 +133,9 @@ impl Consumer {
                 }
             }
             Effect::Recovered { .. } => {}
+            Effect::AskLockOnStart { item_id } => {
+                eprintln!("nguda: start of item {item_id} needs a lock choice");
+            }
         }
     }
 
@@ -221,8 +226,8 @@ mod tests {
 
     use nguda_adapters::{SqliteStore, SystemClock, UuidV7Ids};
     use nguda_core::{
-        Date, Day, ItemStatus, NotifierError, OrderKey, PlanItem, Running, TimeZone, Timestamp,
-        Uuid,
+        Date, Day, ItemStatus, LockChoice, NotifierError, OrderKey, PlanItem, Running, TimeZone,
+        Timestamp, Uuid,
     };
     use nguda_engine::{EngineDeps, StatusKey};
     use tokio::time::timeout;
@@ -339,10 +344,11 @@ mod tests {
     }
 
     #[test]
-    fn recovered_and_unknown_items_post_nothing() {
+    fn recovered_ask_lock_and_unknown_items_post_nothing() {
         let fake = Arc::new(FakeNotifier::default());
         let mut c = Consumer::new(fake.clone(), PromptTargets::default());
         c.handle(Effect::Recovered { item_id: item_id() }, &snapshot());
+        c.handle(Effect::AskLockOnStart { item_id: item_id() }, &snapshot());
         c.handle(notify(1), &Snapshot::default());
         assert!(fake.posted.lock().unwrap().is_empty());
     }
@@ -567,6 +573,7 @@ mod tests {
             .send(EngineMsg::Start {
                 item_id: a,
                 expected_rev: created.rev,
+                lock: Some(LockChoice::NoLock),
             })
             .unwrap();
         let running = timeout(wait, rx.wait_for(|s| s.running.is_some()))

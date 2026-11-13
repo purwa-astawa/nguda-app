@@ -15,16 +15,24 @@ export const commands = {
 	toggleFixed: (itemId: string, pinnedStart: string | null, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("toggle_fixed", { itemId, pinnedStart, expectedRev })),
 	/**  Removes an item that is not running. It is tombstoned, never deleted. */
 	removeTask: (itemId: string) => typedError<null, string>(__TAURI_INVOKE("remove_task", { itemId })),
-	/**  Starts or resumes an item now, pausing whichever item is running. */
-	startTask: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("start_task", { itemId, expectedRev })),
+	/**
+	 *  Starts or resumes an item now, pausing whichever item is running. `lock` is
+	 *  the lock choice while the day is undecided, else `null`.
+	 */
+	startTask: (itemId: string, expectedRev: number, lock: LockChoiceArg | null) => typedError<null, string>(__TAURI_INVOKE("start_task", { itemId, expectedRev, lock })),
+	/**  Locks the undecided day without starting anything, freezing its baseline. */
+	lockDay: (expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("lock_day", { expectedRev })),
 	/**  Pauses the running item now. */
 	pauseTask: (itemId: string) => typedError<null, string>(__TAURI_INVOKE("pause_task", { itemId })),
 	/**  Finishes the running item now and starts or resumes the next one. */
 	switchTask: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("switch_task", { itemId, expectedRev })),
 	/**  Adds `secs` to the running item's planned length; later items re-flow. */
 	extendTask: (itemId: string, secs: number, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("extend_task", { itemId, secs, expectedRev })),
-	/**  Inserts a new task at `anchor`; `now` starts it, pausing the running item. */
-	insertTask: (title: string, plannedSecs: number, anchor: InsertAnchorArg_Deserialize, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("insert_task", { title, plannedSecs, anchor, expectedRev })),
+	/**
+	 *  Inserts a new task at `anchor`; `now` starts it, pausing the running item.
+	 *  `lock` is the lock choice for `now` on an undecided day, else `null`.
+	 */
+	insertTask: (title: string, plannedSecs: number, anchor: InsertAnchorArg_Deserialize, expectedRev: number, lock: LockChoiceArg | null) => typedError<null, string>(__TAURI_INVOKE("insert_task", { title, plannedSecs, anchor, expectedRev, lock })),
 	/**
 	 *  Sets the work-end time of day, `minutes` after local midnight. The engine
 	 *  rejects values outside `0..=1439`.
@@ -57,6 +65,11 @@ export type DayView = {
 	date: string,
 	/**  The IANA zone fixed for this day. */
 	tz: string,
+	/**
+	 *  Whether the day is locked (AD-7). While `none`, Start and insert-now carry
+	 *  a lock choice; once decided, they carry none.
+	 */
+	lockDecision: LockDecisionView,
 };
 
 /**
@@ -155,6 +168,18 @@ export type ItemView_Serialize = {
 	 */
 	interrupted: boolean,
 };
+
+/**
+ *  The answer to "lock the day?" (AD-7), sent with a Start or an insert-now only
+ *  while the snapshot's day is undecided (`lockDecision` `none`).
+ */
+export type LockChoiceArg = 
+/**  Lock & start: freeze the day's plan as the baseline. */
+"lock" | 
+/**  Start without lock: the day never gets a baseline. */
+"noLock";
+
+export type LockDecisionView = "none" | "locked" | "noLock";
 
 /**  A reorder target: next to another flexible item, never a numeric index (AD-15). */
 export type ReorderAnchorArg = {

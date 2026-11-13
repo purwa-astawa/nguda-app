@@ -3,6 +3,7 @@
 //! No I/O, no Tauri, no SQLite, and no system clock: "now" always comes in through
 //! the [`Clock`] port (AD-1, AD-8).
 
+mod baseline;
 mod clock;
 mod day_log;
 mod elapsed;
@@ -19,6 +20,7 @@ mod store;
 #[cfg(test)]
 mod test_support;
 
+pub use baseline::{Baseline, BaselineItem, LockChoice, LockDecision, baseline};
 pub use clock::{Clock, SleepFuture};
 pub use day_log::{DayLogEntry, DayLogKind};
 pub use elapsed::{Running, elapsed_secs, format_elapsed, until_next_second};

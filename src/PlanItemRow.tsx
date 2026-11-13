@@ -30,13 +30,15 @@ type Props = {
   item: Item;
   now: bigint;
   send: (cmd: Command) => void;
+  /** Sends a Start, first asking for the lock choice on an undecided day. */
+  start: (cmd: Command) => void;
   /** Changes each time the tray's or a notification's Extend… asks to focus the
    * running row's extend field. */
   focusExtend: number;
 };
 
 /** One plan item: its facts, and the buttons `rowActions` allows. */
-export function PlanItemRow({ snap, item, now, send, focusExtend }: Props) {
+export function PlanItemRow({ snap, item, now, send, start, focusExtend }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(item.title);
   const [minutes, setMinutes] = useState(String(secsToMinutes(item.plannedSecs)));
@@ -104,7 +106,7 @@ export function PlanItemRow({ snap, item, now, send, focusExtend }: Props) {
       )}
 
       <div className="actions">
-        {actions.start && <button onClick={() => send(actions.start!)}>Start</button>}
+        {actions.start && <button onClick={() => start(actions.start!)}>Start</button>}
         {actions.pause && <button onClick={() => send(actions.pause!)}>Pause</button>}
         {actions.switch && <button onClick={() => send(actions.switch!)}>Switch</button>}
         {running && (

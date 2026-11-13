@@ -7,6 +7,7 @@
 import type {
   InsertAnchorArg_Serialize,
   ItemView_Serialize,
+  LockChoiceArg,
   ReorderAnchorArg,
   SnapshotEvent_Serialize,
 } from "./bindings.ts";
@@ -14,6 +15,8 @@ import { elapsedSecs, formatElapsed } from "./elapsed.ts";
 
 export type Snapshot = SnapshotEvent_Serialize;
 export type Item = ItemView_Serialize;
+/** The answer to "lock the day?": `lock` (Lock & start) or `noLock`. */
+export type LockChoice = LockChoiceArg;
 
 /** A command call, named as in `commands` of `bindings.ts`, with its arguments. */
 export type Command =
@@ -25,13 +28,20 @@ export type Command =
     }
   | { name: "toggleFixed"; args: [itemId: string, pinnedStart: string | null, expectedRev: number] }
   | { name: "removeTask"; args: [itemId: string] }
-  | { name: "startTask"; args: [itemId: string, expectedRev: number] }
+  | { name: "startTask"; args: [itemId: string, expectedRev: number, lock: LockChoice | null] }
+  | { name: "lockDay"; args: [expectedRev: number] }
   | { name: "pauseTask"; args: [itemId: string] }
   | { name: "switchTask"; args: [itemId: string, expectedRev: number] }
   | { name: "extendTask"; args: [itemId: string, secs: number, expectedRev: number] }
   | {
       name: "insertTask";
-      args: [title: string, plannedSecs: number, anchor: InsertAnchor, expectedRev: number];
+      args: [
+        title: string,
+        plannedSecs: number,
+        anchor: InsertAnchor,
+        expectedRev: number,
+        lock: LockChoice | null,
+      ];
     }
   | { name: "setWorkEnd"; args: [minutes: number] }
   | { name: "carryOverToTomorrow"; args: [expectedRev: number] };
@@ -148,15 +158,63 @@ export function insertPositions(snap: Snapshot): InsertPosition[] {
   return out;
 }
 
-/** Inserts a task at `anchor` with the rendered rev. Blank or invalid minutes are
- * sent as 0 so the engine can reject them. */
+/** Inserts a task at `anchor` with the rendered rev and no lock choice. Blank or
+ * invalid minutes are sent as 0 so the engine can reject them. An insert-now on an
+ * undecided day gets its choice through `withLock` first (`asksLockChoice`). */
 export function insertCommand(
   snap: Snapshot,
   title: string,
   minutes: string,
   anchor: InsertAnchor,
 ): Command {
-  return { name: "insertTask", args: [title, minutesToSecs(minutes), anchor, snap.rev] };
+  return { name: "insertTask", args: [title, minutesToSecs(minutes), anchor, snap.rev, null] };
+}
+
+/** The day is undecided (AD-7): its first Start or insert-now must carry a lock
+ * choice, asked before anything is sent. Decided days never ask. */
+export function needsLockChoice(snap: Snapshot): boolean {
+  return snap.day?.lockDecision === "none";
+}
+
+/** Whether sending `cmd` must first ask "Lock & start / Start without lock": a
+ * Start, or an insert with the `now` anchor, on an undecided day. */
+export function asksLockChoice(snap: Snapshot, cmd: Command): boolean {
+  if (!needsLockChoice(snap)) return false;
+  return cmd.name === "startTask" || (cmd.name === "insertTask" && cmd.args[2].place === "now");
+}
+
+/** `cmd` (a Start or an insert) carrying the lock `choice`; other commands are
+ * returned unchanged. */
+export function withLock(cmd: Command, choice: LockChoice): Command {
+  switch (cmd.name) {
+    case "startTask":
+      return { name: "startTask", args: [cmd.args[0], cmd.args[1], choice] };
+    case "insertTask": {
+      const [title, secs, anchor, rev] = cmd.args;
+      return { name: "insertTask", args: [title, secs, anchor, rev, choice] };
+    }
+    default:
+      return cmd;
+  }
+}
+
+/** Locks the undecided day without starting anything, at the rendered rev. `null`
+ * (no Lock day button) once the day is decided. */
+export function lockDayCommand(snap: Snapshot): Command | null {
+  return needsLockChoice(snap) ? { name: "lockDay", args: [snap.rev] } : null;
+}
+
+/** The day's lock badge: `locked` or `unlocked` once decided, `null` while
+ * undecided (the Lock day button shows instead). */
+export function lockBadge(snap: Snapshot): "locked" | "unlocked" | null {
+  switch (snap.day?.lockDecision) {
+    case "locked":
+      return "locked";
+    case "noLock":
+      return "unlocked";
+    default:
+      return null;
+  }
 }
 
 /** Sets the work-end from a time field's `HH:MM`. Anything else is sent as 1440,
@@ -208,7 +266,8 @@ export function rowActions(snap: Snapshot, item: Item): RowActions {
     },
     canPin: !item.fixed,
     unpin: item.fixed ? { name: "toggleFixed", args: [item.id, null, snap.rev] } : null,
-    start: startable ? { name: "startTask", args: [item.id, snap.rev] } : null,
+    // No lock choice: an undecided day asks for one first (`asksLockChoice`).
+    start: startable ? { name: "startTask", args: [item.id, snap.rev, null] } : null,
     pause: running ? { name: "pauseTask", args: [item.id] } : null,
     switch: running ? { name: "switchTask", args: [item.id, snap.rev] } : null,
     remove: running ? null : { name: "removeTask", args: [item.id] },

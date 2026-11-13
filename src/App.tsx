@@ -3,13 +3,18 @@ import { events, commands } from "./bindings";
 import { nowNs } from "./elapsed";
 import {
   addCommand,
+  asksLockChoice,
   carryOverCommand,
   insertCommand,
   insertPositions,
+  lockBadge,
+  lockDayCommand,
   mergeSnapshot,
   overflowItems,
+  withLock,
   workEndCommand,
   type Command,
+  type LockChoice,
   type Snapshot,
 } from "./plan";
 import { PlanItemRow } from "./PlanItemRow";
@@ -36,6 +41,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
       break;
     case "startTask":
       res = await commands.startTask(...cmd.args);
+      break;
+    case "lockDay":
+      res = await commands.lockDay(...cmd.args);
       break;
     case "pauseTask":
       res = await commands.pauseTask(...cmd.args);
@@ -74,6 +82,10 @@ function App() {
   const [workEnd, setWorkEnd] = useState<string | null>(null);
   // Bumped by the tray's or a notification's Extend…; the running row focuses its extend field.
   const [focusExtend, setFocusExtend] = useState(0);
+  // A Start or insert-now held back until the user answers "lock the day?" (AD-7).
+  const [askingLock, setAskingLock] = useState<Command | null>(null);
+  // Runs once the held command is sent (not on Cancel), e.g. to clear its form.
+  const [afterAsk, setAfterAsk] = useState<(() => void) | null>(null);
 
   useEffect(() => {
     const unlisten = events.focusExtendEvent.listen(() => setFocusExtend((n) => n + 1));
@@ -115,6 +127,28 @@ function App() {
     }
   };
 
+  // On an undecided day, a Start or insert-now asks for the lock choice first and
+  // sends nothing until it is answered.
+  // `onSent` runs only once the command is actually sent.
+  const sendOrAsk = (cmd: Command, onSent?: () => void) => {
+    if (snap && asksLockChoice(snap, cmd)) {
+      setAskingLock(cmd);
+      setAfterAsk(() => onSent ?? null);
+    } else {
+      send(cmd);
+      onSent?.();
+    }
+  };
+
+  const answerLock = (choice: LockChoice | null) => {
+    if (askingLock && choice) {
+      send(withLock(askingLock, choice));
+      afterAsk?.();
+    }
+    setAskingLock(null);
+    setAfterAsk(null);
+  };
+
   if (!snap) {
     return (
       <main>
@@ -127,10 +161,35 @@ function App() {
   // Positions come from the snapshot; a choice that is gone falls back to the end.
   const positions = insertPositions(snap);
   const position = positions.find((p) => p.value === insertAt) ?? positions[positions.length - 1];
+  const lockDay = lockDayCommand(snap);
+  const badge = lockBadge(snap);
 
   return (
     <main>
-      <h1>nguda{snap.day ? ` · ${snap.day.date}` : ""}</h1>
+      <h1>
+        nguda{snap.day ? ` · ${snap.day.date}` : ""}
+        {badge && <span className={`badge ${badge}`}>{badge}</span>}
+      </h1>
+      {lockDay && (
+        <button type="button" className="lock-day" onClick={() => send(lockDay)}>
+          Lock day
+        </button>
+      )}
+
+      {askingLock && (
+        <div className="ask-lock" role="dialog" aria-label="Lock the day?">
+          <p>Lock today's plan as the baseline before starting?</p>
+          <button type="button" onClick={() => answerLock("lock")}>
+            Lock &amp; start
+          </button>
+          <button type="button" onClick={() => answerLock("noLock")}>
+            Start without lock
+          </button>
+          <button type="button" onClick={() => answerLock(null)}>
+            Cancel
+          </button>
+        </div>
+      )}
 
       {snap.status.map((s) =>
         s.key === "overflow" ? (
@@ -209,8 +268,9 @@ function App() {
         className="add insert"
         onSubmit={(e) => {
           e.preventDefault();
-          send(insertCommand(snap, insertTitle, insertMinutes, position.anchor));
-          setInsertTitle("");
+          sendOrAsk(insertCommand(snap, insertTitle, insertMinutes, position.anchor), () =>
+            setInsertTitle(""),
+          );
         }}
       >
         <input
@@ -254,6 +314,7 @@ function App() {
               item={item}
               now={now}
               send={send}
+              start={(cmd) => sendOrAsk(cmd)}
               focusExtend={focusExtend}
             />
           ))}

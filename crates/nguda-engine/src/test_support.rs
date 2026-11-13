@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nguda_core::{
-    Clock, Date, Day, DayLogEntry, IdGen, ItemId, OpenSegmentRef, OrderKey, PlanItem,
-    PlanItemRecord, PromptId, Segment, Settings, SleepFuture, Store, StoreBatch, StoreError,
-    StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
+    Baseline, Clock, Date, Day, DayLogEntry, IdGen, ItemId, LockChoice, LockDecision,
+    OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, PromptId, Segment, Settings, SleepFuture,
+    Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
 };
 use tokio::sync::watch;
 
@@ -40,11 +40,18 @@ pub(crate) fn item(n: u128, title: &str, order: &str) -> PlanItem {
     PlanItem::new(id(n), title, 600, key(order))
 }
 
-/// A day whose item 100 has been running since 1_000.
+/// A day whose item 100 has been running since 1_000, decided `NoLock` (a day
+/// with time on it is always decided).
 pub(crate) fn day_running_other() -> Day {
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(item(100, "other", "V")).unwrap();
     day.start(id(100), ts(1_000)).unwrap();
+    day
+}
+
+/// `day`, decided `NoLock`, so a choiceless Start works on it as before the lock.
+pub(crate) fn no_lock(mut day: Day) -> Day {
+    day.decide_lock(LockChoice::NoLock).unwrap();
     day
 }
 
@@ -128,6 +135,10 @@ struct Data {
     stacks: BTreeMap<Date, Vec<ItemId>>,
     /// `None` until a work-end is stored.
     work_end: Option<WorkEnd>,
+    /// date → lock decision; a missing date is undecided.
+    decisions: BTreeMap<Date, LockDecision>,
+    /// date → its write-once baseline.
+    baselines: BTreeMap<Date, Baseline>,
 }
 
 impl Data {
@@ -237,6 +248,40 @@ impl Data {
                 self.stacks.insert(*date, items.clone());
             }
             StoreOp::SetWorkEnd { work_end } => self.work_end = Some(*work_end),
+            StoreOp::SetLockDecision { date, decision } => {
+                if !self.days.contains_key(date) {
+                    return Err(StoreError::new(format!("set lock decision: no day {date}")));
+                }
+                if self
+                    .decisions
+                    .get(date)
+                    .is_some_and(|d| *d != LockDecision::None)
+                {
+                    return Err(StoreError::new(format!(
+                        "set lock decision for {date}: already decided"
+                    )));
+                }
+                self.decisions.insert(*date, *decision);
+            }
+            StoreOp::PutBaseline { baseline } => {
+                let date = baseline.date;
+                let ctx = format!("put baseline for {date}");
+                if !self.days.contains_key(&date) {
+                    return Err(StoreError::new(format!("{ctx}: no day")));
+                }
+                if self.baselines.contains_key(&date) {
+                    return Err(StoreError::new(format!("{ctx}: already stored")));
+                }
+                for item in &baseline.items {
+                    if self.item_date(item.item_id).is_none() {
+                        return Err(StoreError::new(format!(
+                            "{ctx}: unknown item {}",
+                            item.item_id
+                        )));
+                    }
+                }
+                self.baselines.insert(date, baseline.clone());
+            }
         }
         Ok(())
     }
@@ -262,9 +307,13 @@ impl Data {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let stack = self.stacks.get(&date).cloned().unwrap_or_default();
+        let decision = self.decisions.get(&date).copied().unwrap_or_default();
         Day::restore(date, tz.clone(), items)
             .and_then(|mut day| day.restore_interrupt_stack(stack).map(|()| day))
-            .map(Some)
+            .map(|mut day| {
+                day.restore_lock_decision(decision);
+                Some(day)
+            })
             .map_err(|e| StoreError::new(format!("load day {date}: {e}")))
     }
 
@@ -339,6 +388,7 @@ impl MemoryStore {
         }
         data.stacks
             .insert(day.date(), day.interrupt_stack().to_vec());
+        data.decisions.insert(day.date(), day.lock_decision());
     }
 
     /// Stores `items` as `date`'s interrupt stack as is, bypassing batches.
@@ -365,6 +415,11 @@ impl MemoryStore {
 
     pub(crate) fn stored_day(&self, date: Date) -> Option<Day> {
         self.data.lock().unwrap().load_day(date).unwrap()
+    }
+
+    /// The stored baseline of `date`, as committed.
+    pub(crate) fn stored_baseline(&self, date: Date) -> Option<Baseline> {
+        self.data.lock().unwrap().baselines.get(&date).cloned()
     }
 
     /// Every successfully committed batch, in order.
@@ -429,5 +484,9 @@ impl Store for MemoryStore {
                 work_end: d.work_end.unwrap_or_default(),
             })
         })
+    }
+
+    fn load_baseline(&self, date: Date) -> StoreFuture<Option<Baseline>> {
+        self.read(|d| Ok(d.baselines.get(&date).cloned()))
     }
 }

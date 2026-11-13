@@ -11,7 +11,9 @@
 //! with `Err` on malformed input without sending anything; every semantic check
 //! happens in the engine, which reports rejections through `Snapshot.status`.
 
-use nguda_core::{Day, ItemId, ItemStatus, PlanItem, Slot, Timestamp, Uuid, closed_secs};
+use nguda_core::{
+    Day, ItemId, ItemStatus, LockChoice, LockDecision, PlanItem, Slot, Timestamp, Uuid, closed_secs,
+};
 use nguda_engine::{EngineHandle, EngineMsg, InsertAnchor, ReorderAnchor, Snapshot, StatusKey};
 use serde::{Deserialize, Serialize};
 #[cfg(any(debug_assertions, test))]
@@ -59,6 +61,26 @@ pub struct InsertAnchorArg {
     pub place: InsertPlace,
     /// UUID of the anchor item, for `before` and `after`.
     pub item_id: Option<String>,
+}
+
+/// The answer to "lock the day?" (AD-7), sent with a Start or an insert-now only
+/// while the snapshot's day is undecided (`lockDecision` `none`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum LockChoiceArg {
+    /// Lock & start: freeze the day's plan as the baseline.
+    Lock,
+    /// Start without lock: the day never gets a baseline.
+    NoLock,
+}
+
+impl From<LockChoiceArg> for LockChoice {
+    fn from(c: LockChoiceArg) -> Self {
+        match c {
+            LockChoiceArg::Lock => Self::Lock,
+            LockChoiceArg::NoLock => Self::NoLock,
+        }
+    }
 }
 
 fn send(engine: &EngineHandle, msg: Result<EngineMsg, String>) -> Result<(), String> {
@@ -122,15 +144,24 @@ pub fn remove_task(engine: State<'_, EngineHandle>, item_id: String) -> Result<(
     send(&engine, remove_task_msg(&item_id))
 }
 
-/// Starts or resumes an item now, pausing whichever item is running.
+/// Starts or resumes an item now, pausing whichever item is running. `lock` is
+/// the lock choice while the day is undecided, else `null`.
 #[tauri::command]
 #[specta::specta]
 pub fn start_task(
     engine: State<'_, EngineHandle>,
     item_id: String,
     expected_rev: u32,
+    lock: Option<LockChoiceArg>,
 ) -> Result<(), String> {
-    send(&engine, start_task_msg(&item_id, expected_rev))
+    send(&engine, start_task_msg(&item_id, expected_rev, lock))
+}
+
+/// Locks the undecided day without starting anything, freezing its baseline.
+#[tauri::command]
+#[specta::specta]
+pub fn lock_day(engine: State<'_, EngineHandle>, expected_rev: u32) -> Result<(), String> {
+    send(&engine, Ok(lock_day_msg(expected_rev)))
 }
 
 /// Pauses the running item now.
@@ -164,6 +195,7 @@ pub fn extend_task(
 }
 
 /// Inserts a new task at `anchor`; `now` starts it, pausing the running item.
+/// `lock` is the lock choice for `now` on an undecided day, else `null`.
 #[tauri::command]
 #[specta::specta]
 pub fn insert_task(
@@ -172,10 +204,11 @@ pub fn insert_task(
     planned_secs: u32,
     anchor: InsertAnchorArg,
     expected_rev: u32,
+    lock: Option<LockChoiceArg>,
 ) -> Result<(), String> {
     send(
         &engine,
-        insert_task_msg(title, planned_secs, &anchor, expected_rev),
+        insert_task_msg(title, planned_secs, &anchor, expected_rev, lock),
     )
 }
 
@@ -266,11 +299,22 @@ fn remove_task_msg(item_id: &str) -> Result<EngineMsg, String> {
     })
 }
 
-fn start_task_msg(item_id: &str, expected_rev: u32) -> Result<EngineMsg, String> {
+fn start_task_msg(
+    item_id: &str,
+    expected_rev: u32,
+    lock: Option<LockChoiceArg>,
+) -> Result<EngineMsg, String> {
     Ok(EngineMsg::Start {
         item_id: parse_item_id(item_id)?,
         expected_rev: expected_rev.into(),
+        lock: lock.map(Into::into),
     })
+}
+
+fn lock_day_msg(expected_rev: u32) -> EngineMsg {
+    EngineMsg::LockDay {
+        expected_rev: expected_rev.into(),
+    }
 }
 
 fn pause_task_msg(item_id: &str) -> Result<EngineMsg, String> {
@@ -309,6 +353,7 @@ fn insert_task_msg(
     planned_secs: u32,
     anchor: &InsertAnchorArg,
     expected_rev: u32,
+    lock: Option<LockChoiceArg>,
 ) -> Result<EngineMsg, String> {
     let anchor_id = || {
         anchor
@@ -328,6 +373,7 @@ fn insert_task_msg(
         planned_secs: planned_secs.into(),
         anchor,
         expected_rev: expected_rev.into(),
+        lock: lock.map(Into::into),
     })
 }
 
@@ -364,6 +410,27 @@ pub struct DayView {
     pub date: String,
     /// The IANA zone fixed for this day.
     pub tz: String,
+    /// Whether the day is locked (AD-7). While `none`, Start and insert-now carry
+    /// a lock choice; once decided, they carry none.
+    pub lock_decision: LockDecisionView,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum LockDecisionView {
+    None,
+    Locked,
+    NoLock,
+}
+
+impl From<LockDecision> for LockDecisionView {
+    fn from(d: LockDecision) -> Self {
+        match d {
+            LockDecision::None => Self::None,
+            LockDecision::Locked => Self::Locked,
+            LockDecision::NoLock => Self::NoLock,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
@@ -468,6 +535,7 @@ impl From<&Snapshot> for SnapshotEvent {
             day: s.day.as_ref().map(|d| DayView {
                 date: d.date().to_string(),
                 tz: d.tz().to_owned(),
+                lock_decision: d.lock_decision().into(),
             }),
             items,
             running: s.running.as_ref().map(|r| RunningView {
@@ -526,6 +594,7 @@ pub fn specta_builder() -> Builder<Wry> {
             toggle_fixed,
             remove_task,
             start_task,
+            lock_day,
             pause_task,
             switch_task,
             extend_task,
@@ -590,6 +659,7 @@ mod tests {
             "toggleFixed",
             "removeTask",
             "startTask",
+            "lockDay",
             "pauseTask",
             "switchTask",
             "extendTask",
@@ -674,12 +744,41 @@ mod tests {
             Ok(EngineMsg::RemoveTask { item_id: item(A) })
         );
         assert_eq!(
-            start_task_msg(A, 4),
+            start_task_msg(A, 4, None),
             Ok(EngineMsg::Start {
                 item_id: item(A),
-                expected_rev: 4
+                expected_rev: 4,
+                lock: None
             })
         );
+        for (arg, choice) in [
+            (LockChoiceArg::Lock, LockChoice::Lock),
+            (LockChoiceArg::NoLock, LockChoice::NoLock),
+        ] {
+            assert_eq!(
+                start_task_msg(A, 4, Some(arg)),
+                Ok(EngineMsg::Start {
+                    item_id: item(A),
+                    expected_rev: 4,
+                    lock: Some(choice)
+                })
+            );
+            assert_eq!(
+                insert_task_msg("Call".into(), 900, &now_anchor(), 4, Some(arg)),
+                Ok(EngineMsg::InsertTask {
+                    title: "Call".into(),
+                    planned_secs: 900,
+                    anchor: InsertAnchor::Now,
+                    expected_rev: 4,
+                    lock: Some(choice)
+                })
+            );
+        }
+        assert_eq!(lock_day_msg(6), EngineMsg::LockDay { expected_rev: 6 });
+        let choice: LockChoiceArg = serde_json::from_str(r#""noLock""#).unwrap();
+        assert_eq!(choice, LockChoiceArg::NoLock);
+        let choice: LockChoiceArg = serde_json::from_str(r#""lock""#).unwrap();
+        assert_eq!(choice, LockChoiceArg::Lock);
         assert_eq!(pause_task_msg(A), Ok(EngineMsg::Pause { item_id: item(A) }));
         assert_eq!(
             switch_task_msg(A, 9),
@@ -722,12 +821,13 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                insert_task_msg("Call".into(), 900, &arg, 4),
+                insert_task_msg("Call".into(), 900, &arg, 4, None),
                 Ok(EngineMsg::InsertTask {
                     title: "Call".into(),
                     planned_secs: 900,
                     anchor: expected,
-                    expected_rev: 4
+                    expected_rev: 4,
+                    lock: None
                 }),
                 "{arg:?}"
             );
@@ -745,7 +845,7 @@ mod tests {
         for bad in ["", "not-a-uuid", "0192f3a0-0000-7000-8000"] {
             assert!(edit_task_msg(bad, None, None).is_err(), "{bad}");
             assert!(remove_task_msg(bad).is_err(), "{bad}");
-            assert!(start_task_msg(bad, 1).is_err(), "{bad}");
+            assert!(start_task_msg(bad, 1, None).is_err(), "{bad}");
             assert!(pause_task_msg(bad).is_err(), "{bad}");
             assert!(switch_task_msg(bad, 1).is_err(), "{bad}");
             assert!(extend_task_msg(bad, 300, 1).is_err(), "{bad}");
@@ -765,7 +865,10 @@ mod tests {
                     place,
                     item_id: Some(bad.into()),
                 };
-                assert!(insert_task_msg("t".into(), 60, &arg, 1).is_err(), "{bad}");
+                assert!(
+                    insert_task_msg("t".into(), 60, &arg, 1, None).is_err(),
+                    "{bad}"
+                );
             }
         }
         for place in [InsertPlace::Before, InsertPlace::After] {
@@ -774,7 +877,7 @@ mod tests {
                 item_id: None,
             };
             assert!(
-                insert_task_msg("t".into(), 60, &arg, 1).is_err(),
+                insert_task_msg("t".into(), 60, &arg, 1, None).is_err(),
                 "{place:?}"
             );
         }
@@ -785,6 +888,13 @@ mod tests {
 
     fn ts(s: &str) -> Timestamp {
         s.parse().unwrap()
+    }
+
+    fn now_anchor() -> InsertAnchorArg {
+        InsertAnchorArg {
+            place: InsertPlace::Now,
+            item_id: None,
+        }
     }
 
     fn record(id: &str, title: &str, order: &str) -> PlanItemRecord {
@@ -859,7 +969,8 @@ mod tests {
             ev.day,
             Some(DayView {
                 date: "2026-11-11".into(),
-                tz: "Europe/Berlin".into()
+                tz: "Europe/Berlin".into(),
+                lock_decision: LockDecisionView::None,
             })
         );
         let ids: Vec<&str> = ev.items.iter().map(|i| i.id.as_str()).collect();
@@ -953,6 +1064,22 @@ mod tests {
         let status = |s| serde_json::to_string(&ItemStatusView::from(s)).unwrap();
         assert_eq!(status(ItemStatus::CarriedOver), "\"carriedOver\"");
         assert_eq!(status(ItemStatus::Paused), "\"paused\"");
+        let decision = |d| serde_json::to_string(&LockDecisionView::from(d)).unwrap();
+        assert_eq!(decision(LockDecision::None), "\"none\"");
+        assert_eq!(decision(LockDecision::Locked), "\"locked\"");
+        assert_eq!(decision(LockDecision::NoLock), "\"noLock\"");
+    }
+
+    #[test]
+    fn snapshot_event_carries_the_lock_decision() {
+        let mut day = sample_day();
+        day.decide_lock(LockChoice::Lock).unwrap();
+        let snap = Snapshot {
+            day: Some(day),
+            ..Default::default()
+        };
+        let ev = SnapshotEvent::from(&snap);
+        assert_eq!(ev.day.unwrap().lock_decision, LockDecisionView::Locked);
     }
 
     #[test]

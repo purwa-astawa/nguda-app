@@ -99,17 +99,59 @@ const V7: &str = r#"
 ALTER TABLE plan_item ADD COLUMN carried_from TEXT REFERENCES plan_item (id);
 "#;
 
+/// v8: each day's lock decision (AD-7) and its write-once baseline (AD-6). Days
+/// that already have time on them were started before locking existed, so they are
+/// decided `no_lock`; the rest stay undecided. A baseline holds one row per frozen
+/// item, `position` 0 first in schedule order, with its planned length and its
+/// scheduled span (both NULL or both set). Triggers refuse any UPDATE or DELETE.
+const V8: &str = r#"
+ALTER TABLE day ADD COLUMN lock_decision TEXT NOT NULL DEFAULT 'none'
+    CHECK (lock_decision IN ('none', 'locked', 'no_lock'));
+
+UPDATE day SET lock_decision = 'no_lock'
+WHERE date IN (
+    SELECT p.day_date FROM plan_item p JOIN time_segment s ON s.item_id = p.id
+);
+
+CREATE TABLE baseline (
+    day_date  TEXT PRIMARY KEY NOT NULL REFERENCES day (date),
+    locked_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE baseline_item (
+    day_date        TEXT NOT NULL REFERENCES baseline (day_date),
+    position        INTEGER NOT NULL CHECK (position >= 0),
+    item_id         TEXT NOT NULL REFERENCES plan_item (id),
+    planned_secs    INTEGER NOT NULL CHECK (planned_secs >= 0),
+    scheduled_start INTEGER,
+    scheduled_end   INTEGER,
+    PRIMARY KEY (day_date, item_id),
+    UNIQUE (day_date, position),
+    CHECK ((scheduled_start IS NULL) = (scheduled_end IS NULL))
+) STRICT;
+
+CREATE TRIGGER baseline_no_update BEFORE UPDATE ON baseline
+BEGIN SELECT RAISE(ABORT, 'baseline is write-once'); END;
+CREATE TRIGGER baseline_no_delete BEFORE DELETE ON baseline
+BEGIN SELECT RAISE(ABORT, 'baseline is write-once'); END;
+CREATE TRIGGER baseline_item_no_update BEFORE UPDATE ON baseline_item
+BEGIN SELECT RAISE(ABORT, 'baseline is write-once'); END;
+CREATE TRIGGER baseline_item_no_delete BEFORE DELETE ON baseline_item
+BEGIN SELECT RAISE(ABORT, 'baseline is write-once'); END;
+"#;
+
+/// Every migration's SQL, oldest first.
+const ALL: [&str; 8] = [V1, V2, V3, V4, V5, V6, V7, V8];
+
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![
-        M::up(V1),
-        M::up(V2),
-        M::up(V3),
-        M::up(V4),
-        M::up(V5),
-        M::up(V6),
-        M::up(V7),
-    ])
+    Migrations::new(ALL.iter().map(|sql| M::up(sql)).collect())
+}
+
+/// The first `n` migrations, for building a database at an older version.
+#[cfg(test)]
+pub(super) fn migrations_through(n: usize) -> Migrations<'static> {
+    Migrations::new(ALL[..n].iter().map(|sql| M::up(sql)).collect())
 }
 
 #[cfg(test)]

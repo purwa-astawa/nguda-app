@@ -275,6 +275,7 @@ impl Actor {
         let changed = match applied {
             Err(reject) => {
                 self.reject(name, item_id, &reject);
+                self.ask_lock(name, item_id, &reject);
                 return false;
             }
             Ok(extras) => {
@@ -318,6 +319,19 @@ impl Actor {
         self.status
             .insert(StatusKey::CommandRejected, reject.to_string());
         self.publish();
+    }
+
+    /// After a choiceless `Start` was rejected on an undecided day, asks surfaces
+    /// to get a lock choice for its item (AD-7). Insert-now has no item to name.
+    fn ask_lock(&self, name: &'static str, item_id: Option<ItemId>, reject: &Reject) {
+        let (commands::START, Some(item_id), Reject::LockUndecided { .. }) =
+            (name, item_id, reject)
+        else {
+            return;
+        };
+        tracing::info!(%item_id, "asking for a lock choice");
+        // A closed receiver only means nobody listens for effects.
+        let _ = self.effects.send(Effect::AskLockOnStart { item_id });
     }
 
     /// Carries the current overflow list over to tomorrow (AD-6), in one batch with

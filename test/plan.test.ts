@@ -3,13 +3,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   addCommand,
+  asksLockChoice,
   carryOverCommand,
   editCommand,
   extendCommand,
   flexibleNeighbours,
   insertCommand,
   insertPositions,
+  lockBadge,
+  lockDayCommand,
   mergeSnapshot,
+  needsLockChoice,
   minutesToSecs,
   overflowItems,
   pinCommand,
@@ -17,6 +21,7 @@ import {
   rowActions,
   rowTime,
   scheduleLabel,
+  withLock,
   workEndCommand,
   type Item,
   type Snapshot,
@@ -50,7 +55,7 @@ function runningView(itemId: string, title: string, accumulatedSecs = 0): NonNul
 function snap(rev: number, items: Item[] = [F, A, B], running: Snapshot["running"] = null): Snapshot {
   return {
     rev,
-    day: { date: "2026-11-11", tz: "Europe/Berlin" },
+    day: { date: "2026-11-11", tz: "Europe/Berlin", lockDecision: "noLock" },
     items,
     running,
     workEnd: "17:00",
@@ -118,8 +123,11 @@ test("unpin sends null with the rendered rev", () => {
 test("start for pending or paused, pause for running", () => {
   const paused = item("A", { status: "paused" });
   const running = item("A", { status: "running" });
-  assert.deepEqual(rowActions(snap(2), A).start, { name: "startTask", args: ["A", 2] });
-  assert.deepEqual(rowActions(snap(2, [paused]), paused).start, { name: "startTask", args: ["A", 2] });
+  assert.deepEqual(rowActions(snap(2), A).start, { name: "startTask", args: ["A", 2, null] });
+  assert.deepEqual(rowActions(snap(2, [paused]), paused).start, {
+    name: "startTask",
+    args: ["A", 2, null],
+  });
   assert.equal(rowActions(snap(2), A).pause, null);
   assert.deepEqual(rowActions(snap(2, [running]), running).pause, { name: "pauseTask", args: ["A"] });
   assert.equal(rowActions(snap(2, [running]), running).start, null);
@@ -262,11 +270,11 @@ test("insertCommand sends title, seconds, the anchor and the rendered rev", () =
   const anchor = { place: "before", itemId: "B" } as const;
   assert.deepEqual(insertCommand(s, "Call", "15", anchor), {
     name: "insertTask",
-    args: ["Call", 900, { place: "before", itemId: "B" }, 9],
+    args: ["Call", 900, { place: "before", itemId: "B" }, 9, null],
   });
   assert.deepEqual(insertCommand(s, "", "", { place: "now", itemId: null }), {
     name: "insertTask",
-    args: ["", 0, { place: "now", itemId: null }, 9],
+    args: ["", 0, { place: "now", itemId: null }, 9, null],
   });
 });
 
@@ -290,4 +298,58 @@ test("overflow items follow snap.overflow's order and skip unknown ids", () => {
 
 test("move to tomorrow carries over at the rendered rev", () => {
   assert.deepEqual(carryOverCommand(snap(7)), { name: "carryOverToTomorrow", args: [7] });
+});
+
+function withDecision(s: Snapshot, lockDecision: "none" | "locked" | "noLock"): Snapshot {
+  return { ...s, day: { ...s.day!, lockDecision } };
+}
+
+test("an undecided day asks for a lock choice on Start and insert-now only", () => {
+  const undecided = withDecision(snap(3), "none");
+  assert.equal(needsLockChoice(undecided), true);
+  const start = rowActions(undecided, A).start!;
+  assert.deepEqual(start, { name: "startTask", args: ["A", 3, null] });
+  assert.equal(asksLockChoice(undecided, start), true);
+  const now = insertCommand(undecided, "Call", "15", { place: "now", itemId: null });
+  assert.equal(asksLockChoice(undecided, now), true);
+  const end = insertCommand(undecided, "Call", "15", { place: "end", itemId: null });
+  assert.equal(asksLockChoice(undecided, end), false, "only the now anchor decides");
+  assert.equal(asksLockChoice(undecided, { name: "pauseTask", args: ["A"] }), false);
+  assert.equal(needsLockChoice({ ...undecided, day: null }), false);
+});
+
+test("the chosen answer's Start and insert-now go out with that choice", () => {
+  const undecided = withDecision(snap(3), "none");
+  const start = rowActions(undecided, A).start!;
+  assert.deepEqual(withLock(start, "lock"), { name: "startTask", args: ["A", 3, "lock"] });
+  assert.deepEqual(withLock(start, "noLock"), { name: "startTask", args: ["A", 3, "noLock"] });
+  const now = insertCommand(undecided, "Call", "15", { place: "now", itemId: null });
+  assert.deepEqual(withLock(now, "lock"), {
+    name: "insertTask",
+    args: ["Call", 900, { place: "now", itemId: null }, 3, "lock"],
+  });
+  const pause = { name: "pauseTask", args: ["A"] } as const;
+  assert.deepEqual(withLock(pause, "lock"), pause);
+});
+
+test("Lock day shows only while undecided; the badge reads locked or unlocked", () => {
+  const undecided = withDecision(snap(4), "none");
+  assert.deepEqual(lockDayCommand(undecided), { name: "lockDay", args: [4] });
+  assert.equal(lockBadge(undecided), null);
+  for (const [decision, badge] of [
+    ["locked", "locked"],
+    ["noLock", "unlocked"],
+  ] as const) {
+    const decided = withDecision(snap(4), decision);
+    assert.equal(lockDayCommand(decided), null, decision);
+    assert.equal(lockBadge(decided), badge);
+    assert.equal(needsLockChoice(decided), false);
+    // Start sends no lock choice and never asks.
+    const start = rowActions(decided, A).start!;
+    assert.deepEqual(start, { name: "startTask", args: ["A", 4, null] });
+    assert.equal(asksLockChoice(decided, start), false);
+    const now = insertCommand(decided, "Call", "15", { place: "now", itemId: null });
+    assert.equal(asksLockChoice(decided, now), false);
+  }
+  assert.equal(lockDayCommand({ ...snap(4), day: null }), null);
 });

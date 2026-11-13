@@ -14,9 +14,9 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use nguda_core::{
-    Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OpenSegmentRef, OrderKey, PlanItem,
-    PlanItemRecord, Segment, Settings, Store, StoreBatch, StoreError, StoreFuture, StoreOp,
-    Timestamp, Uuid, WorkEnd,
+    Baseline, BaselineItem, Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, LockDecision,
+    OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Segment, Settings, Span, Store, StoreBatch,
+    StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Params, Row, Transaction, params};
 use rusqlite_migration::{Migrations, SchemaVersion};
@@ -65,6 +65,7 @@ enum Request {
     OpenSegment(oneshot::Sender<Result<Option<OpenSegmentRef>, StoreError>>),
     LoadDayLog(Date, oneshot::Sender<Result<Vec<DayLogEntry>, StoreError>>),
     LoadSettings(oneshot::Sender<Result<Settings, StoreError>>),
+    LoadBaseline(Date, oneshot::Sender<Result<Option<Baseline>, StoreError>>),
 }
 
 /// The SQLite implementation of the [`Store`] port.
@@ -150,6 +151,11 @@ impl Store for SqliteStore {
     fn load_settings(&self) -> StoreFuture<Settings> {
         let (tx, rx) = oneshot::channel();
         self.call(Request::LoadSettings(tx), rx)
+    }
+
+    fn load_baseline(&self, date: Date) -> StoreFuture<Option<Baseline>> {
+        let (tx, rx) = oneshot::channel();
+        self.call(Request::LoadBaseline(date, tx), rx)
     }
 }
 
@@ -257,6 +263,9 @@ fn serve(mut conn: Connection, rx: mpsc::Receiver<Request>) {
             }
             Request::LoadSettings(reply) => {
                 let _ = reply.send(load_settings(&conn));
+            }
+            Request::LoadBaseline(date, reply) => {
+                let _ = reply.send(load_baseline(&conn, date));
             }
         }
     }
@@ -447,8 +456,153 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
             )
             .map_err(sql_err(ctx))?;
         }
+        StoreOp::SetLockDecision { date, decision } => {
+            let ctx = format!("set lock decision for {date}");
+            // Decided at most once (AD-7): only an undecided day takes a decision.
+            let changed = tx
+                .execute(
+                    "UPDATE day SET lock_decision = ?2
+                     WHERE date = ?1 AND lock_decision = 'none'",
+                    params![date.to_string(), decision_str(*decision)],
+                )
+                .map_err(sql_err(&ctx))?;
+            if changed != 1 {
+                let exists = tx
+                    .query_row(
+                        "SELECT 1 FROM day WHERE date = ?1",
+                        [date.to_string()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(sql_err(&ctx))?
+                    .is_some();
+                let why = if exists {
+                    "already decided"
+                } else {
+                    "no such day"
+                };
+                return Err(StoreError::new(format!("{ctx}: {why}")));
+            }
+        }
+        StoreOp::PutBaseline { baseline } => put_baseline(tx, baseline)?,
     }
     Ok(())
+}
+
+/// Plain INSERTs, so a second baseline for the date fails on its primary key and
+/// rolls back the batch (AD-6: write-once).
+fn put_baseline(tx: &Transaction<'_>, baseline: &Baseline) -> Result<(), StoreError> {
+    let date = baseline.date.to_string();
+    let ctx = format!("put baseline for {date}");
+    tx.execute(
+        "INSERT INTO baseline (day_date, locked_at) VALUES (?1, ?2)",
+        params![date, to_nanos(baseline.locked_at, &ctx)?],
+    )
+    .map_err(sql_err(&ctx))?;
+    for (position, item) in baseline.items.iter().enumerate() {
+        let ctx = format!("{ctx}: item {}", item.item_id);
+        let position = i64::try_from(position)
+            .map_err(|_| StoreError::new(format!("{ctx}: too many items")))?;
+        let planned_secs = i64::try_from(item.planned_secs)
+            .map_err(|_| StoreError::new(format!("{ctx}: planned_secs out of range")))?;
+        let (start, end) = match item.span {
+            Some(span) => (
+                Some(to_nanos(span.start, &ctx)?),
+                Some(to_nanos(span.end, &ctx)?),
+            ),
+            None => (None, None),
+        };
+        tx.execute(
+            "INSERT INTO baseline_item
+               (day_date, position, item_id, planned_secs, scheduled_start, scheduled_end)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                date,
+                position,
+                item.item_id.to_string(),
+                planned_secs,
+                start,
+                end
+            ],
+        )
+        .map_err(sql_err(&ctx))?;
+    }
+    Ok(())
+}
+
+/// The stored baseline of `date` with its items by position, or `None`.
+fn load_baseline(conn: &Connection, date: Date) -> Result<Option<Baseline>, StoreError> {
+    let ctx = format!("load baseline {date}");
+    let date_text = date.to_string();
+    let Some(locked_at) = conn
+        .query_row(
+            "SELECT locked_at FROM baseline WHERE day_date = ?1",
+            [&date_text],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(sql_err(&ctx))?
+    else {
+        return Ok(None);
+    };
+    let rows = query_all(
+        conn,
+        "SELECT item_id, planned_secs, scheduled_start, scheduled_end FROM baseline_item
+         WHERE day_date = ?1 ORDER BY position",
+        [&date_text],
+        &ctx,
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        },
+    )?;
+    let items = rows
+        .into_iter()
+        .map(|(item_id, planned_secs, start, end)| {
+            let item_id = parse_id(&item_id)?;
+            let ctx = format!("{ctx}: item {item_id}");
+            let span = match (start, end) {
+                (Some(start), Some(end)) => Some(Span {
+                    start: from_nanos(start, &ctx)?,
+                    end: from_nanos(end, &ctx)?,
+                }),
+                (None, None) => None,
+                _ => return Err(StoreError::new(format!("{ctx}: half a span"))),
+            };
+            Ok(BaselineItem {
+                item_id,
+                planned_secs: u64::try_from(planned_secs)
+                    .map_err(|_| StoreError::new(format!("{ctx}: invalid planned_secs")))?,
+                span,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Baseline {
+        date,
+        locked_at: from_nanos(locked_at, &ctx)?,
+        items,
+    }))
+}
+
+fn decision_str(decision: LockDecision) -> &'static str {
+    match decision {
+        LockDecision::None => "none",
+        LockDecision::Locked => "locked",
+        LockDecision::NoLock => "no_lock",
+    }
+}
+
+fn parse_decision(text: &str) -> Option<LockDecision> {
+    Some(match text {
+        "none" => LockDecision::None,
+        "locked" => LockDecision::Locked,
+        "no_lock" => LockDecision::NoLock,
+        _ => return None,
+    })
 }
 
 /// Stored `settings.key` values.
@@ -615,15 +769,19 @@ struct ItemRow {
 fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
     let ctx = format!("load day {date}");
     let date_text = date.to_string();
-    let Some(tz) = conn
-        .query_row("SELECT tz FROM day WHERE date = ?1", [&date_text], |r| {
-            r.get::<_, String>(0)
-        })
+    let Some((tz, decision)) = conn
+        .query_row(
+            "SELECT tz, lock_decision FROM day WHERE date = ?1",
+            [&date_text],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
         .optional()
         .map_err(sql_err(&ctx))?
     else {
         return Ok(None);
     };
+    let decision = parse_decision(&decision)
+        .ok_or_else(|| StoreError::new(format!("{ctx}: invalid lock decision")))?;
 
     let rows = query_all(
         conn,
@@ -692,7 +850,10 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
     .collect::<Result<Vec<_>, _>>()?;
     Day::restore(date, tz, items)
         .and_then(|mut day| day.restore_interrupt_stack(stack).map(|()| day))
-        .map(Some)
+        .map(|mut day| {
+            day.restore_lock_decision(decision);
+            Some(day)
+        })
         .map_err(|e| StoreError::new(format!("{ctx}: {e}")))
 }
 

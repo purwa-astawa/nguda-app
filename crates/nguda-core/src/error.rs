@@ -19,6 +19,8 @@ pub enum DomainError {
     DuplicateItem(ItemId),
     /// A stored record is internally inconsistent and cannot be rehydrated.
     InvalidRecord { id: ItemId, reason: &'static str },
+    /// The day's lock was already decided; it is decided at most once (AD-7).
+    LockAlreadyDecided,
 }
 
 impl fmt::Display for DomainError {
@@ -34,6 +36,7 @@ impl fmt::Display for DomainError {
             Self::InvalidRecord { id, reason } => {
                 write!(f, "invalid record for item {id}: {reason}")
             }
+            Self::LockAlreadyDecided => f.write_str("the day's lock is already decided"),
         }
     }
 }
