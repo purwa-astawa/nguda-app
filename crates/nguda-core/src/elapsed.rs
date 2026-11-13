@@ -45,7 +45,7 @@ pub fn until_next_second(running: &Running, now: Timestamp) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Uuid;
+    use crate::test_support::id;
 
     fn at(secs: i64, ms: i64) -> Timestamp {
         Timestamp::from_millisecond(secs * 1000 + ms).unwrap()
@@ -53,7 +53,7 @@ mod tests {
 
     fn running(started: Timestamp, accumulated_secs: u64) -> Running {
         Running {
-            item_id: ItemId(Uuid::from_u128(1)),
+            item_id: id(1),
             title: "Demo".into(),
             segment_started_at: started,
             accumulated_secs,

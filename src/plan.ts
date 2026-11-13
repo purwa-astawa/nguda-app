@@ -4,7 +4,12 @@
 // everything else and reports rejections through `snapshot.status`.
 // Erasable TS only, so `node --test` runs this file directly.
 
-import type { ItemView_Serialize, SnapshotEvent_Serialize } from "./bindings.ts";
+import type {
+  InsertAnchorArg_Serialize,
+  ItemView_Serialize,
+  ReorderAnchorArg,
+  SnapshotEvent_Serialize,
+} from "./bindings.ts";
 import { elapsedSecs, formatElapsed } from "./elapsed.ts";
 
 export type Snapshot = SnapshotEvent_Serialize;
@@ -16,7 +21,7 @@ export type Command =
   | { name: "editTask"; args: [itemId: string, title: string | null, plannedSecs: number | null] }
   | {
       name: "reorderTask";
-      args: [itemId: string, anchor: { place: "before" | "after"; itemId: string }, expectedRev: number];
+      args: [itemId: string, anchor: ReorderAnchorArg, expectedRev: number];
     }
   | { name: "toggleFixed"; args: [itemId: string, pinnedStart: string | null, expectedRev: number] }
   | { name: "removeTask"; args: [itemId: string] }
@@ -32,10 +37,7 @@ export type Command =
   | { name: "carryOverToTomorrow"; args: [expectedRev: number] };
 
 /** Where an inserted task goes, as `insertTask` takes it. Never a numeric index. */
-export type InsertAnchor = {
-  place: "now" | "before" | "after" | "end";
-  itemId: string | null;
-};
+export type InsertAnchor = InsertAnchorArg_Serialize;
 
 /** One choice of the Insert form's position picker. */
 export type InsertPosition = { value: string; label: string; anchor: InsertAnchor };
@@ -66,6 +68,12 @@ export function pinInstant(date: string, time: string): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+/** A pending or paused flexible item that is not interrupted: the only kind a
+ * reorder or an insert can be placed next to. */
+function isFlexibleAnchor(i: Item): boolean {
+  return !i.fixed && !i.interrupted && (i.status === "pending" || i.status === "paused");
+}
+
 /** The pending or paused flexible items just before and after `id`, in the order
  * given. Done, running and carried-over items sit at their actual times rather than
  * in order-key order, so they are never neighbours, and have none themselves.
@@ -75,9 +83,7 @@ export function flexibleNeighbours(
   items: readonly Item[],
   id: string,
 ): { prev: Item | null; next: Item | null } {
-  const flexible = items.filter(
-    (i) => !i.fixed && !i.interrupted && (i.status === "pending" || i.status === "paused"),
-  );
+  const flexible = items.filter(isFlexibleAnchor);
   const at = flexible.findIndex((i) => i.id === id);
   if (at < 0) return { prev: null, next: null };
   return { prev: flexible[at - 1] ?? null, next: flexible[at + 1] ?? null };
@@ -126,7 +132,7 @@ export function insertPositions(snap: Snapshot): InsertPosition[] {
     });
   }
   for (const i of snap.items) {
-    if (i.fixed || i.interrupted || (i.status !== "pending" && i.status !== "paused")) continue;
+    if (!isFlexibleAnchor(i)) continue;
     out.push({
       value: `before:${i.id}`,
       label: `Before \u201c${i.title}\u201d`,
@@ -188,9 +194,7 @@ export type RowActions = {
 };
 
 export function rowActions(snap: Snapshot, item: Item): RowActions {
-  const { prev, next } = item.fixed || item.interrupted
-    ? { prev: null, next: null }
-    : flexibleNeighbours(snap.items, item.id);
+  const { prev, next } = flexibleNeighbours(snap.items, item.id);
   const running = item.status === "running";
   const startable = item.status === "pending" || item.status === "paused";
   return {
@@ -221,7 +225,7 @@ export function rowTime(snap: Snapshot, item: Item, nowNs: bigint): string {
 
 /** Local `HH:MM` of an RFC 3339 instant in the IANA zone `tz`, 24-hour. Falls back
  * to the browser's zone if `tz` is unknown. */
-export function zonedTime(iso: string, tz: string): string {
+function zonedTime(iso: string, tz: string): string {
   const opts: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
   const at = new Date(iso);
   try {

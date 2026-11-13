@@ -30,7 +30,8 @@ type Props = {
   item: Item;
   now: bigint;
   send: (cmd: Command) => void;
-  /** Changes each time the tray asks to focus the running row's extend field. */
+  /** Changes each time the tray's or a notification's Extend… asks to focus the
+   * running row's extend field. */
   focusExtend: number;
 };
 
@@ -42,7 +43,8 @@ export function PlanItemRow({ snap, item, now, send, focusExtend }: Props) {
   const [pinTime, setPinTime] = useState("");
   const [extendMinutes, setExtendMinutes] = useState("5");
   const extendRef = useRef<HTMLInputElement>(null);
-  // The last tray focus request this row has handled; starts at the value at mount.
+  // The last focus request from the tray's or a notification's Extend… this row has
+  // handled; starts at the value at mount.
   const handledFocus = useRef(focusExtend);
   const running = item.status === "running";
   const extend = extendCommand(snap, item, extendMinutes);

@@ -39,7 +39,7 @@ fn headline(kind: PromptKind) -> &'static str {
 
 /// The fixed identifier of an action, sent to the notification server and read
 /// back on a click.
-pub(crate) fn action_id(action: PromptAction) -> &'static str {
+fn action_id(action: PromptAction) -> &'static str {
     match action {
         PromptAction::Extend5 => "extend5",
         PromptAction::Extend15 => "extend15",
@@ -50,7 +50,7 @@ pub(crate) fn action_id(action: PromptAction) -> &'static str {
 
 /// The action an identifier names, or `None` for anything else (a click on the
 /// notification body, a close, an unknown id).
-pub(crate) fn action_from_id(id: &str) -> Option<PromptAction> {
+fn action_from_id(id: &str) -> Option<PromptAction> {
     PromptAction::ALL.into_iter().find(|a| action_id(*a) == id)
 }
 

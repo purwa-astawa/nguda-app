@@ -43,6 +43,10 @@ const F = item("F", { fixed: true, pinnedStart: "2026-11-11T07:00:00Z" });
 const A = item("A");
 const B = item("B");
 
+function runningView(itemId: string, title: string, accumulatedSecs = 0): NonNullable<Snapshot["running"]> {
+  return { itemId, title, segmentStartedAt: "2026-11-11T09:00:00Z", accumulatedSecs };
+}
+
 function snap(rev: number, items: Item[] = [F, A, B], running: Snapshot["running"] = null): Snapshot {
   return {
     rev,
@@ -144,12 +148,7 @@ test("remove on non-running items only", () => {
 test("row time ticks for the running item and shows banked time otherwise", () => {
   const a = item("A", { status: "running", actualSecs: 60 });
   const b = item("B", { actualSecs: 3600 });
-  const s = snap(1, [a, b], {
-    itemId: "A",
-    title: "A",
-    segmentStartedAt: "2026-11-11T09:00:00Z",
-    accumulatedSecs: 60,
-  });
+  const s = snap(1, [a, b], runningView("A", "A", 60));
   assert.equal(rowTime(s, a, parseInstantNs("2026-11-11T09:00:05.9Z")), "01:05");
   assert.equal(rowTime(s, a, parseInstantNs("2026-11-11T09:00:06Z")), "01:06");
   assert.equal(rowTime(s, b, parseInstantNs("2026-11-11T09:00:06Z")), "1:00:00");
@@ -225,7 +224,7 @@ test("insert positions: Now and After current only while running, then each pend
   const R = item("R", { status: "running", title: "Run" });
   const P = item("P", { status: "paused", title: "Paused" });
   const D = item("D", { status: "done" });
-  const running = { itemId: "R", title: "Run", segmentStartedAt: "2026-11-11T09:00:00Z", accumulatedSecs: 0 };
+  const running = runningView("R", "Run");
   const s = snap(4, [D, R, F, P, B], running);
   assert.deepEqual(
     insertPositions(s).map((p) => [p.value, p.label, p.anchor]),
@@ -251,7 +250,7 @@ test("insert positions: Now and After current only while running, then each pend
 test("insert positions skip interrupted items", () => {
   const N = item("N", { status: "running", title: "N" });
   const A2 = item("A", { status: "paused", interrupted: true });
-  const running = { itemId: "N", title: "N", segmentStartedAt: "2026-11-11T09:00:00Z", accumulatedSecs: 0 };
+  const running = runningView("N", "N");
   assert.deepEqual(
     insertPositions(snap(3, [N, A2, B], running)).map((p) => p.label),
     ["Now", "After current", "Before \u201cB\u201d", "After \u201cB\u201d", "At end"],
