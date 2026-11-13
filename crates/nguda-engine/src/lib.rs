@@ -178,8 +178,9 @@ pub struct Snapshot {
     /// Today's plan. `None` only before startup finishes (rev 0).
     pub day: Option<Day>,
     pub running: Option<Running>,
-    /// What to do next: the first pending or paused item of `schedule`. Set only
-    /// while nothing runs (AD-11).
+    /// What to do next (`nguda_core::next_task`): the top of the interrupt stack,
+    /// else the first pending or paused item of `schedule`. Set only while nothing
+    /// runs (AD-11).
     pub next_item: Option<NextItem>,
     /// Today's schedule, re-flowed at publish time (`nguda_core::reflow`). Empty
     /// only before startup finishes (rev 0).

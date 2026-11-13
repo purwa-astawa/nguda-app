@@ -6,7 +6,7 @@
 //! actions (Extend +5, Extend +15, Extend…, Switch); an overflow prompt none. Each
 //! `WithdrawNotification` is passed to the notifier; the prompt id stays in
 //! `posted`, so a withdrawn prompt is never re-posted. Failures are logged with
-//! ids and kinds only (AD-14), never titles. `Recovered` needs no rendering yet
+//! ids and kinds only (AD-14), never titles. `Recovered` needs no rendering
 //! and is ignored.
 //!
 //! Actions (AD-15): when it posts, the consumer records the prompt's target, the
@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, watch};
 use crate::tray::{EXTEND_5_SECS, EXTEND_15_SECS, extend_target, switch_target};
 
 /// The item a prompt is about and the rev of the snapshot it was rendered from.
-pub type Target = (ItemId, u64);
+type Target = (ItemId, u64);
 
 /// Targets by prompt, shared between the consumer (which records them when it
 /// posts) and the notifier's action callback (which reads them). The lock is held
@@ -64,7 +64,7 @@ pub enum ActionOutcome {
 
 /// The outcome of `action` on a prompt with `target`: the tray's message shapes,
 /// at the recorded item and rev.
-pub fn action_msg(target: Target, action: PromptAction) -> ActionOutcome {
+fn action_msg(target: Target, action: PromptAction) -> ActionOutcome {
     let (item_id, rev) = target;
     match action {
         PromptAction::Extend5 => ActionOutcome::Send(extend_target(item_id, EXTEND_5_SECS, rev)),
@@ -220,7 +220,10 @@ mod tests {
     use std::time::Duration;
 
     use nguda_adapters::{SqliteStore, SystemClock, UuidV7Ids};
-    use nguda_core::{Date, Day, ItemStatus, NotifierError, OrderKey, PlanItem, TimeZone, Uuid};
+    use nguda_core::{
+        Date, Day, ItemStatus, NotifierError, OrderKey, PlanItem, Running, TimeZone, Timestamp,
+        Uuid,
+    };
     use nguda_engine::{EngineDeps, StatusKey};
     use tokio::time::timeout;
 
@@ -233,23 +236,26 @@ mod tests {
         withdrawn: Mutex<Vec<PromptId>>,
     }
 
-    impl Notifier for FakeNotifier {
-        fn post(&self, n: &Notification) -> Result<(), NotifierError> {
-            self.posted.lock().unwrap().push(n.clone());
+    impl FakeNotifier {
+        /// What every call returns: an error when `fail` is set.
+        fn result(&self) -> Result<(), NotifierError> {
             if self.fail {
                 Err(NotifierError::new("boom"))
             } else {
                 Ok(())
             }
         }
+    }
+
+    impl Notifier for FakeNotifier {
+        fn post(&self, n: &Notification) -> Result<(), NotifierError> {
+            self.posted.lock().unwrap().push(n.clone());
+            self.result()
+        }
 
         fn withdraw(&self, prompt_id: PromptId) -> Result<(), NotifierError> {
             self.withdrawn.lock().unwrap().push(prompt_id);
-            if self.fail {
-                Err(NotifierError::new("boom"))
-            } else {
-                Ok(())
-            }
+            self.result()
         }
     }
 
@@ -282,6 +288,14 @@ mod tests {
             prompt_id: prompt(n),
             item_id: item_id(),
             kind: PromptKind::PlannedEnd,
+        }
+    }
+
+    fn notify_overflow(n: u128) -> Effect {
+        Effect::Notify {
+            prompt_id: prompt(n),
+            item_id: item_id(),
+            kind: PromptKind::Overflow,
         }
     }
 
@@ -372,20 +386,15 @@ mod tests {
     fn an_overflow_prompt_names_the_first_leftover_and_counts_the_rest() {
         let fake = Arc::new(FakeNotifier::default());
         let mut c = Consumer::new(fake.clone(), PromptTargets::default());
-        let overflow = |n: u128| Effect::Notify {
-            prompt_id: prompt(n),
-            item_id: item_id(),
-            kind: PromptKind::Overflow,
-        };
         let mut snap = snapshot();
         snap.overflow = vec![item_id()];
-        c.handle(overflow(1), &snap);
+        c.handle(notify_overflow(1), &snap);
         snap.overflow = vec![
             item_id(),
             ItemId(Uuid::from_u128(2)),
             ItemId(Uuid::from_u128(3)),
         ];
-        c.handle(overflow(2), &snap);
+        c.handle(notify_overflow(2), &snap);
         let titles: Vec<(PromptKind, String)> = fake
             .posted
             .lock()
@@ -519,14 +528,7 @@ mod tests {
         let mut c = Consumer::new(fake.clone(), targets.clone());
         let mut snap = snapshot();
         snap.overflow = vec![item_id()];
-        c.handle(
-            Effect::Notify {
-                prompt_id: prompt(1),
-                item_id: item_id(),
-                kind: PromptKind::Overflow,
-            },
-            &snap,
-        );
+        c.handle(notify_overflow(1), &snap);
         assert!(fake.posted.lock().unwrap()[0].actions.is_empty());
         assert_eq!(resolve(&targets, prompt(1), PromptAction::Extend5), None);
     }
@@ -628,10 +630,10 @@ mod tests {
     #[test]
     fn custom_focuses_the_extend_field_only_while_its_item_runs() {
         let running = |id: ItemId| Snapshot {
-            running: Some(nguda_core::Running {
+            running: Some(Running {
                 item_id: id,
                 title: "Write".into(),
-                segment_started_at: nguda_core::Timestamp::UNIX_EPOCH,
+                segment_started_at: Timestamp::UNIX_EPOCH,
                 accumulated_secs: 0,
             }),
             ..snapshot()

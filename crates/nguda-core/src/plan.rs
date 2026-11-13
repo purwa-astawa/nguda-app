@@ -666,15 +666,7 @@ mod tests {
     use crate::clock::Clock;
     use crate::elapsed::elapsed_secs;
     use crate::reflow::reflow;
-    use crate::test_support::{FakeClock, closed, ts};
-
-    fn id(n: u128) -> ItemId {
-        ItemId(Uuid::from_u128(n))
-    }
-
-    fn key(s: &str) -> OrderKey {
-        OrderKey::new(s).unwrap()
-    }
+    use crate::test_support::{FakeClock, closed, id, key, ts};
 
     fn item(n: u128, order: &str) -> PlanItem {
         PlanItem::new(id(n), format!("item {n}"), 1500, key(order))

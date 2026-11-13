@@ -30,6 +30,11 @@ pub(crate) fn day1() -> Date {
     Date::constant(1970, 1, 1)
 }
 
+/// 1970-01-02 (UTC), the day after [`day1`].
+pub(crate) fn day2() -> Date {
+    Date::constant(1970, 1, 2)
+}
+
 /// Item ids from `SeqIds` start at 1, so seeded items use 100 and up.
 pub(crate) fn item(n: u128, title: &str, order: &str) -> PlanItem {
     PlanItem::new(id(n), title, 600, key(order))
@@ -90,7 +95,7 @@ pub(crate) struct SeqIds {
 }
 
 /// Prompt ids start above this, so they never equal an item id in a test.
-pub(crate) const PROMPT_BASE: u128 = 1 << 64;
+const PROMPT_BASE: u128 = 1 << 64;
 
 /// The `n`th prompt id `SeqIds` mints (1-based).
 pub(crate) fn prompt(n: u128) -> PromptId {

@@ -8,7 +8,7 @@
 use std::fmt;
 
 use nguda_core::{
-    Day, DayLogEntry, DayLogKind, DomainError, IdGen, ItemId, ItemStatus, OrderKey, PlanItem,
+    Date, Day, DayLogEntry, DayLogKind, DomainError, IdGen, ItemId, ItemStatus, OrderKey, PlanItem,
     StoreOp, Timestamp, WorkEnd, closed_secs,
 };
 
@@ -88,6 +88,9 @@ const EXTEND_TASK: &str = "ExtendTask";
 const INSERT_TASK: &str = "InsertTask";
 const SET_WORK_END: &str = "SetWorkEnd";
 pub(crate) const CARRY_OVER: &str = "CarryOverToTomorrow";
+
+/// Why a carry-over with no leftovers is rejected.
+pub(crate) const NOTHING_TO_CARRY_OVER: &str = "nothing to carry over";
 
 /// The message's name, for logs and reject messages.
 pub(crate) fn name(msg: &EngineMsg) -> &'static str {
@@ -246,6 +249,31 @@ fn flexible_in_order(day: &Day) -> Vec<&PlanItem> {
     items
 }
 
+/// The key after the last flexible item of `day`.
+fn after_last_flexible(day: &Day) -> Result<OrderKey, DomainError> {
+    OrderKey::between(flexible_in_order(day).last().map(|i| i.order()), None)
+}
+
+/// The key right after (`after`) or right before `items[at]`, between it and its
+/// neighbour in `items`.
+fn key_next_to(items: &[&PlanItem], at: usize, after: bool) -> Result<OrderKey, DomainError> {
+    let key = |p: usize| items.get(p).map(|i| i.order());
+    let (low, high) = if after {
+        (key(at), key(at + 1))
+    } else {
+        (at.checked_sub(1).and_then(key), key(at))
+    };
+    OrderKey::between(low, high)
+}
+
+/// Appends a `kind` entry at `at` to `date`'s day log.
+pub(crate) fn log_op(date: Date, at: Timestamp, kind: DayLogKind) -> StoreOp {
+    StoreOp::AppendDayLog {
+        date,
+        entry: DayLogEntry { at, kind },
+    }
+}
+
 /// The item `id`, unless it is unknown or removed.
 fn live_item<'d>(
     day: &'d Day,
@@ -286,8 +314,7 @@ fn create_task(
     const CMD: &str = CREATE_TASK;
     check_title(CMD, &title)?;
     check_secs(CMD, planned_secs)?;
-    let last = flexible_in_order(day).last().map(|i| i.order().clone());
-    let order = OrderKey::between(last.as_ref(), None).map_err(domain(CMD))?;
+    let order = after_last_flexible(day).map_err(domain(CMD))?;
     day.add(PlanItem::new(ids.new_item_id(), title, planned_secs, order))
         .map_err(domain(CMD))?;
     Ok(Vec::new())
@@ -359,12 +386,8 @@ fn reorder_task(
         .iter()
         .position(|i| i.id() == anchor_id)
         .expect("anchor is a live flexible item");
-    let key = |p: usize| others.get(p).map(|i| i.order());
-    let (low, high) = match anchor {
-        ReorderAnchor::Before(_) => (at.checked_sub(1).and_then(key), key(at)),
-        ReorderAnchor::After(_) => (key(at), key(at + 1)),
-    };
-    let order = OrderKey::between(low, high).map_err(domain(CMD))?;
+    let after = matches!(anchor, ReorderAnchor::After(_));
+    let order = key_next_to(&others, at, after).map_err(domain(CMD))?;
     day.set_order(item_id, order).map_err(domain(CMD))?;
     Ok(Vec::new())
 }
@@ -404,13 +427,11 @@ fn toggle_fixed(
 
 fn remove_task(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
     day.remove(item_id, now).map_err(domain(REMOVE_TASK))?;
-    Ok(vec![StoreOp::AppendDayLog {
-        date: day.date(),
-        entry: DayLogEntry {
-            at: now,
-            kind: DayLogKind::Removed { item_id },
-        },
-    }])
+    Ok(vec![log_op(
+        day.date(),
+        now,
+        DayLogKind::Removed { item_id },
+    )])
 }
 
 fn start(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
@@ -448,13 +469,11 @@ fn pause(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>,
 /// Finish, start-next and the `Switched` entry, committed as one batch (AD-15).
 fn switch(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
     let to = day.switch(item_id, now).map_err(domain(SWITCH))?;
-    Ok(vec![StoreOp::AppendDayLog {
-        date: day.date(),
-        entry: DayLogEntry {
-            at: now,
-            kind: DayLogKind::Switched { from: item_id, to },
-        },
-    }])
+    Ok(vec![log_op(
+        day.date(),
+        now,
+        DayLogKind::Switched { from: item_id, to },
+    )])
 }
 
 /// The longer planned length and the `Extended` entry, committed as one batch
@@ -479,13 +498,11 @@ fn extend_task(
         ));
     }
     day.extend(item_id, secs).map_err(domain(CMD))?;
-    Ok(vec![StoreOp::AppendDayLog {
-        date: day.date(),
-        entry: DayLogEntry {
-            at: now,
-            kind: DayLogKind::Extended { item_id, secs },
-        },
-    }])
+    Ok(vec![log_op(
+        day.date(),
+        now,
+        DayLogKind::Extended { item_id, secs },
+    )])
 }
 
 /// The key that puts a new item first in the flow: just before the first pending
@@ -531,15 +548,11 @@ fn insert_task(
         .iter()
         .find(|i| i.status() == ItemStatus::Running)
         .map(PlanItem::id);
-    let after_last = |day: &Day| {
-        let all = flexible_in_order(day);
-        OrderKey::between(all.last().map(|i| i.order()), None)
-    };
     let order = match anchor {
-        InsertAnchor::End => after_last(day),
+        InsertAnchor::End => after_last_flexible(day),
         InsertAnchor::Now => match running {
             Some(_) => first_in_flow_key(day),
-            None => after_last(day),
+            None => after_last_flexible(day),
         },
         InsertAnchor::After(id) | InsertAnchor::Before(id) => {
             let target = live_item(day, CMD, id, "anchor")?;
@@ -565,13 +578,7 @@ fn insert_task(
                     .iter()
                     .position(|i| i.id() == id)
                     .expect("anchor is a live flexible item");
-                let key = |p: usize| all.get(p).map(|i| i.order());
-                let (low, high) = if is_after {
-                    (key(at), key(at + 1))
-                } else {
-                    (at.checked_sub(1).and_then(key), key(at))
-                };
-                OrderKey::between(low, high)
+                key_next_to(&all, at, is_after)
             }
         }
     }
@@ -584,13 +591,11 @@ fn insert_task(
         _ => day.add(item),
     }
     .map_err(domain(CMD))?;
-    Ok(vec![StoreOp::AppendDayLog {
-        date: day.date(),
-        entry: DayLogEntry {
-            at: now,
-            kind: DayLogKind::Inserted { item_id },
-        },
-    }])
+    Ok(vec![log_op(
+        day.date(),
+        now,
+        DayLogKind::Inserted { item_id },
+    )])
 }
 
 /// Carries each of `items` (in that order) over from `today` to `tomorrow` (AD-6):
@@ -611,11 +616,8 @@ pub(crate) fn carry_over(
     /// The shortest carried item, so a nearly done leftover still gets a slot.
     const MIN_SECS: u64 = 60;
     if items.is_empty() {
-        return Err(Reject::invalid(CMD, "nothing to carry over"));
+        return Err(Reject::invalid(CMD, NOTHING_TO_CARRY_OVER));
     }
-    let mut last = flexible_in_order(tomorrow)
-        .last()
-        .map(|i| i.order().clone());
     let mut ops = Vec::with_capacity(items.len());
     for &item_id in items {
         let item = today
@@ -628,33 +630,29 @@ pub(crate) fn carry_over(
             .saturating_sub(closed_secs(item.segments()))
             .max(MIN_SECS);
         today.carry_over(item_id).map_err(domain(CMD))?;
-        let order = OrderKey::between(last.as_ref(), None).map_err(domain(CMD))?;
+        // Each carried item is the new last flexible item of `tomorrow`.
+        let order = after_last_flexible(tomorrow).map_err(domain(CMD))?;
         let to = ids.new_item_id();
         tomorrow
-            .add(PlanItem::carried(to, title, left, order.clone(), item_id))
+            .add(PlanItem::carried(to, title, left, order, item_id))
             .map_err(domain(CMD))?;
-        last = Some(order);
-        ops.push(StoreOp::AppendDayLog {
-            date: today.date(),
-            entry: DayLogEntry {
-                at: now,
-                kind: DayLogKind::CarriedOver { item_id, to },
-            },
-        });
+        ops.push(log_op(
+            today.date(),
+            now,
+            DayLogKind::CarriedOver { item_id, to },
+        ));
     }
     Ok(ops)
 }
 
 #[cfg(test)]
 mod tests {
-    use nguda_core::Date;
-
     use super::*;
-    use crate::test_support::{SeqIds, id, key, ts};
+    use crate::test_support::{SeqIds, day1, day2, id, key, ts};
 
     /// Flexible items 100 (A, "U"), 101 (B, "V"), 102 (C, "W").
     fn abc() -> Day {
-        let mut day = Day::new(Date::constant(1970, 1, 1), "UTC");
+        let mut day = Day::new(day1(), "UTC");
         for (n, k) in [(100, "U"), (101, "V"), (102, "W")] {
             day.add(PlanItem::new(id(n), format!("t{n}"), 600, key(k)))
                 .unwrap();
@@ -672,7 +670,7 @@ mod tests {
     #[test]
     fn create_keys_after_the_last_live_flexible_item() {
         let ids = SeqIds::default();
-        let mut empty = Day::new(Date::constant(1970, 1, 1), "UTC");
+        let mut empty = Day::new(day1(), "UTC");
         create_task(&mut empty, &ids, "a".into(), 60).unwrap();
         assert_eq!(
             empty.item(id(1)).unwrap().order(),
@@ -771,7 +769,7 @@ mod tests {
     #[test]
     fn unpinning_onto_a_shared_key_gives_a_fresh_key() {
         let ids = SeqIds::default();
-        let mut day = Day::new(Date::constant(1970, 1, 1), "UTC");
+        let mut day = Day::new(day1(), "UTC");
         create_task(&mut day, &ids, "a".into(), 60).unwrap();
         toggle_fixed(&mut day, id(1), Some(ts(5))).unwrap();
         create_task(&mut day, &ids, "b".into(), 60).unwrap();
@@ -848,7 +846,7 @@ mod tests {
         // 100 paused with 200 s done; 101 pending.
         today.start(id(100), ts(0)).unwrap();
         today.pause(id(100), ts(200)).unwrap();
-        let mut tomorrow = Day::new(Date::constant(1970, 1, 2), "UTC");
+        let mut tomorrow = Day::new(day2(), "UTC");
         tomorrow
             .add(PlanItem::new(id(50), "x", 60, key("V")))
             .unwrap();
@@ -888,7 +886,7 @@ mod tests {
         let mut today = abc();
         today.start(id(100), ts(0)).unwrap();
         today.pause(id(100), ts(10_000)).unwrap();
-        let mut tomorrow = Day::new(Date::constant(1970, 1, 2), "UTC");
+        let mut tomorrow = Day::new(day2(), "UTC");
         carry_over(&mut today, &mut tomorrow, &[id(100)], &ids, ts(9)).unwrap();
         assert_eq!(tomorrow.item(id(1)).unwrap().planned_secs(), 60);
 

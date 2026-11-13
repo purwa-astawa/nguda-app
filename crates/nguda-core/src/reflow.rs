@@ -219,22 +219,16 @@ pub fn reflow(day: &Day, now: Timestamp) -> Schedule {
 mod tests {
     use super::*;
     use crate::clock::Clock;
-    use crate::order::OrderKey;
     use crate::plan::PlanItemRecord;
     use crate::segment::Segment;
-    use crate::test_support::{FakeClock, closed, ts};
-    use uuid::Uuid;
-
-    fn id(n: u128) -> ItemId {
-        ItemId(Uuid::from_u128(n))
-    }
+    use crate::test_support::{FakeClock, closed, id, key, ts};
 
     fn record(n: u128, planned_secs: u64, order: &str) -> PlanItemRecord {
         PlanItemRecord {
             id: id(n),
             title: format!("item {n}"),
             planned_secs,
-            order: OrderKey::new(order).unwrap(),
+            order: key(order),
             fixed: false,
             pinned_start: None,
             status: ItemStatus::Pending,

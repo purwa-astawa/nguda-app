@@ -72,7 +72,7 @@ function App() {
   const [insertAt, setInsertAt] = useState("end");
   // The work-end field's draft; `null` shows the snapshot's value.
   const [workEnd, setWorkEnd] = useState<string | null>(null);
-  // Bumped by the tray's Extend…; the running row focuses its extend field.
+  // Bumped by the tray's or a notification's Extend…; the running row focuses its extend field.
   const [focusExtend, setFocusExtend] = useState(0);
 
   useEffect(() => {

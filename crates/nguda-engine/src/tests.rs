@@ -7,13 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OrderKey, PlanItem, PromptKind,
-    Segment, SlotKind, StoreOp, TimeZone, WorkEnd,
+    Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OrderKey, PlanItem, PromptKind, Segment,
+    SlotKind, StoreOp, TimeZone, WorkEnd,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::test_support::{
-    FakeClock, INJECTED, MemoryStore, SeqIds, day_running_other, day1, id, item, key, prompt, ts,
+    FakeClock, INJECTED, MemoryStore, SeqIds, day_running_other, day1, day2, id, item, key, prompt,
+    ts,
 };
 use crate::{
     Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, InsertAnchor, NextItem,
@@ -21,10 +22,6 @@ use crate::{
 };
 
 const DAY_SECS: i64 = 86_400;
-
-fn day2() -> Date {
-    Date::constant(1970, 1, 2)
-}
 
 fn closed(from: i64, to: i64) -> Segment {
     Segment {
@@ -298,7 +295,7 @@ async fn reorder_before_the_first_item_moves_it_to_the_front() {
     h.send(reorder(102, ReorderAnchor::Before(id(100)), 1));
     let snap = h.rev(2).await;
     assert_eq!(ids_in_order(&snap), vec![id(102), id(100), id(101)]);
-    assert!(day_of(&snap).item(id(102)).unwrap().order() < &OrderKey::new("U").unwrap());
+    assert!(day_of(&snap).item(id(102)).unwrap().order() < &key("U"));
     assert!(snap.status.is_empty());
     assert_eq!(store.stored_day(day1()), snap.day);
     assert_eq!(store.batches().len(), 2);
@@ -310,7 +307,7 @@ async fn reorder_after_the_last_item_keys_it_after() {
     h.send(reorder(100, ReorderAnchor::After(id(102)), 1));
     let snap = h.rev(2).await;
     assert_eq!(ids_in_order(&snap), vec![id(101), id(102), id(100)]);
-    assert!(day_of(&snap).item(id(100)).unwrap().order() > &OrderKey::new("W").unwrap());
+    assert!(day_of(&snap).item(id(100)).unwrap().order() > &key("W"));
     assert_eq!(store.stored_day(day1()), snap.day);
 }
 

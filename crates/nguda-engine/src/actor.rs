@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Date, Day, DayLogEntry, DayLogKind, IdGen, ItemId, OpenSegmentRef, PlanItem, PromptId,
-    PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
-    WorkEnd, next_task, reflow,
+    Clock, Date, Day, DayLogKind, IdGen, ItemId, OpenSegmentRef, PlanItem, PromptId, PromptKind,
+    Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp, WorkEnd,
+    reflow,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -209,15 +209,13 @@ impl Actor {
             return day;
         }
         let mut batch = diff(&day, &next);
-        batch.push(StoreOp::AppendDayLog {
-            date: segment.date,
-            entry: DayLogEntry {
-                at: now,
-                kind: DayLogKind::Recovered {
-                    item_id: segment.item_id,
-                },
+        batch.push(commands::log_op(
+            segment.date,
+            now,
+            DayLogKind::Recovered {
+                item_id: segment.item_id,
             },
-        });
+        ));
         batch.push(StoreOp::SetLastAlive { at: now });
         if !self.commit(batch).await {
             return day;
@@ -338,7 +336,11 @@ impl Actor {
             return false;
         }
         if self.overflow.is_empty() {
-            self.reject(CMD, None, &Reject::invalid(CMD, "nothing to carry over"));
+            self.reject(
+                CMD,
+                None,
+                &Reject::invalid(CMD, commands::NOTHING_TO_CARRY_OVER),
+            );
             return false;
         }
         let Ok(date) = self.day.date().tomorrow() else {
@@ -607,15 +609,13 @@ fn running_of(day: &Day) -> Option<Running> {
     day.items().iter().find_map(PlanItem::running_view)
 }
 
-/// The next item to show while nothing runs: [`next_task`], so the top of the
+/// The next item to show while nothing runs: [`Day::next_item`], so the top of the
 /// interrupt stack, else the schedule's first pending or paused item.
 fn next_item_of(day: &Day, now: Timestamp) -> Option<NextItem> {
-    next_task(day, now)
-        .and_then(|id| day.item(id))
-        .map(|i| NextItem {
-            item_id: i.id(),
-            title: i.title().to_owned(),
-        })
+    day.next_item(now).map(|i| NextItem {
+        item_id: i.id(),
+        title: i.title().to_owned(),
+    })
 }
 
 fn today(now: Timestamp, tz: &TimeZone) -> Date {

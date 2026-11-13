@@ -86,7 +86,7 @@ impl Action {
 
 /// [`Targets`] as managed state; the lock is held only to copy in or out.
 #[derive(Default)]
-pub struct MenuTargets(Mutex<Targets>);
+struct MenuTargets(Mutex<Targets>);
 
 impl MenuTargets {
     fn set(&self, targets: Targets) {

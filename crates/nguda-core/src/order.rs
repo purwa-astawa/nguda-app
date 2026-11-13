@@ -108,10 +108,7 @@ fn midpoint(a: &[u8], b: Option<&[u8]>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn key(s: &str) -> OrderKey {
-        OrderKey::new(s).unwrap()
-    }
+    use crate::test_support::key;
 
     fn between(a: Option<&str>, b: Option<&str>) -> OrderKey {
         let (a, b) = (a.map(key), b.map(key));

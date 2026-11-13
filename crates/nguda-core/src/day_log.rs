@@ -11,7 +11,7 @@ pub struct DayLogEntry {
     pub kind: DayLogKind,
 }
 
-/// What happened. Later kinds (inserted, carried over, ...) join here.
+/// What happened. Later kinds join here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DayLogKind {
     /// An open segment left by a crash was closed at the last heartbeat.
