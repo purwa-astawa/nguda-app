@@ -6,11 +6,12 @@ use nguda_core::{Day, StoreBatch, StoreOp};
 /// single-open-segment index never sees two open rows:
 ///
 /// 1. `PutDay` (always; an idempotent upsert),
-/// 2. `PutItem` for each new or changed item,
-/// 3. `CloseSegment` for each segment open in `old` and closed in `new`,
-/// 4. each segment new in `new`: closed ones first (open then close), then the open
+/// 2. `SetLockDecision` when the lock decision changed,
+/// 3. `PutItem` for each new or changed item,
+/// 4. `CloseSegment` for each segment open in `old` and closed in `new`,
+/// 5. each segment new in `new`: closed ones first (open then close), then the open
 ///    one,
-/// 5. `SetInterruptStack` when the interrupt stack changed.
+/// 6. `SetInterruptStack` when the interrupt stack changed.
 ///
 /// Callers append their extra ops (day log, heartbeat) after these.
 pub(crate) fn diff(old: &Day, new: &Day) -> StoreBatch {
@@ -23,6 +24,12 @@ pub(crate) fn diff(old: &Day, new: &Day) -> StoreBatch {
         date: new.date(),
         tz: new.tz().to_owned(),
     });
+    if old.lock_decision() != new.lock_decision() {
+        batch.push(StoreOp::SetLockDecision {
+            date: new.date(),
+            decision: new.lock_decision(),
+        });
+    }
 
     for item in new.items() {
         if old.item(item.id()) != Some(item) {
@@ -92,6 +99,8 @@ pub(crate) fn diff(old: &Day, new: &Day) -> StoreBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nguda_core::{LockChoice, LockDecision};
+
     use crate::test_support::{day_running_other, day1, id, item, ts};
 
     fn ops(batch: &StoreBatch) -> Vec<StoreOp> {
@@ -225,6 +234,34 @@ mod tests {
         assert_eq!(
             ops(&diff(&new, &renamed)),
             vec![put_day(), put(&renamed, 100)]
+        );
+    }
+
+    #[test]
+    fn diff_sets_the_lock_decision_right_after_put_day_when_it_changed() {
+        let mut old = Day::new(day1(), "UTC");
+        old.add(item(1, "a", "V")).unwrap();
+        let mut new = old.clone();
+        new.start(id(1), ts(10)).unwrap();
+        new.decide_lock(LockChoice::Lock).unwrap();
+        assert_eq!(
+            ops(&diff(&old, &new)),
+            vec![
+                put_day(),
+                StoreOp::SetLockDecision {
+                    date: day1(),
+                    decision: LockDecision::Locked,
+                },
+                put(&new, 1),
+                open_op(1, 10),
+            ]
+        );
+        // An unchanged decision writes nothing.
+        let mut renamed = new.clone();
+        renamed.set_title(id(1), "x").unwrap();
+        assert_eq!(
+            ops(&diff(&new, &renamed)),
+            vec![put_day(), put(&renamed, 1)]
         );
     }
 

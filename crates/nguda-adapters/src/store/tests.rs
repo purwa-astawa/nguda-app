@@ -3,14 +3,14 @@
 use std::path::{Path, PathBuf};
 
 use nguda_core::{
-    Day, DayLogEntry, DayLogKind, ItemId, OpenSegmentRef, OrderKey, PlanItem, Settings, Store,
-    StoreBatch, StoreOp, Timestamp, Uuid, WorkEnd,
+    Baseline, BaselineItem, Day, DayLogEntry, DayLogKind, ItemId, LockDecision, OpenSegmentRef,
+    OrderKey, PlanItem, Settings, Span, Store, StoreBatch, StoreOp, Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
 use tempfile::TempDir;
 
-use super::schema::V1_SQL;
+use super::schema::{V1_SQL, migrations_through};
 use super::{OpenError, SqliteStore, backup_path};
 
 const TITLE: &str = "private title";
@@ -191,12 +191,14 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 7);
+    assert_eq!(user_version(&path), 8);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
     assert!(has_table(&path, "interrupt_entry"));
     assert!(has_table(&path, "settings"));
+    assert!(has_table(&path, "baseline"));
+    assert!(has_table(&path, "baseline_item"));
     assert!(backups(&dir).is_empty());
 }
 
@@ -276,7 +278,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     // connection: a read-write open closing it would checkpoint them.
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-    raw.pragma_update(None, "user_version", 8).unwrap();
+    raw.pragma_update(None, "user_version", 9).unwrap();
     let copy = dir.path().join("newer.db");
     let wal = |p: &Path| PathBuf::from(format!("{}-wal", p.display()));
     std::fs::copy(&path, &copy).unwrap();
@@ -291,14 +293,14 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     assert_eq!(
         err,
         OpenError::NewerSchema {
-            found: 8,
-            supported: 7
+            found: 9,
+            supported: 8
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read(wal(&path)).unwrap(), wal_before);
     assert!(backups(&dir).is_empty());
-    assert_eq!(user_version(&path), 8);
+    assert_eq!(user_version(&path), 9);
 }
 
 #[tokio::test]
@@ -488,7 +490,10 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(user_version(&path), 1);
 
     let store = SqliteStore::open(&path).unwrap();
-    assert_eq!(store.load_day(date()).await.unwrap(), Some(sample_day()));
+    // The sample day has time on it, so v8 decides it `no_lock`.
+    let mut expected = sample_day();
+    expected.restore_lock_decision(LockDecision::NoLock);
+    assert_eq!(store.load_day(date()).await.unwrap(), Some(expected));
     assert_eq!(store.last_alive_at().await.unwrap(), None);
     assert_eq!(store.load_day_log(date()).await.unwrap(), vec![]);
     drop(store);
@@ -497,7 +502,7 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 7);
+    assert_eq!(user_version(&path), 8);
     assert!(has_table(&path, "engine_meta"));
 }
 
@@ -995,4 +1000,216 @@ async fn a_carried_over_entry_without_a_target_fails_the_load() {
     let store = SqliteStore::open(&path).unwrap();
     let err = store.load_day_log(date()).await.unwrap_err();
     assert!(err.message.contains("missing to_item_id"), "{err}");
+}
+
+// --- Day lock and baseline ---
+
+fn set_decision(decision: LockDecision) -> StoreOp {
+    StoreOp::SetLockDecision {
+        date: date(),
+        decision,
+    }
+}
+
+/// A baseline of `sample_day` at `locked_at`: the running item with a span, then
+/// the done one without.
+fn sample_baseline(locked_at: i64) -> Baseline {
+    Baseline {
+        date: date(),
+        locked_at: ts(locked_at),
+        items: vec![
+            BaselineItem {
+                item_id: id(1),
+                planned_secs: 1500,
+                span: Some(Span {
+                    start: ts(500),
+                    end: ts(1_900),
+                }),
+            },
+            BaselineItem {
+                item_id: id(4),
+                planned_secs: 1500,
+                span: None,
+            },
+        ],
+    }
+}
+
+#[tokio::test]
+async fn the_lock_decision_and_baseline_round_trip_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    assert_eq!(store.load_baseline(date()).await.unwrap(), None);
+    store
+        .commit(batch([
+            set_decision(LockDecision::Locked),
+            StoreOp::PutBaseline {
+                baseline: sample_baseline(700),
+            },
+        ]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let day = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(day.lock_decision(), LockDecision::Locked);
+    assert_eq!(
+        store.load_baseline(date()).await.unwrap(),
+        Some(sample_baseline(700))
+    );
+    assert_eq!(store.load_baseline(other_date()).await.unwrap(), None);
+    // An undecided day loads `None`, and NoLock round-trips too.
+    store
+        .commit(batch([StoreOp::PutDay {
+            date: other_date(),
+            tz: "UTC".into(),
+        }]))
+        .await
+        .unwrap();
+    let other = store.load_day(other_date()).await.unwrap().unwrap();
+    assert_eq!(other.lock_decision(), LockDecision::None);
+    store
+        .commit(batch([StoreOp::SetLockDecision {
+            date: other_date(),
+            decision: LockDecision::NoLock,
+        }]))
+        .await
+        .unwrap();
+    let other = store.load_day(other_date()).await.unwrap().unwrap();
+    assert_eq!(other.lock_decision(), LockDecision::NoLock);
+}
+
+#[tokio::test]
+async fn a_second_baseline_for_a_date_rolls_back_the_whole_batch() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    store
+        .commit(batch([StoreOp::PutBaseline {
+            baseline: sample_baseline(700),
+        }]))
+        .await
+        .unwrap();
+    let err = store
+        .commit(batch([
+            set_decision(LockDecision::Locked),
+            StoreOp::PutBaseline {
+                baseline: sample_baseline(900),
+            },
+        ]))
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("put baseline"), "{err}");
+    assert!(!err.message.contains(TITLE));
+    assert_eq!(
+        store.load_baseline(date()).await.unwrap(),
+        Some(sample_baseline(700))
+    );
+    let day = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(day.lock_decision(), LockDecision::None, "rolled back");
+}
+
+#[tokio::test]
+async fn a_baseline_of_an_unknown_day_or_item_rolls_back() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let mut unknown_item = sample_baseline(700);
+    unknown_item.items[1].item_id = id(99);
+    let mut unknown_day = sample_baseline(700);
+    unknown_day.date = other_date();
+    for baseline in [unknown_item, unknown_day] {
+        assert!(
+            store
+                .commit(batch([StoreOp::PutBaseline { baseline }]))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(store.load_baseline(date()).await.unwrap(), None);
+    // A decision for an unknown day is refused too.
+    let err = store
+        .commit(batch([StoreOp::SetLockDecision {
+            date: other_date(),
+            decision: LockDecision::Locked,
+        }]))
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("no such day"), "{err}");
+}
+
+#[tokio::test]
+async fn the_stored_baseline_refuses_updates_and_deletes() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    store
+        .commit(batch([StoreOp::PutBaseline {
+            baseline: sample_baseline(700),
+        }]))
+        .await
+        .unwrap();
+    drop(store);
+    let conn = Connection::open(&path).unwrap();
+    for sql in [
+        "UPDATE baseline SET locked_at = 0",
+        "DELETE FROM baseline",
+        "UPDATE baseline_item SET planned_secs = 1",
+        "DELETE FROM baseline_item",
+    ] {
+        let err = conn.execute(sql, []).unwrap_err();
+        assert!(err.to_string().contains("write-once"), "{sql}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn v8_decides_days_with_time_no_lock_and_leaves_the_rest_undecided() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let v7 = SqliteStore::open_with(&path, &migrations_through(7)).unwrap();
+    v7.commit(batch_for(&sample_day())).await.unwrap();
+    let mut idle = Day::new(other_date(), "UTC");
+    idle.add(item(10, "V")).unwrap();
+    v7.commit(batch_for(&idle)).await.unwrap();
+    drop(v7);
+    assert_eq!(user_version(&path), 7);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let started = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(started.lock_decision(), LockDecision::NoLock);
+    let untouched = store.load_day(other_date()).await.unwrap().unwrap();
+    assert_eq!(untouched.lock_decision(), LockDecision::None);
+    assert_eq!(store.load_baseline(date()).await.unwrap(), None);
+    drop(store);
+    assert_eq!(user_version(&path), 8);
+    assert_eq!(backups(&dir), vec![backup_path(&path, 7)]);
+}
+
+#[tokio::test]
+async fn a_second_lock_decision_fails_and_rolls_back_its_batch() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    store
+        .commit(batch([set_decision(LockDecision::NoLock)]))
+        .await
+        .unwrap();
+    let err = store
+        .commit(batch([
+            set_decision(LockDecision::Locked),
+            StoreOp::PutBaseline {
+                baseline: sample_baseline(700),
+            },
+        ]))
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("already decided"), "{err}");
+    let day = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(day.lock_decision(), LockDecision::NoLock);
+    assert_eq!(
+        store.load_baseline(date()).await.unwrap(),
+        None,
+        "rolled back"
+    );
 }

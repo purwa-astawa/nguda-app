@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, OrderKey, PlanItem, PromptKind, Segment,
-    SlotKind, StoreOp, TimeZone, WorkEnd,
+    Baseline, BaselineItem, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, LockChoice,
+    LockDecision, OrderKey, PlanItem, PromptKind, Segment, SlotKind, StoreOp, TimeZone, WorkEnd,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::test_support::{
-    FakeClock, INJECTED, MemoryStore, SeqIds, day_running_other, day1, day2, id, item, key, prompt,
-    ts,
+    FakeClock, INJECTED, MemoryStore, SeqIds, day_running_other, day1, day2, id, item, key,
+    no_lock, prompt, ts,
 };
 use crate::{
     Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, InsertAnchor, NextItem,
@@ -107,10 +107,21 @@ fn create(title: &str, planned_secs: u64) -> EngineMsg {
     }
 }
 
+/// A choiceless Start, for a decided day.
 fn start_msg(n: u128, expected_rev: u64) -> EngineMsg {
     EngineMsg::Start {
         item_id: id(n),
         expected_rev,
+        lock: None,
+    }
+}
+
+/// A Start carrying `lock`, for an undecided day.
+fn start_with(n: u128, expected_rev: u64, lock: LockChoice) -> EngineMsg {
+    EngineMsg::Start {
+        item_id: id(n),
+        expected_rev,
+        lock: Some(lock),
     }
 }
 
@@ -159,7 +170,7 @@ async fn fresh_start_publishes_an_empty_today_at_rev_1() {
 #[tokio::test]
 async fn existing_day_is_loaded_into_rev_1() {
     let (clock, store) = (FakeClock::at(1_000), MemoryStore::new());
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(item(100, "write", "V")).unwrap();
     day.add(item(101, "read", "W")).unwrap();
     day.start(id(101), ts(10)).unwrap();
@@ -213,7 +224,7 @@ async fn create_task_with_a_blank_title_or_zero_secs_is_rejected() {
 }
 
 fn abc_day() -> Day {
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(item(100, "A", "U")).unwrap();
     day.add(item(101, "B", "V")).unwrap();
     day.add(item(102, "C", "W")).unwrap();
@@ -579,7 +590,7 @@ async fn next_item_is_published_only_while_nothing_runs() {
     });
     assert_eq!(snap.next_item, next_a);
 
-    h.send(start_msg(1, 2));
+    h.send(start_with(1, 2, LockChoice::NoLock));
     let snap = h.rev(3).await;
     assert!(snap.running.is_some());
     assert_eq!(snap.next_item, None);
@@ -654,7 +665,7 @@ async fn a_failing_commit_keeps_the_state_and_sets_store_status_until_a_success(
     let snap = h.rev(4).await;
     assert!(snap.status.is_empty());
     // The failed attempt used id 1.
-    h.send(start_msg(2, 4));
+    h.send(start_with(2, 4, LockChoice::NoLock));
     let snap = h.rev(5).await;
     assert_eq!(snap.running.unwrap().segment_started_at, ts(1_005));
 }
@@ -802,7 +813,7 @@ async fn a_failed_startup_load_yields_an_empty_today_with_store_status() {
 async fn a_failed_load_of_today_alone_yields_an_empty_today_with_store_status() {
     // No open segment, so the recovery reads succeed; only `load_day(today)` fails.
     let (clock, store) = (FakeClock::at(5_000), MemoryStore::new());
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(item(100, "stored", "V")).unwrap();
     store.seed(&day);
     store.fail_load_day(true);
@@ -906,7 +917,7 @@ impl Harness {
 
 /// Item 100 "A" planned 60 s and item 101 "B" planned 600 s, both pending.
 fn short_day() -> Day {
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(PlanItem::new(id(100), "A", 60, key("U"))).unwrap();
     day.add(item(101, "B", "V")).unwrap();
     day
@@ -950,7 +961,7 @@ async fn planned_end_emits_exactly_one_notify_and_keeps_the_item_running() {
 
 #[tokio::test]
 async fn a_planned_end_between_heartbeats_notifies_without_committing() {
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(PlanItem::new(id(100), "A", 30, key("U"))).unwrap();
     let (mut h, store) = started_a(&day).await;
     let before = h.rx.borrow().clone();
@@ -1097,7 +1108,7 @@ async fn switch_resumes_a_paused_next_item() {
 
 #[tokio::test]
 async fn switch_with_nothing_left_finishes_and_logs_no_target() {
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(item(100, "A", "U")).unwrap();
     day.add(item(101, "B", "V")).unwrap();
     day.remove(id(101), ts(5)).unwrap();
@@ -1290,7 +1301,7 @@ async fn extend_shifts_later_flexible_items_and_logs_in_one_batch() {
 #[tokio::test]
 async fn extend_keeps_a_fixed_item_in_place_and_flows_flexible_past_it() {
     // R 600 s, A flexible 300 s, F fixed at 1_900 for 300 s.
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(item(100, "R", "U")).unwrap();
     day.add(PlanItem::new(id(101), "A", 300, key("V"))).unwrap();
     day.add(PlanItem::new(id(102), "F", 300, key("W"))).unwrap();
@@ -1436,6 +1447,7 @@ fn insert_msg(
         planned_secs,
         anchor,
         expected_rev,
+        lock: None,
     }
 }
 
@@ -1801,7 +1813,7 @@ fn overflow_status(snap: &Snapshot) -> Option<&str> {
 /// A (100, 15 min) running from 16:00 at rev 2 and B (101, 40 min) pending, so B
 /// ends at 16:55, just inside work-end.
 async fn a_running_at_four() -> (Harness, Arc<MemoryStore>) {
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(PlanItem::new(id(100), "A", 900, key("U"))).unwrap();
     day.add(PlanItem::new(id(101), "B", 2_400, key("V")))
         .unwrap();
@@ -1905,7 +1917,7 @@ async fn a_later_work_end_clears_and_an_earlier_one_opens_a_new_episode() {
 #[tokio::test]
 async fn time_passing_alone_opens_an_episode_at_a_heartbeat() {
     // Nothing runs: A flows from now and ends 16:59.
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(item(100, "A", "U")).unwrap();
     let start_at = WORK_END - 660;
     let (mut h, _store) = running_on(start_at, Some(&day)).await;
@@ -2034,7 +2046,7 @@ async fn a_started_at_four(day: &Day) -> (Harness, Arc<MemoryStore>) {
 /// 30 min) pending, ending 17:25 and 17:55: overflow [B, C], episode prompt 1.
 /// Today's zone is `tz`.
 async fn leftovers(tz: &str) -> (Harness, Arc<MemoryStore>) {
-    let mut day = Day::new(day1(), tz);
+    let mut day = no_lock(Day::new(day1(), tz));
     day.add(PlanItem::new(id(100), "A", 2_700, key("U")))
         .unwrap();
     day.add(PlanItem::new(id(101), "B", 2_400, key("V")))
@@ -2087,7 +2099,7 @@ async fn carry_over_moves_the_leftovers_to_a_new_tomorrow_in_one_batch() {
 
 #[tokio::test]
 async fn a_paused_leftover_carries_only_its_remaining_time() {
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(PlanItem::new(id(100), "A", 2_700, key("U")))
         .unwrap();
     day.add(PlanItem::new(id(101), "P", 2_400, key("V")))
@@ -2200,7 +2212,7 @@ async fn midnight_rolls_over_to_the_day_holding_the_carried_items() {
 
 #[tokio::test]
 async fn an_item_running_at_midnight_keeps_its_day_until_it_stops() {
-    let mut day = Day::new(day1(), "UTC");
+    let mut day = no_lock(Day::new(day1(), "UTC"));
     day.add(PlanItem::new(id(100), "A", 3_600, key("U")))
         .unwrap();
     let (mut h, store) = running_on(MIDNIGHT - 1_800, Some(&day)).await;
@@ -2263,4 +2275,360 @@ async fn carried_items_load_with_their_link_after_a_restart() {
     assert_eq!(today.date(), day2());
     assert_eq!(today.item(id(1)).unwrap().carried_from(), Some(id(101)));
     assert_eq!(today.item(id(2)).unwrap().carried_from(), Some(id(102)));
+}
+
+// --- Day lock and frozen baseline ---
+
+/// Flexible items 100 (A, "U"), 101 (B, "V"), 102 (C, "W"), 600 s each, on an
+/// undecided day.
+fn undecided_abc() -> Day {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(item(100, "A", "U")).unwrap();
+    day.add(item(101, "B", "V")).unwrap();
+    day.add(item(102, "C", "W")).unwrap();
+    day
+}
+
+fn locked(mut day: Day) -> Day {
+    day.decide_lock(LockChoice::Lock).unwrap();
+    day
+}
+
+fn frozen(n: u128, planned_secs: u64, from: i64, to: i64) -> BaselineItem {
+    BaselineItem {
+        item_id: id(n),
+        planned_secs,
+        span: Some(nguda_core::Span {
+            start: ts(from),
+            end: ts(to),
+        }),
+    }
+}
+
+fn insert_now_with(title: &str, expected_rev: u64, lock: Option<LockChoice>) -> EngineMsg {
+    EngineMsg::InsertTask {
+        title: title.into(),
+        planned_secs: 300,
+        anchor: InsertAnchor::Now,
+        expected_rev,
+        lock,
+    }
+}
+
+/// The last committed batch's ops.
+fn last_batch(store: &MemoryStore) -> Vec<StoreOp> {
+    store.batches().last().unwrap().ops().to_vec()
+}
+
+fn is_baseline(op: &StoreOp) -> bool {
+    matches!(op, StoreOp::PutBaseline { .. })
+}
+
+#[tokio::test]
+async fn lock_day_locks_and_freezes_every_live_item_without_starting() {
+    let mut day = undecided_abc();
+    day.add(item(103, "D", "X")).unwrap();
+    day.remove(id(101), ts(5)).unwrap();
+    day.carry_over(id(102)).unwrap();
+    let (mut h, store) = running_on(1_000, Some(&day)).await;
+    h.send(EngineMsg::LockDay { expected_rev: 1 });
+    let snap = h.rev(2).await;
+    assert_eq!(rejected(&snap), None);
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::Locked);
+    assert_eq!(snap.running, None);
+    let expected = Baseline {
+        date: day1(),
+        locked_at: ts(1_000),
+        items: vec![
+            frozen(100, 600, 1_000, 1_600),
+            frozen(103, 600, 1_600, 2_200),
+        ],
+    };
+    assert_eq!(store.stored_baseline(day1()), Some(expected.clone()));
+    assert_eq!(
+        last_batch(&store),
+        vec![
+            StoreOp::PutDay {
+                date: day1(),
+                tz: "UTC".into(),
+            },
+            StoreOp::SetLockDecision {
+                date: day1(),
+                decision: LockDecision::Locked,
+            },
+            StoreOp::PutBaseline { baseline: expected },
+        ]
+    );
+    assert!(
+        store.day_log(day1()).is_empty(),
+        "no day-log kind for locking"
+    );
+    assert_eq!(store.stored_day(day1()), snap.day);
+}
+
+#[tokio::test]
+async fn lock_day_on_an_empty_day_freezes_an_empty_baseline() {
+    let (mut h, store) = running_on(1_000, None).await;
+    h.send(EngineMsg::LockDay { expected_rev: 1 });
+    let snap = h.rev(2).await;
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::Locked);
+    assert_eq!(store.stored_baseline(day1()).unwrap().items, vec![]);
+}
+
+#[tokio::test]
+async fn lock_and_start_starts_the_item_and_freezes_the_day_after_the_start() {
+    let (mut h, store) = running_on(1_000, Some(&undecided_abc())).await;
+    h.send(start_with(101, 1, LockChoice::Lock));
+    let snap = h.rev(2).await;
+    assert_eq!(rejected(&snap), None);
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(101));
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::Locked);
+    assert_eq!(
+        store.stored_baseline(day1()).unwrap().items,
+        vec![
+            frozen(101, 600, 1_000, 1_600),
+            frozen(100, 600, 1_600, 2_200),
+            frozen(102, 600, 2_200, 2_800),
+        ]
+    );
+    let ops = last_batch(&store);
+    assert!(ops.contains(&StoreOp::OpenSegment {
+        item_id: id(101),
+        started_at: ts(1_000),
+    }));
+    assert!(is_baseline(ops.last().unwrap()), "one batch, baseline last");
+    assert_eq!(store.stored_day(day1()), snap.day);
+}
+
+#[tokio::test]
+async fn start_without_lock_starts_the_item_and_freezes_nothing() {
+    let (mut h, store) = running_on(1_000, Some(&undecided_abc())).await;
+    h.send(start_with(100, 1, LockChoice::NoLock));
+    let snap = h.rev(2).await;
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(100));
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::NoLock);
+    assert_eq!(store.stored_baseline(day1()), None);
+    assert!(!last_batch(&store).iter().any(is_baseline));
+    assert_eq!(store.stored_day(day1()), snap.day);
+}
+
+#[tokio::test]
+async fn insert_now_with_lock_starts_the_new_item_and_freezes_it_in() {
+    let (mut h, store) = running_on(1_000, Some(&undecided_abc())).await;
+    h.send(insert_now_with("N", 1, Some(LockChoice::Lock)));
+    let snap = h.rev(2).await;
+    assert_eq!(rejected(&snap), None);
+    assert_eq!(snap.running.as_ref().unwrap().item_id, id(1));
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::Locked);
+    assert_eq!(
+        store.stored_baseline(day1()).unwrap().items,
+        vec![
+            frozen(1, 300, 1_000, 1_300),
+            frozen(100, 600, 1_300, 1_900),
+            frozen(101, 600, 1_900, 2_500),
+            frozen(102, 600, 2_500, 3_100),
+        ]
+    );
+    let ops = last_batch(&store);
+    assert!(is_baseline(ops.last().unwrap()));
+    assert!(ops.contains(&StoreOp::AppendDayLog {
+        date: day1(),
+        entry: inserted_at(1, 1_000),
+    }));
+}
+
+#[tokio::test]
+async fn a_choiceless_start_on_an_undecided_day_is_rejected_and_asks_for_a_choice() {
+    let (mut h, store) = running_on(1_000, Some(&undecided_abc())).await;
+    let snap = expect_rejected(&mut h, &store, start_msg(100, 1), 2).await;
+    assert_eq!(rejected(&snap), Some("Start: the day's lock is undecided"));
+    assert_eq!(snap.running, None);
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::None);
+    assert_eq!(
+        h.next_effect().await,
+        Effect::AskLockOnStart { item_id: id(100) }
+    );
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn a_choiceless_insert_now_on_an_undecided_day_is_rejected_without_an_effect() {
+    let (mut h, store) = running_on(1_000, Some(&undecided_abc())).await;
+    let snap = expect_rejected(&mut h, &store, insert_now_with("N", 1, None), 2).await;
+    assert_eq!(
+        rejected(&snap),
+        Some("InsertTask: the day's lock is undecided")
+    );
+    assert_eq!(day_of(&snap).items().len(), 3);
+    h.expect_no_effect().await;
+}
+
+#[tokio::test]
+async fn a_lock_choice_or_lock_day_on_a_decided_day_is_rejected() {
+    for day in [locked(undecided_abc()), no_lock(undecided_abc())] {
+        let (mut h, store) = running_on(1_000, Some(&day)).await;
+        let msgs = [
+            start_with(100, 1, LockChoice::Lock),
+            start_with(100, 2, LockChoice::NoLock),
+            insert_now_with("N", 3, Some(LockChoice::Lock)),
+            EngineMsg::LockDay { expected_rev: 4 },
+        ];
+        for (rev, msg) in (2..).zip(msgs) {
+            let snap = expect_rejected(&mut h, &store, msg, rev).await;
+            assert!(
+                rejected(&snap)
+                    .unwrap()
+                    .ends_with(": the day's lock is already decided"),
+                "{:?}",
+                rejected(&snap)
+            );
+        }
+        assert_eq!(store.stored_day(day1()), Some(day));
+        assert_eq!(store.stored_baseline(day1()), None);
+        h.expect_no_effect().await;
+    }
+}
+
+#[tokio::test]
+async fn a_lock_choice_with_an_anchor_other_than_now_is_invalid_input() {
+    let (mut h, store) = running_on(1_000, Some(&undecided_abc())).await;
+    for (rev, anchor) in (1..).zip([InsertAnchor::End, InsertAnchor::After(id(100))]) {
+        let msg = EngineMsg::InsertTask {
+            title: "N".into(),
+            planned_secs: 300,
+            anchor,
+            expected_rev: rev,
+            lock: Some(LockChoice::Lock),
+        };
+        let snap = expect_rejected(&mut h, &store, msg, rev + 1).await;
+        assert_eq!(
+            rejected(&snap),
+            Some("InsertTask: a lock choice needs the Now anchor")
+        );
+        assert_eq!(day_of(&snap).lock_decision(), LockDecision::None);
+    }
+}
+
+#[tokio::test]
+async fn a_choiceless_start_and_insert_work_as_before_on_a_decided_day() {
+    for day in [locked(undecided_abc()), no_lock(undecided_abc())] {
+        let decision = day.lock_decision();
+        let (mut h, store) = running_on(1_000, Some(&day)).await;
+        h.send(start_msg(100, 1));
+        let snap = h.rev(2).await;
+        assert_eq!(rejected(&snap), None);
+        assert_eq!(snap.running.as_ref().unwrap().item_id, id(100));
+        h.send(insert_now_with("N", 2, None));
+        let snap = h.rev(3).await;
+        assert_eq!(rejected(&snap), None);
+        assert_eq!(snap.running.as_ref().unwrap().item_id, id(1));
+        assert_eq!(day_of(&snap).lock_decision(), decision);
+        assert!(
+            !store
+                .batches()
+                .iter()
+                .any(|b| b.ops().iter().any(is_baseline))
+        );
+    }
+}
+
+#[tokio::test]
+async fn later_edits_change_the_plan_but_never_the_baseline() {
+    let (mut h, store) = running_on(1_000, Some(&undecided_abc())).await;
+    h.send(start_with(100, 1, LockChoice::Lock));
+    h.rev(2).await;
+    let frozen_at_lock = store.stored_baseline(day1()).unwrap();
+    h.send(extend_msg(100, 300, 2));
+    h.rev(3).await;
+    h.send(insert_msg("N", 300, InsertAnchor::End, 3));
+    h.rev(4).await;
+    h.send(EngineMsg::RemoveTask { item_id: id(102) });
+    h.rev(5).await;
+    // Midnight is work-end, so every pending item is a leftover.
+    h.send(set_work_end(0));
+    let snap = h.rev(6).await;
+    assert_eq!(snap.overflow, vec![id(101), id(1)]);
+    h.send(carry(6));
+    let snap = h.rev(7).await;
+    assert_eq!(rejected(&snap), None);
+    let day = day_of(&snap);
+    assert_eq!(day.item(id(100)).unwrap().planned_secs(), 900);
+    assert_eq!(day.item(id(101)).unwrap().status(), ItemStatus::CarriedOver);
+    assert_eq!(day.item(id(102)).unwrap().status(), ItemStatus::Removed);
+    assert_eq!(day.lock_decision(), LockDecision::Locked);
+    assert_eq!(store.stored_baseline(day1()), Some(frozen_at_lock));
+    let puts = store
+        .batches()
+        .iter()
+        .flat_map(|b| b.ops().to_vec())
+        .filter(is_baseline)
+        .count();
+    assert_eq!(puts, 1, "written once");
+}
+
+#[tokio::test]
+async fn the_lock_decision_and_baseline_survive_an_engine_restart() {
+    let (mut h, store) = running_on(1_000, Some(&undecided_abc())).await;
+    h.send(start_with(100, 1, LockChoice::Lock));
+    h.rev(2).await;
+    let frozen_at_lock = store.stored_baseline(day1()).unwrap();
+    drop(h);
+    let mut h = start(&FakeClock::at(1_100), &store);
+    let snap = h.rev(1).await;
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::Locked);
+    let loaded = nguda_core::Store::load_baseline(store.as_ref(), day1())
+        .await
+        .unwrap();
+    assert_eq!(loaded, Some(frozen_at_lock));
+}
+
+#[tokio::test]
+async fn a_failed_lock_and_start_commit_leaves_the_day_undecided_and_idle() {
+    let (mut h, store) = running_on(1_000, Some(&undecided_abc())).await;
+    store.fail_commits(true);
+    h.send(start_with(100, 1, LockChoice::Lock));
+    let snap = h.rev(2).await;
+    assert_eq!(snap.status, store_status());
+    assert_eq!(snap.running, None);
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::None);
+    assert_eq!(store.stored_baseline(day1()), None);
+    assert_eq!(
+        store.stored_day(day1()).unwrap().lock_decision(),
+        LockDecision::None
+    );
+    // Still undecided, so the choice can be sent again.
+    store.fail_commits(false);
+    h.send(start_with(100, 2, LockChoice::Lock));
+    let snap = h.rev(3).await;
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::Locked);
+    assert!(store.stored_baseline(day1()).is_some());
+}
+
+#[tokio::test]
+async fn a_second_baseline_for_a_date_fails_and_rolls_back_its_batch() {
+    use nguda_core::{Store, StoreBatch};
+    let store = MemoryStore::new();
+    store.seed(&undecided_abc());
+    let put = |locked_at| StoreOp::PutBaseline {
+        baseline: Baseline {
+            date: day1(),
+            locked_at: ts(locked_at),
+            items: vec![frozen(100, 600, 0, 600)],
+        },
+    };
+    store.commit(StoreBatch::from_iter([put(0)])).await.unwrap();
+    let second = StoreBatch::from_iter([
+        StoreOp::SetLockDecision {
+            date: day1(),
+            decision: LockDecision::Locked,
+        },
+        put(5),
+    ]);
+    assert!(store.commit(second).await.is_err());
+    assert_eq!(store.stored_baseline(day1()).unwrap().locked_at, ts(0));
+    assert_eq!(
+        store.stored_day(day1()).unwrap().lock_decision(),
+        LockDecision::None,
+        "rolled back"
+    );
 }

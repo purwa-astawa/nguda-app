@@ -26,6 +26,11 @@
 //! stack, and [`nguda_core::next_task`] (used by Switch and for `next_item`) resumes
 //! the top of that stack before anything else.
 //!
+//! Day lock (AD-6, AD-7): each day's lock decision (on [`Day`], so in every
+//! snapshot) starts undecided and is decided once, by [`EngineMsg::LockDay`], or
+//! by a `Start` or insert-now carrying a [`LockChoice`]. Locking writes the day's
+//! frozen baseline in the same batch; the engine never updates or reads it back.
+//!
 //! Carry-over (AD-6): [`EngineMsg::CarryOverToTomorrow`] moves the current overflow
 //! list to tomorrow. Items never change days: each original turns `carried_over`,
 //! and tomorrow's day (created with today's zone if missing) gains a fresh pending
@@ -52,8 +57,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Day, IdGen, ItemId, PromptId, PromptKind, Running, Schedule, Store, TimeZone, Timestamp,
-    WorkEnd,
+    Clock, Day, IdGen, ItemId, LockChoice, PromptId, PromptKind, Running, Schedule, Store,
+    TimeZone, Timestamp, WorkEnd,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -93,7 +98,16 @@ pub enum EngineMsg {
     RemoveTask { item_id: ItemId },
     /// Starts a pending item or resumes a paused one now, pausing any other running
     /// item first. Already running: no change.
-    Start { item_id: ItemId, expected_rev: u64 },
+    ///
+    /// `lock` decides the day's lock in the same batch (AD-7) and is sent only
+    /// while the day is undecided: `Some(_)` on a decided day is rejected, and
+    /// `None` on an undecided day is rejected with an [`Effect::AskLockOnStart`].
+    /// `Some(Lock)` freezes the baseline of the day as it is after the start.
+    Start {
+        item_id: ItemId,
+        expected_rev: u64,
+        lock: Option<LockChoice>,
+    },
     /// Pauses the running item now.
     Pause { item_id: ItemId },
     /// Finishes the running item `item_id` now and starts or resumes the next item,
@@ -113,12 +127,21 @@ pub enum EngineMsg {
     /// Always rev-checked. The title must not be blank and `planned_secs` must be
     /// positive. `Now` starts the new item, first pausing any running item and
     /// pushing it onto the interrupt stack.
+    ///
+    /// `lock` follows the [`EngineMsg::Start`] rules for `Now` (a choiceless
+    /// insert-now on an undecided day is rejected, with no effect), and is invalid
+    /// input with any other anchor. `Some(Lock)` puts the new item in the baseline.
     InsertTask {
         title: String,
         planned_secs: u64,
         anchor: InsertAnchor,
         expected_rev: u64,
+        lock: Option<LockChoice>,
     },
+    /// Locks the undecided day without starting anything: decides `Locked` and
+    /// freezes the baseline of every item not removed or carried over, re-flowed
+    /// now, in one batch (AD-6, AD-7). Rev-checked; a decided day is rejected.
+    LockDay { expected_rev: u64 },
     /// Sets the work-end time of day to `minutes` after local midnight
     /// (`0..=1439`), persisted. Not rev-checked; the same value changes nothing.
     SetWorkEnd { minutes: u32 },
@@ -217,6 +240,9 @@ pub enum Effect {
     /// prompt whose item was extended (emitted only after the extension committed)
     /// or was superseded, or the overflow prompt of an episode that just ended.
     WithdrawNotification { prompt_id: PromptId },
+    /// A choiceless `Start` of `item_id` hit an undecided day and was rejected:
+    /// surfaces that can should ask "lock the day?" and resend with a choice (AD-7).
+    AskLockOnStart { item_id: ItemId },
 }
 
 /// The ports and settings the engine runs on.

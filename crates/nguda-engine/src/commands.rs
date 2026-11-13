@@ -8,8 +8,8 @@
 use std::fmt;
 
 use nguda_core::{
-    Date, Day, DayLogEntry, DayLogKind, DomainError, IdGen, ItemId, ItemStatus, OrderKey, PlanItem,
-    StoreOp, Timestamp, WorkEnd, closed_secs,
+    Date, Day, DayLogEntry, DayLogKind, DomainError, IdGen, ItemId, ItemStatus, LockChoice,
+    LockDecision, OrderKey, PlanItem, StoreOp, Timestamp, WorkEnd, baseline, closed_secs,
 };
 
 use crate::{EngineMsg, InsertAnchor, ReorderAnchor};
@@ -30,6 +30,8 @@ pub(crate) enum Reject {
         command: &'static str,
         error: DomainError,
     },
+    /// A start or insert-now without a lock choice on an undecided day (AD-7).
+    LockUndecided { command: &'static str },
 }
 
 impl Reject {
@@ -39,6 +41,7 @@ impl Reject {
             Self::StaleRev { .. } => "stale_rev",
             Self::Invalid { .. } => "invalid_input",
             Self::Domain { error, .. } => domain_kind(error),
+            Self::LockUndecided { .. } => "lock_undecided",
         }
     }
 
@@ -59,6 +62,9 @@ impl fmt::Display for Reject {
             Self::Invalid { command, reason } => write!(f, "{command}: {reason}"),
             // DomainError's Display holds ids, states and actions only.
             Self::Domain { command, error } => write!(f, "{command}: {error}"),
+            Self::LockUndecided { command } => {
+                write!(f, "{command}: the day's lock is undecided")
+            }
         }
     }
 }
@@ -72,6 +78,7 @@ pub(crate) fn domain_kind(e: &DomainError) -> &'static str {
         DomainError::UnknownItem(_) => "unknown_item",
         DomainError::DuplicateItem(_) => "duplicate_item",
         DomainError::InvalidRecord { .. } => "invalid_record",
+        DomainError::LockAlreadyDecided => "lock_already_decided",
     }
 }
 
@@ -81,12 +88,13 @@ const EDIT_TASK: &str = "EditTask";
 const REORDER_TASK: &str = "ReorderTask";
 const TOGGLE_FIXED: &str = "ToggleFixed";
 const REMOVE_TASK: &str = "RemoveTask";
-const START: &str = "Start";
+pub(crate) const START: &str = "Start";
 const PAUSE: &str = "Pause";
 const SWITCH: &str = "Switch";
 const EXTEND_TASK: &str = "ExtendTask";
 const INSERT_TASK: &str = "InsertTask";
 const SET_WORK_END: &str = "SetWorkEnd";
+const LOCK_DAY: &str = "LockDay";
 pub(crate) const CARRY_OVER: &str = "CarryOverToTomorrow";
 
 /// Why a carry-over with no leftovers is rejected.
@@ -106,6 +114,7 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::ExtendTask { .. } => EXTEND_TASK,
         EngineMsg::InsertTask { .. } => INSERT_TASK,
         EngineMsg::SetWorkEnd { .. } => SET_WORK_END,
+        EngineMsg::LockDay { .. } => LOCK_DAY,
         EngineMsg::CarryOverToTomorrow { .. } => CARRY_OVER,
     }
 }
@@ -115,6 +124,7 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
     match msg {
         EngineMsg::CreateTask { .. }
         | EngineMsg::SetWorkEnd { .. }
+        | EngineMsg::LockDay { .. }
         | EngineMsg::CarryOverToTomorrow { .. } => None,
         EngineMsg::InsertTask { anchor, .. } => match anchor {
             InsertAnchor::After(id) | InsertAnchor::Before(id) => Some(*id),
@@ -181,9 +191,13 @@ pub(crate) fn apply(
         EngineMsg::Start {
             item_id,
             expected_rev,
+            lock,
         } => {
             check(expected_rev)?;
-            start(day, now, item_id)
+            check_lock(START, day, lock)?;
+            let mut ops = start(day, now, item_id)?;
+            ops.extend(decide_lock(START, day, now, lock)?);
+            Ok(ops)
         }
         EngineMsg::Pause { item_id } => pause(day, now, item_id),
         EngineMsg::Switch {
@@ -206,9 +220,25 @@ pub(crate) fn apply(
             planned_secs,
             anchor,
             expected_rev,
+            lock,
         } => {
             check(expected_rev)?;
-            insert_task(day, now, ids, title, planned_secs, anchor)
+            if lock.is_some() && anchor != InsertAnchor::Now {
+                return Err(Reject::invalid(
+                    INSERT_TASK,
+                    "a lock choice needs the Now anchor",
+                ));
+            }
+            if anchor == InsertAnchor::Now {
+                check_lock(INSERT_TASK, day, lock)?;
+            }
+            let mut ops = insert_task(day, now, ids, title, planned_secs, anchor)?;
+            ops.extend(decide_lock(INSERT_TASK, day, now, lock)?);
+            Ok(ops)
+        }
+        EngineMsg::LockDay { expected_rev } => {
+            check(expected_rev)?;
+            decide_lock(LOCK_DAY, day, now, Some(LockChoice::Lock))
         }
         EngineMsg::SetWorkEnd { minutes } => set_work_end(work_end, minutes),
         // The actor routes it to `carry_over` with tomorrow's day loaded.
@@ -232,6 +262,40 @@ fn set_work_end(work_end: &mut WorkEnd, minutes: u32) -> Result<Vec<StoreOp>, Re
     }
     *work_end = next;
     Ok(vec![StoreOp::SetWorkEnd { work_end: next }])
+}
+
+/// The day-lock precondition of a start or insert-now (AD-7): a choice only while
+/// the day is undecided, and an undecided day only with a choice.
+fn check_lock(command: &'static str, day: &Day, lock: Option<LockChoice>) -> Result<(), Reject> {
+    match (lock, day.lock_decision()) {
+        (Some(_), LockDecision::Locked | LockDecision::NoLock) => Err(Reject::Domain {
+            command,
+            error: DomainError::LockAlreadyDecided,
+        }),
+        (None, LockDecision::None) => Err(Reject::LockUndecided { command }),
+        _ => Ok(()),
+    }
+}
+
+/// Decides the day's lock with `lock`, if given, after the command's transition.
+/// `Lock` returns the baseline of the day as it is now, to be committed after the
+/// diff so every baselined item's row exists (AD-6, AD-7).
+fn decide_lock(
+    command: &'static str,
+    day: &mut Day,
+    now: Timestamp,
+    lock: Option<LockChoice>,
+) -> Result<Vec<StoreOp>, Reject> {
+    let Some(choice) = lock else {
+        return Ok(Vec::new());
+    };
+    day.decide_lock(choice).map_err(domain(command))?;
+    Ok(match choice {
+        LockChoice::Lock => vec![StoreOp::PutBaseline {
+            baseline: baseline(day, now),
+        }],
+        LockChoice::NoLock => Vec::new(),
+    })
 }
 
 fn domain(command: &'static str) -> impl Fn(DomainError) -> Reject {
@@ -800,6 +864,7 @@ mod tests {
             EngineMsg::Start {
                 item_id: id(100),
                 expected_rev: 3,
+                lock: None,
             },
             &mut day,
             &mut WorkEnd::default(),

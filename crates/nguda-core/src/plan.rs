@@ -9,6 +9,7 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use uuid::Uuid;
 
+use crate::baseline::{LockChoice, LockDecision};
 use crate::elapsed::Running;
 use crate::error::DomainError;
 use crate::next_task::next_task;
@@ -391,12 +392,16 @@ impl PlanItem {
 /// The interrupt stack (AD-15) holds distinct ids of **paused** items of this day,
 /// bottom first. Any transition that makes a stacked item running, done, carried
 /// over or removed drops it from the stack; pausing and plan edits leave it alone.
+///
+/// The lock decision (AD-7) starts [`LockDecision::None`] and is decided at most
+/// once, through [`Day::decide_lock`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Day {
     date: Date,
     tz: String,
     items: Vec<PlanItem>,
     interrupt_stack: Vec<ItemId>,
+    lock_decision: LockDecision,
 }
 
 impl Day {
@@ -406,6 +411,7 @@ impl Day {
             tz: tz.into(),
             items: Vec::new(),
             interrupt_stack: Vec::new(),
+            lock_decision: LockDecision::None,
         }
     }
 
@@ -448,6 +454,26 @@ impl Day {
             stack.push(id);
         }
         self.interrupt_stack = stack;
+        Ok(())
+    }
+
+    /// Sets the stored lock decision of a restored day.
+    pub fn restore_lock_decision(&mut self, decision: LockDecision) {
+        self.lock_decision = decision;
+    }
+
+    /// Whether the day is locked, decided against locking, or undecided (AD-7).
+    pub fn lock_decision(&self) -> LockDecision {
+        self.lock_decision
+    }
+
+    /// Decides the day's lock with `choice`. A day is decided at most once: unless
+    /// it is still undecided this is `LockAlreadyDecided` and changes nothing.
+    pub fn decide_lock(&mut self, choice: LockChoice) -> Result<(), DomainError> {
+        if self.lock_decision != LockDecision::None {
+            return Err(DomainError::LockAlreadyDecided);
+        }
+        self.lock_decision = choice.decision();
         Ok(())
     }
 

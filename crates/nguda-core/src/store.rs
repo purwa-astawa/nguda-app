@@ -10,6 +10,7 @@ use std::pin::Pin;
 use jiff::Timestamp;
 use jiff::civil::Date;
 
+use crate::baseline::{Baseline, LockDecision};
 use crate::day_log::DayLogEntry;
 use crate::plan::{Day, ItemId, PlanItem};
 use crate::settings::{Settings, WorkEnd};
@@ -43,6 +44,11 @@ pub enum StoreOp {
     SetInterruptStack { date: Date, items: Vec<ItemId> },
     /// Stores the work-end setting, replacing any earlier value.
     SetWorkEnd { work_end: WorkEnd },
+    /// Sets the stored day `date`'s lock decision (AD-7).
+    SetLockDecision { date: Date, decision: LockDecision },
+    /// Writes the stored day's baseline (AD-6). Insert-only: a second baseline for
+    /// the same date fails, rolling back the whole batch. Its items must exist.
+    PutBaseline { baseline: Baseline },
 }
 
 /// Where the one open segment is: its item's day, the item, and its start.
@@ -133,4 +139,8 @@ pub trait Store: Send + Sync + 'static {
 
     /// The stored user settings, each missing one at its default.
     fn load_settings(&self) -> StoreFuture<Settings>;
+
+    /// The day's baseline with its items in schedule order, or `None` if the day
+    /// was never locked.
+    fn load_baseline(&self, date: Date) -> StoreFuture<Option<Baseline>>;
 }
