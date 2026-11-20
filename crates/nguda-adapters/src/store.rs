@@ -67,6 +67,7 @@ enum Request {
     LoadSettings(oneshot::Sender<Result<Settings, StoreError>>),
     LoadBaseline(Date, oneshot::Sender<Result<Option<Baseline>, StoreError>>),
     LoadTagNames(oneshot::Sender<Result<Vec<String>, StoreError>>),
+    StoredDates(oneshot::Sender<Result<Vec<Date>, StoreError>>),
 }
 
 /// The SQLite implementation of the [`Store`] port.
@@ -162,6 +163,11 @@ impl Store for SqliteStore {
     fn load_tag_names(&self) -> StoreFuture<Vec<String>> {
         let (tx, rx) = oneshot::channel();
         self.call(Request::LoadTagNames(tx), rx)
+    }
+
+    fn stored_dates(&self) -> StoreFuture<Vec<Date>> {
+        let (tx, rx) = oneshot::channel();
+        self.call(Request::StoredDates(tx), rx)
     }
 }
 
@@ -275,6 +281,9 @@ fn serve(mut conn: Connection, rx: mpsc::Receiver<Request>) {
             }
             Request::LoadTagNames(reply) => {
                 let _ = reply.send(load_tag_names(&conn));
+            }
+            Request::StoredDates(reply) => {
+                let _ = reply.send(stored_dates(&conn));
             }
         }
     }
@@ -802,6 +811,24 @@ fn load_tag_names(conn: &Connection) -> Result<Vec<String>, StoreError> {
         "load tag names",
         |r| r.get(0),
     )
+}
+
+/// Every stored day's date, ascending. Dates are stored as `YYYY-MM-DD`, so text
+/// order is date order.
+fn stored_dates(conn: &Connection) -> Result<Vec<Date>, StoreError> {
+    let ctx = "load stored dates";
+    let texts: Vec<String> = query_all(conn, "SELECT date FROM day ORDER BY date", [], ctx, |r| {
+        r.get(0)
+    })?;
+    let mut dates = texts
+        .iter()
+        .map(|t| {
+            t.parse::<Date>()
+                .map_err(|_| StoreError::new(format!("{ctx}: invalid stored date")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    dates.sort();
+    Ok(dates)
 }
 
 /// One plan-item row before its segments are attached.

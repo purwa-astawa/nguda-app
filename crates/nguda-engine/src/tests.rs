@@ -12,8 +12,8 @@ use nguda_core::{
 use tokio::sync::{mpsc, watch};
 
 use crate::test_support::{
-    FakeClock, INJECTED, MemoryStore, SeqIds, day_running_other, day1, day2, id, item, key,
-    no_lock, prompt, ts,
+    FakeClock, FakeFileSink, INJECTED, MemoryStore, SeqIds, day_running_other, day1, day2, id,
+    item, key, no_lock, prompt, ts,
 };
 use crate::{
     Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, InsertAnchor, NextItem,
@@ -41,13 +41,16 @@ struct Harness {
     effects: mpsc::UnboundedReceiver<Effect>,
     rx: watch::Receiver<Snapshot>,
     clock: Arc<FakeClock>,
+    files: Arc<FakeFileSink>,
 }
 
 fn start(clock: &Arc<FakeClock>, store: &Arc<MemoryStore>) -> Harness {
+    let files = FakeFileSink::new();
     let (engine, effects) = spawn(EngineDeps {
         clock: clock.clone(),
         store: store.clone(),
         ids: Arc::new(SeqIds::default()),
+        files: files.clone(),
         tz: TimeZone::UTC,
     });
     let rx = engine.subscribe();
@@ -56,6 +59,7 @@ fn start(clock: &Arc<FakeClock>, store: &Arc<MemoryStore>) -> Harness {
         effects,
         rx,
         clock: clock.clone(),
+        files,
     }
 }
 
@@ -2967,6 +2971,210 @@ async fn a_failed_load_fails_the_week_and_leaves_state_and_status_untouched() {
     assert_eq!(h.engine.query_week(week1()).await, Err(err));
     store.fail_loads(false);
     expect_untouched(&mut h, &store, batches).await;
+}
+
+// --- CSV export (AD-16, CAP-9) ---
+
+use std::path::PathBuf;
+
+use nguda_core::{ExportRange, export_csv};
+
+use crate::test_support::SINK_FAILURE;
+
+const CSV_HEAD: &str = "\u{feff}date,title,tags,planned_secs,planned_source,actual_secs\r\n";
+
+fn export(path: &str, range: ExportRange) -> EngineMsg {
+    EngineMsg::ExportCsv {
+        path: PathBuf::from(path),
+        range,
+    }
+}
+
+fn export_status(snap: &Snapshot) -> Option<&str> {
+    snap.status
+        .iter()
+        .find(|e| e.key == StatusKey::Export)
+        .map(|e| e.message.as_str())
+}
+
+/// The locked past day 1 (with baseline and log) stored, today day 2, at rev 1.
+async fn past_day_engine() -> (Harness, Arc<MemoryStore>) {
+    let (past, baseline, log) = locked_past_day();
+    let (clock, store) = (FakeClock::at(DAY_SECS + 1_000), MemoryStore::new());
+    store.seed(&past);
+    store.seed_baseline(baseline);
+    store.seed_day_log(day1(), log);
+    let mut h = start(&clock, &store);
+    h.rev(1).await;
+    (h, store)
+}
+
+#[tokio::test]
+async fn a_week_export_writes_the_reports_rows_and_changes_nothing() {
+    let (mut h, store) = past_day_engine().await;
+    let batches = store.batches().len();
+    h.send(export("/tmp/week.csv", ExportRange::Week(week1())));
+    let done = h.next_effect().await;
+
+    let day1_report = h.engine.query_day(day1()).await.unwrap().unwrap();
+    let expected = export_csv(&[day1_report]);
+    assert_eq!(
+        done,
+        Effect::ExportDone {
+            rows: expected.rows
+        }
+    );
+    assert_eq!(expected.rows, 4, "A, B, removed C, unplanned D");
+    let writes = h.files.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, PathBuf::from("/tmp/week.csv"));
+    let text = String::from_utf8(writes[0].1.clone()).unwrap();
+    assert_eq!(text, expected.contents);
+    assert!(text.starts_with(CSV_HEAD));
+    assert!(
+        text.contains("1970-01-01,A,,600,baseline,700\r\n"),
+        "{text}"
+    );
+    assert!(text.contains("1970-01-01,D,,,unplanned,300\r\n"), "{text}");
+    // Read-only: no batch, no publish, no status.
+    expect_untouched(&mut h, &store, batches).await;
+}
+
+#[tokio::test]
+async fn an_all_export_writes_stored_days_in_order_up_to_today() {
+    let (past, baseline, log) = locked_past_day();
+    let mut earlier = no_lock(Day::new(Date::constant(1969, 12, 30), "UTC"));
+    earlier.add(item(200, "Earlier", "U")).unwrap();
+    let mut future = no_lock(Day::new(Date::constant(1970, 1, 3), "UTC"));
+    future.add(item(300, "Future", "U")).unwrap();
+    let (clock, store) = (FakeClock::at(DAY_SECS + 1_000), MemoryStore::new());
+    store.seed(&future);
+    store.seed(&past);
+    store.seed(&earlier);
+    store.seed_baseline(baseline);
+    store.seed_day_log(day1(), log);
+    let mut h = start(&clock, &store);
+    h.rev(1).await;
+    h.send(create("Today", 60));
+    h.rev(2).await;
+
+    h.send(export("/tmp/all.csv", ExportRange::All));
+    let done = h.next_effect().await;
+    assert_eq!(done, Effect::ExportDone { rows: 6 });
+    let text = String::from_utf8(h.files.writes()[0].1.clone()).unwrap();
+    let dates: Vec<&str> = text
+        .strip_prefix(CSV_HEAD)
+        .unwrap()
+        .split_terminator("\r\n")
+        .map(|line| line.split(',').next().unwrap())
+        .collect();
+    assert_eq!(
+        dates,
+        vec![
+            "1969-12-30",
+            "1970-01-01",
+            "1970-01-01",
+            "1970-01-01",
+            "1970-01-01",
+            "1970-01-02"
+        ]
+    );
+    assert!(
+        text.contains("1970-01-02,Today,,60,unlocked,0\r\n"),
+        "{text}"
+    );
+    assert!(!text.contains("Future"), "a future day is skipped");
+    assert_eq!(h.rx.borrow().rev, 2, "no publish");
+}
+
+#[tokio::test]
+async fn a_failed_write_sets_the_export_status_and_a_later_success_clears_it() {
+    let (mut h, store) = past_day_engine().await;
+    let batches = store.batches().len();
+    h.files.fail(true);
+    h.send(export("/secret/dir/out.csv", ExportRange::Week(week1())));
+    let snap = h.rev(2).await;
+    assert_eq!(
+        export_status(&snap),
+        Some(format!("Export failed: {SINK_FAILURE}").as_str())
+    );
+    assert!(!export_status(&snap).unwrap().contains("secret"));
+    assert_eq!(snap.status.len(), 1, "only the export status");
+    h.expect_no_effect().await;
+
+    h.files.fail(false);
+    h.send(export("/tmp/out.csv", ExportRange::Week(week1())));
+    let snap = h.rev(3).await;
+    assert_eq!(export_status(&snap), None);
+    assert_eq!(h.next_effect().await, Effect::ExportDone { rows: 4 });
+    assert_eq!(h.files.writes().len(), 1);
+    assert_eq!(store.batches().len(), batches, "no batch");
+}
+
+#[tokio::test]
+async fn a_failed_store_read_sets_the_export_status_and_writes_nothing() {
+    let (mut h, store) = past_day_engine().await;
+    let batches = store.batches().len();
+    store.fail_load_day(true);
+    h.send(export("/tmp/out.csv", ExportRange::Week(week1())));
+    let snap = h.rev(2).await;
+    assert_eq!(
+        export_status(&snap),
+        Some(format!("Export failed: {INJECTED}").as_str())
+    );
+    assert_eq!(snap.status.len(), 1, "no Store or CommandRejected status");
+    store.fail_load_day(false);
+
+    store.fail_loads(true);
+    h.send(export("/tmp/out.csv", ExportRange::All));
+    let snap = h.rev(3).await;
+    assert_eq!(
+        export_status(&snap),
+        Some(format!("Export failed: {INJECTED}").as_str())
+    );
+    store.fail_loads(false);
+    h.expect_no_effect().await;
+    assert!(h.files.writes().is_empty());
+    assert_eq!(store.batches().len(), batches, "no batch");
+}
+
+#[tokio::test]
+async fn a_stale_export_failure_after_a_newer_success_is_dropped() {
+    let (mut h, _store) = past_day_engine().await;
+    let finished = |id, result| crate::Inbox::ExportFinished { id, result };
+    h.engine.tx.send(finished(2, Ok(5))).ok().unwrap();
+    h.engine
+        .tx
+        .send(finished(1, Err("older failure".into())))
+        .ok()
+        .unwrap();
+    assert_eq!(h.next_effect().await, Effect::ExportDone { rows: 5 });
+    h.expect_no_effect().await;
+    let snap = h.rx.borrow().clone();
+    assert_eq!(snap.rev, 1, "the stale failure published nothing");
+    assert_eq!(export_status(&snap), None);
+    // The next publish is rev 2, so nothing was published in between.
+    h.send(create("Next", 60));
+    assert_eq!(export_status(&h.rev(2).await), None);
+}
+
+#[tokio::test]
+async fn dropping_every_handle_stops_the_engine_after_an_export() {
+    let (mut h, _store) = past_day_engine().await;
+    h.send(export("/tmp/out.csv", ExportRange::All));
+    assert!(matches!(h.next_effect().await, Effect::ExportDone { .. }));
+    let Harness {
+        engine,
+        mut effects,
+        rx,
+        ..
+    } = h;
+    drop(engine);
+    drop(rx);
+    let end = tokio::time::timeout(Duration::from_secs(5), effects.recv())
+        .await
+        .expect("the engine stopped");
+    assert_eq!(end, None, "the effects sender went away with the actor");
 }
 
 // --- Tags ---

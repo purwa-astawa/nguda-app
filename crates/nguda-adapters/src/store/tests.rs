@@ -1317,3 +1317,31 @@ async fn known_tag_names_keep_a_removed_tag_and_match_case_insensitively() {
     assert_eq!(loaded.item(id(1)).unwrap().tags(), strings(&["Work"]));
     assert_eq!(tag_names(&store).await, strings(&["Work", "old"]));
 }
+
+#[tokio::test]
+async fn stored_dates_lists_every_day_ascending() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let empty = SqliteStore::open(&path).unwrap();
+    assert_eq!(empty.stored_dates().await.unwrap(), Vec::new());
+    drop(empty);
+    let store = seeded(&path).await;
+    let earlier = nguda_core::Date::constant(2026, 10, 30);
+    store
+        .commit(batch([
+            StoreOp::PutDay {
+                date: other_date(),
+                tz: "Europe/Berlin".into(),
+            },
+            StoreOp::PutDay {
+                date: earlier,
+                tz: "Europe/Berlin".into(),
+            },
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.stored_dates().await.unwrap(),
+        vec![earlier, date(), other_date()]
+    );
+}

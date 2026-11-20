@@ -18,3 +18,8 @@ export function formatRatio(ratio: number | null): string {
 export function containsDate(report: Pick<WeekReport, "start" | "end">, date: string): boolean {
   return report.start <= date && date <= report.end;
 }
+
+/** What the week view says after an export wrote `rows` records. */
+export function exportMessage(rows: number): string {
+  return `Exported ${rows} ${rows === 1 ? "row" : "rows"}.`;
+}

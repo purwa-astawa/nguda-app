@@ -5,13 +5,15 @@
 //! days and messages are never logged or `Debug`-printed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Date, Day, DayLogKind, IdGen, IsoWeek, ItemId, LockDecision, OpenSegmentRef, PlanItem,
-    PromptId, PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone,
-    Timestamp, WorkEnd, merge_tag_names, reflow, report, sort_tag_names, week_report,
+    Clock, Date, Day, DayLogKind, ExportRange, FileSink, IdGen, IsoWeek, ItemId, LockDecision,
+    OpenSegmentRef, PlanItem, PromptId, PromptKind, Running, Schedule, Store, StoreBatch,
+    StoreError, StoreOp, TimeZone, Timestamp, WorkEnd, export_csv, merge_tag_names, reflow, report,
+    sort_tag_names, week_report,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -25,10 +27,11 @@ use crate::{
 pub(crate) async fn run(
     deps: EngineDeps,
     mut rx: mpsc::UnboundedReceiver<Inbox>,
+    inbox: mpsc::WeakUnboundedSender<Inbox>,
     snapshots: watch::Sender<Snapshot>,
     effects: mpsc::UnboundedSender<Effect>,
 ) {
-    let mut actor = Actor::new(deps, snapshots, effects);
+    let mut actor = Actor::new(deps, inbox, snapshots, effects);
     actor.startup().await;
     loop {
         let deadline = actor.clock.sleep_until(actor.next_deadline());
@@ -37,6 +40,7 @@ pub(crate) async fn run(
                 Some(Inbox::Command(msg)) => actor.handle(msg).await,
                 Some(Inbox::QueryDay { date, reply }) => actor.query_day(date, reply),
                 Some(Inbox::QueryWeek { week, reply }) => actor.query_week(week, reply),
+                Some(Inbox::ExportFinished { id, result }) => actor.export_finished(id, result),
                 None => break,
             },
             () = deadline => actor.on_deadline().await,
@@ -50,6 +54,14 @@ struct Actor {
     clock: Arc<dyn Clock>,
     store: Arc<dyn Store>,
     ids: Arc<dyn IdGen>,
+    files: Arc<dyn FileSink>,
+    /// The actor's own inbox, weakly held: export tasks post their outcome here
+    /// without keeping the engine alive.
+    inbox: mpsc::WeakUnboundedSender<Inbox>,
+    /// The last export request id handed out; ids start at 1.
+    export_issued: u64,
+    /// The newest export id whose outcome was applied; older outcomes are stale.
+    export_applied: u64,
     tz: TimeZone,
     /// Today's plan, as last committed.
     day: Day,
@@ -88,6 +100,7 @@ struct Crash {
 impl Actor {
     fn new(
         deps: EngineDeps,
+        inbox: mpsc::WeakUnboundedSender<Inbox>,
         snapshots: watch::Sender<Snapshot>,
         effects: mpsc::UnboundedSender<Effect>,
     ) -> Self {
@@ -97,6 +110,10 @@ impl Actor {
             clock: deps.clock,
             store: deps.store,
             ids: deps.ids,
+            files: deps.files,
+            inbox,
+            export_issued: 0,
+            export_applied: 0,
             tz: deps.tz,
             day,
             work_end: WorkEnd::DEFAULT,
@@ -301,6 +318,86 @@ impl Actor {
         });
     }
 
+    /// Starts a CSV export without waiting (AD-4, AD-16, AD-17): notes `now` and
+    /// today, clones today's committed day, and spawns a task that resolves the
+    /// range's dates up to today, builds their reports, turns them into CSV, writes
+    /// it through the file sink on a blocking thread, and posts the outcome back
+    /// as [`Inbox::ExportFinished`] under a fresh request id. Touches no other
+    /// state here. Logs the range kind and week only, never the path (AD-14).
+    fn export_csv(&mut self, path: PathBuf, range: ExportRange) {
+        self.export_issued += 1;
+        let id = self.export_issued;
+        let now = self.clock.now();
+        let today_date = self.day.date();
+        let mut today = Some(self.day.clone());
+        let store = self.store.clone();
+        let files = self.files.clone();
+        let inbox = self.inbox.clone();
+        let (kind, year, number) = range_fields(range);
+        tracing::info!(range = kind, year, week = number, "export started");
+        tokio::spawn(async move {
+            let result = async {
+                let dates = export_dates(store.as_ref(), range, today_date).await?;
+                let mut reports = Vec::with_capacity(dates.len());
+                for date in dates {
+                    let live = today.take_if(|d| d.date() == date);
+                    let built = build_report(store.as_ref(), date, live, now).await;
+                    if let Some(r) = built.map_err(|e| e.message)? {
+                        reports.push(r);
+                    }
+                }
+                let csv = export_csv(&reports);
+                let rows = csv.rows;
+                tokio::task::spawn_blocking(move || files.write(&path, csv.contents.as_bytes()))
+                    .await
+                    .map_err(|_| "the file write task failed".to_owned())?
+                    .map_err(|e| e.message)?;
+                Ok::<_, String>(rows)
+            }
+            .await;
+            match &result {
+                Ok(rows) => {
+                    tracing::info!(range = kind, year, week = number, rows, "export written");
+                }
+                Err(_) => tracing::warn!(range = kind, year, week = number, "export failed"),
+            }
+            // The engine may have stopped meanwhile; nothing to report to then.
+            if let Some(inbox) = inbox.upgrade() {
+                let _ = inbox.send(Inbox::ExportFinished { id, result });
+            }
+        });
+    }
+
+    /// Applies an export's outcome (AD-14): success clears the `Export` status
+    /// (publishing only if it was set) and emits `ExportDone`; failure sets it and
+    /// publishes. No other status, the plan, or the committed state changes. An
+    /// outcome older than the newest one applied is stale and dropped (AD-17).
+    fn export_finished(&mut self, id: u64, result: Result<usize, String>) {
+        if id < self.export_applied {
+            tracing::debug!(
+                id,
+                newest = self.export_applied,
+                "stale export outcome dropped"
+            );
+            return;
+        }
+        self.export_applied = id;
+        match result {
+            Ok(rows) => {
+                if self.status.remove(&StatusKey::Export).is_some() {
+                    self.publish();
+                }
+                // A closed receiver only means nobody listens for effects.
+                let _ = self.effects.send(Effect::ExportDone { rows });
+            }
+            Err(message) => {
+                self.status
+                    .insert(StatusKey::Export, format!("Export failed: {message}"));
+                self.publish();
+            }
+        }
+    }
+
     /// One command. Rollover runs first, so a command carrying a pre-rollover rev
     /// is stale, and again after a committed change (a Pause after midnight ends
     /// the old day). Carry-over needs tomorrow's day, so it has its own path.
@@ -308,6 +405,10 @@ impl Actor {
         self.roll_over_if_due(self.clock.now()).await;
         let changed = match msg {
             EngineMsg::CarryOverToTomorrow { expected_rev } => self.carry_over(expected_rev).await,
+            EngineMsg::ExportCsv { path, range } => {
+                self.export_csv(path, range);
+                false
+            }
             msg => self.handle_plan(msg).await,
         };
         if changed {
@@ -718,6 +819,37 @@ async fn build_report(
     };
     let log = store.load_day_log(date).await?;
     Ok(Some(report(&day, baseline.as_ref(), &log, now)))
+}
+
+/// The dates an export of `range` covers, ascending and never after `today`: the
+/// week's dates, or every stored date with `today` added when it is missing.
+async fn export_dates(
+    store: &dyn Store,
+    range: ExportRange,
+    today: Date,
+) -> Result<Vec<Date>, String> {
+    let mut dates = match range {
+        ExportRange::Week(week) => week.days().to_vec(),
+        ExportRange::All => {
+            let mut dates = store.stored_dates().await.map_err(|e| e.message)?;
+            if !dates.contains(&today) {
+                dates.push(today);
+            }
+            dates
+        }
+    };
+    dates.retain(|d| *d <= today);
+    dates.sort();
+    dates.dedup();
+    Ok(dates)
+}
+
+/// An export range's log fields: its kind, and the week's year and number.
+fn range_fields(range: ExportRange) -> (&'static str, Option<i16>, Option<i8>) {
+    match range {
+        ExportRange::Week(w) => ("week", Some(w.year()), Some(w.week())),
+        ExportRange::All => ("all", None, None),
+    }
 }
 
 /// The first item that is running.

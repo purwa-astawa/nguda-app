@@ -8,7 +8,10 @@
 //! engine effects are rendered by `effects` through the system notifier (AD-10),
 //! whose planned-end buttons come back here as `(prompt_id, action)` and are
 //! turned by `effects::resolve` into the same targeted commands as the tray's
-//! (AD-15). On macOS the app runs as an accessory (no Dock icon) and the tray
+//! (AD-15). CSV exports (AD-16) ask for a path through `tauri-plugin-dialog`
+//! from the `export_csv` command, the engine writes through the adapters'
+//! `FsFileSink`, and its `ExportDone` effect reaches the view as an
+//! `ExportDoneEvent`. On macOS the app runs as an accessory (no Dock icon) and the tray
 //! title gets monospaced digits once, from `macos`.
 
 mod effects;
@@ -19,10 +22,13 @@ mod tray;
 
 use std::sync::Arc;
 
-use nguda_adapters::{ActionCallback, SqliteStore, SystemClock, SystemNotifier, UuidV7Ids};
+use nguda_adapters::{
+    ActionCallback, FsFileSink, SqliteStore, SystemClock, SystemNotifier, UuidV7Ids,
+};
 use nguda_core::{Clock, Notifier, Store, TimeZone};
 use nguda_engine::{EngineDeps, EngineHandle};
 use tauri::{AppHandle, Manager};
+use tauri_specta::Event;
 
 /// The database file, in the app data directory.
 const DB_FILE: &str = "nguda.sqlite3";
@@ -39,6 +45,7 @@ pub fn run() {
     }
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             // A tray app: no Dock icon or app menu.
@@ -60,6 +67,7 @@ pub fn run() {
                 clock: clock.clone(),
                 store,
                 ids: Arc::new(UuidV7Ids),
+                files: Arc::new(FsFileSink),
                 tz: system_time_zone(),
             };
             // `nguda_engine::spawn` uses `tokio::spawn`, so enter Tauri's runtime first.
@@ -79,6 +87,7 @@ pub fn run() {
                 engine.subscribe(),
                 notifier,
                 targets,
+                on_export_done(app.handle().clone()),
             ));
             app.manage::<EngineHandle>(engine);
 
@@ -139,6 +148,15 @@ fn on_action(
             None => {}
         },
     )
+}
+
+/// Emits each finished export's row count to the view as an `ExportDoneEvent`.
+fn on_export_done(app: AppHandle) -> effects::ExportDoneCallback {
+    Arc::new(move |rows| {
+        if let Err(e) = (ipc::ExportDoneEvent { rows }).emit(&app) {
+            eprintln!("nguda: failed to emit export done ({rows} rows): {e}");
+        }
+    })
 }
 
 /// Opens (creating and migrating) `<app_data_dir>/nguda.sqlite3`, or exits: the app

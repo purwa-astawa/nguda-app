@@ -65,10 +65,19 @@ export const commands = {
 	 *  days of the calendar whose week runs past it, is an `Err` and sends nothing.
 	 */
 	queryWeek: (date: string) => typedError<WeekReportView_Serialize, string>(__TAURI_INVOKE("query_week", { date })),
+	/**
+	 *  Exports `range` as CSV (AD-16): asks for a path in a native save dialog, then
+	 *  sends the export to the engine. `Ok(false)` when the dialog was cancelled
+	 *  (nothing sent), `Ok(true)` once the export is queued. A malformed range is an
+	 *  `Err` before any dialog opens. The written row count arrives as an
+	 *  [`ExportDoneEvent`]; a failure as an `export` status entry.
+	 */
+	exportCsv: (range: ExportRangeArg_Deserialize) => typedError<boolean, string>(__TAURI_INVOKE("export_csv", { range })),
 };
 
 /** Events */
 export const events = {
+	exportDoneEvent: makeEvent<ExportDoneEvent, ExportDoneEvent>("export-done-event"),
 	focusExtendEvent: makeEvent<FocusExtendEvent, FocusExtendEvent>("focus-extend-event"),
 	openSummaryEvent: makeEvent<OpenSummaryEvent, OpenSummaryEvent>("open-summary-event"),
 	snapshotEvent: makeEvent<SnapshotEvent_Serialize, SnapshotEvent_Deserialize>("snapshot-event"),
@@ -158,6 +167,42 @@ export type DayView = {
 	 *  a lock choice; once decided, they carry none.
 	 */
 	lockDecision: LockDecisionView,
+};
+
+/**  A CSV export finished: `rows` records (the header not counted) were written. */
+export type ExportDoneEvent = {
+	rows: number,
+};
+
+/**  Which days a CSV export covers. */
+export type ExportKind = 
+/**  The ISO week holding `date`. */
+"week" | 
+/**  Every stored day up to today. */
+"all";
+
+/**
+ *  A CSV export range. `week` needs `date` (`YYYY-MM-DD`, any day of the week);
+ *  `all` ignores it.
+ */
+export type ExportRangeArg = ExportRangeArg_Serialize | ExportRangeArg_Deserialize;
+
+/**
+ *  A CSV export range. `week` needs `date` (`YYYY-MM-DD`, any day of the week);
+ *  `all` ignores it.
+ */
+export type ExportRangeArg_Deserialize = {
+	kind: ExportKind,
+	date?: string | null,
+};
+
+/**
+ *  A CSV export range. `week` needs `date` (`YYYY-MM-DD`, any day of the week);
+ *  `all` ignores it.
+ */
+export type ExportRangeArg_Serialize = {
+	kind: ExportKind,
+	date: string | null,
 };
 
 /**
@@ -477,7 +522,9 @@ export type SnapshotEvent_Serialize = {
 	knownTags: string[],
 };
 
-export type StatusKeyView = "store" | "commandRejected" | "overflow";
+export type StatusKeyView = "store" | "commandRejected" | "overflow" | 
+/**  The last CSV export failed; cleared by the next successful one. */
+"export";
 
 export type StatusView = {
 	key: StatusKeyView,

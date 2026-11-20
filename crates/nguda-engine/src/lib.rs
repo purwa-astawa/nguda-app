@@ -60,6 +60,20 @@
 //! skipped, and the first store error fails the whole query), then folds them
 //! with [`nguda_core::week_report`]. A query is read-only: no commit, no rev
 //! bump, no publish, and no status change.
+//!
+//! Export (AD-16, CAP-9): [`EngineMsg::ExportCsv`] is fire-and-forget like any
+//! command, but it never touches the plan, the committed state, or the
+//! `CommandRejected` and `Store` statuses. The actor notes `now` and today, clones
+//! its committed day, and spawns a task that resolves the range's dates (a week's
+//! dates, or every stored date with today added, never past today, ascending),
+//! builds each date's report the way the queries do (a date with no stored day
+//! adds nothing), turns them into CSV with [`nguda_core::export_csv`], and writes
+//! the file through the [`FileSink`] port on a blocking thread. The task posts the
+//! outcome back to the actor through a weak inbox sender, so a pending export
+//! never keeps the engine alive. Success clears [`StatusKey::Export`] (publishing
+//! only if it was set) and emits [`Effect::ExportDone`]; a store or sink failure
+//! sets [`StatusKey::Export`] and publishes. Logs carry the range kind, week, and
+//! row count only, never the path, titles, or contents (AD-14).
 
 mod actor;
 mod batch;
@@ -70,12 +84,14 @@ mod test_support;
 mod tests;
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Date, Day, DayReport, IdGen, IsoWeek, ItemId, LockChoice, PromptId, PromptKind, Running,
-    Schedule, Store, StoreError, TimeZone, Timestamp, WeekReport, WorkEnd,
+    Clock, Date, Day, DayReport, ExportRange, FileSink, IdGen, IsoWeek, ItemId, LockChoice,
+    PromptId, PromptKind, Running, Schedule, Store, StoreError, TimeZone, Timestamp, WeekReport,
+    WorkEnd,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -177,6 +193,11 @@ pub enum EngineMsg {
     /// `carried_from`, logged `CarriedOver` on today, in one batch. Rev-checked; an
     /// empty overflow list is rejected.
     CarryOverToTomorrow { expected_rev: u64 },
+    /// Writes the CSV of `range` (days up to today; today as live state) to
+    /// `path`, replacing any file there, off the actor (AD-16). Not rev-checked and
+    /// read-only on plan state. The outcome comes back as [`Effect::ExportDone`]
+    /// or the [`StatusKey::Export`] status.
+    ExportCsv { path: PathBuf, range: ExportRange },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -211,6 +232,8 @@ pub enum StatusKey {
     /// Re-flow ends flexible items after work-end. Owned by the overflow check
     /// alone: set while the list is non-empty, removed when it is empty.
     Overflow,
+    /// The last CSV export failed. Cleared by the next successful export.
+    Export,
 }
 
 /// One problem the user should see. At most one entry per key.
@@ -271,6 +294,8 @@ pub enum Effect {
     /// A choiceless `Start` of `item_id` hit an undecided day and was rejected:
     /// surfaces that can should ask "lock the day?" and resend with a choice (AD-7).
     AskLockOnStart { item_id: ItemId },
+    /// A CSV export finished writing `rows` records (header not counted).
+    ExportDone { rows: usize },
 }
 
 /// The ports and settings the engine runs on.
@@ -278,6 +303,8 @@ pub struct EngineDeps {
     pub clock: Arc<dyn Clock>,
     pub store: Arc<dyn Store>,
     pub ids: Arc<dyn IdGen>,
+    /// Where CSV exports are written (AD-16).
+    pub files: Arc<dyn FileSink>,
     /// The zone that decides "today" and is fixed on each new day (AD-8).
     pub tz: TimeZone,
 }
@@ -332,6 +359,13 @@ pub(crate) enum Inbox {
     QueryWeek {
         week: IsoWeek,
         reply: oneshot::Sender<WeekReply>,
+    },
+    /// An export task's outcome, tagged with the request id the actor gave it:
+    /// the row count, or the failure message. Outcomes older than the newest one
+    /// already applied are dropped (AD-17).
+    ExportFinished {
+        id: u64,
+        result: Result<usize, String>,
     },
 }
 
@@ -389,6 +423,7 @@ pub fn spawn(deps: EngineDeps) -> (EngineHandle, mpsc::UnboundedReceiver<Effect>
     let (tx, rx) = mpsc::unbounded_channel();
     let (effects_tx, effects) = mpsc::unbounded_channel();
     let (snap_tx, snapshots) = watch::channel(Snapshot::default());
-    tokio::spawn(actor::run(deps, rx, snap_tx, effects_tx));
+    // The actor holds only a weak sender, so dropping every handle still stops it.
+    tokio::spawn(actor::run(deps, rx, tx.downgrade(), snap_tx, effects_tx));
     (EngineHandle { tx, snapshots }, effects)
 }
