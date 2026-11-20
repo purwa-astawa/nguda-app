@@ -48,17 +48,94 @@ export const commands = {
 	 *  the engine (AD-4), so a window that loads after the last event still renders.
 	 */
 	currentSnapshot: () => __TAURI_INVOKE<SnapshotEvent_Serialize>("current_snapshot"),
+	/**
+	 *  The planned-versus-actual report of `date` (`YYYY-MM-DD`), or `null` when no
+	 *  such day is stored. Read-only (AD-16). A malformed date is an `Err` and sends
+	 *  nothing.
+	 */
+	queryDay: (date: string) => typedError<DayReportView_Serialize | null, string>(__TAURI_INVOKE("query_day", { date })),
 };
 
 /** Events */
 export const events = {
 	focusExtendEvent: makeEvent<FocusExtendEvent, FocusExtendEvent>("focus-extend-event"),
+	openSummaryEvent: makeEvent<OpenSummaryEvent, OpenSummaryEvent>("open-summary-event"),
 	snapshotEvent: makeEvent<SnapshotEvent_Serialize, SnapshotEvent_Deserialize>("snapshot-event"),
 };
 
 /* Types */
 /**  Which side of the anchor item a reordered item goes. */
 export type AnchorPlace = "before" | "after";
+
+/**  One frozen baseline item: its planned length and scheduled span at lock. */
+export type BaselineSlotView = BaselineSlotView_Serialize | BaselineSlotView_Deserialize;
+
+/**  One frozen baseline item: its planned length and scheduled span at lock. */
+export type BaselineSlotView_Deserialize = {
+	/**  UUID of the item. */
+	itemId: string,
+	plannedSecs: number,
+	/**  RFC 3339 UTC instant; `null` for a done item without time at lock. */
+	scheduledStart?: string | null,
+	/**  RFC 3339 UTC instant; set exactly when `scheduledStart` is. */
+	scheduledEnd?: string | null,
+};
+
+/**  One frozen baseline item: its planned length and scheduled span at lock. */
+export type BaselineSlotView_Serialize = {
+	/**  UUID of the item. */
+	itemId: string,
+	plannedSecs: number,
+	/**  RFC 3339 UTC instant; `null` for a done item without time at lock. */
+	scheduledStart: string | null,
+	/**  RFC 3339 UTC instant; set exactly when `scheduledStart` is. */
+	scheduledEnd: string | null,
+};
+
+/**  A day's planned-versus-actual report (AD-16), the reply of [`query_day`]. */
+export type DayReportView = DayReportView_Serialize | DayReportView_Deserialize;
+
+/**  A day's planned-versus-actual report (AD-16), the reply of [`query_day`]. */
+export type DayReportView_Deserialize = {
+	/**  Local date, `YYYY-MM-DD`. */
+	date: string,
+	/**  Anything but `locked` means "planned" is the current plan (`unlocked`). */
+	lockDecision: LockDecisionView,
+	/**  RFC 3339 UTC instant the day was locked; `null` unless locked with a baseline. */
+	lockedAt?: string | null,
+	/**
+	 *  Every item of the day, removed and carried-over ones included: schedule
+	 *  order, then removed items. The view shows them as given.
+	 */
+	rows: ReportRowView_Deserialize[],
+	/**  The frozen baseline in schedule order at lock; empty unless locked. */
+	baseline: BaselineSlotView_Deserialize[],
+	/**  Every stretch of actual work, by start. */
+	segments: SegmentView[],
+	/**  The day log in append order. */
+	markers: MarkerView_Deserialize[],
+};
+
+/**  A day's planned-versus-actual report (AD-16), the reply of [`query_day`]. */
+export type DayReportView_Serialize = {
+	/**  Local date, `YYYY-MM-DD`. */
+	date: string,
+	/**  Anything but `locked` means "planned" is the current plan (`unlocked`). */
+	lockDecision: LockDecisionView,
+	/**  RFC 3339 UTC instant the day was locked; `null` unless locked with a baseline. */
+	lockedAt: string | null,
+	/**
+	 *  Every item of the day, removed and carried-over ones included: schedule
+	 *  order, then removed items. The view shows them as given.
+	 */
+	rows: ReportRowView_Serialize[],
+	/**  The frozen baseline in schedule order at lock; empty unless locked. */
+	baseline: BaselineSlotView_Serialize[],
+	/**  Every stretch of actual work, by start. */
+	segments: SegmentView[],
+	/**  The day log in append order. */
+	markers: MarkerView_Serialize[],
+};
 
 export type DayView = {
 	/**  Local date, `YYYY-MM-DD`. */
@@ -181,11 +258,97 @@ export type LockChoiceArg =
 
 export type LockDecisionView = "none" | "locked" | "noLock";
 
+export type MarkerKindView = "recovered" | "removed" | "switched" | "extended" | "inserted" | "carriedOver";
+
+/**  One day-log entry. */
+export type MarkerView = MarkerView_Serialize | MarkerView_Deserialize;
+
+/**  One day-log entry. */
+export type MarkerView_Deserialize = {
+	/**  RFC 3339 UTC instant. */
+	at: string,
+	kind: MarkerKindView,
+	/**  UUID of the item the entry is about (for `switched`, the item switched from). */
+	itemId: string,
+	/**
+	 *  UUID of the other item: the switch target (`null` when nothing was left) or
+	 *  the carried-over copy. `null` for every other kind.
+	 */
+	toItemId?: string | null,
+	/**  The seconds an `extended` entry added; `null` for every other kind. */
+	secs?: number | null,
+};
+
+/**  One day-log entry. */
+export type MarkerView_Serialize = {
+	/**  RFC 3339 UTC instant. */
+	at: string,
+	kind: MarkerKindView,
+	/**  UUID of the item the entry is about (for `switched`, the item switched from). */
+	itemId: string,
+	/**
+	 *  UUID of the other item: the switch target (`null` when nothing was left) or
+	 *  the carried-over copy. `null` for every other kind.
+	 */
+	toItemId: string | null,
+	/**  The seconds an `extended` entry added; `null` for every other kind. */
+	secs: number | null,
+};
+
+/**
+ *  The tray's "Today's summary" was picked: the view shows the Summary tab for
+ *  the snapshot's today. Carries nothing.
+ */
+export type OpenSummaryEvent = null;
+
+/**  Where a row's planned value comes from (AD-6). */
+export type PlannedSourceView = 
+/**  The frozen baseline of a locked day. */
+"baseline" | 
+/**  The current plan of a day that is not locked. */
+"unlocked" | 
+/**  Added to a locked day after lock: no planned value. */
+"unplanned";
+
 /**  A reorder target: next to another flexible item, never a numeric index (AD-15). */
 export type ReorderAnchorArg = {
 	place: AnchorPlace,
 	/**  UUID of the anchor item. */
 	itemId: string,
+};
+
+export type ReportRowView = ReportRowView_Serialize | ReportRowView_Deserialize;
+
+export type ReportRowView_Deserialize = {
+	/**  UUID of the item. */
+	itemId: string,
+	title: string,
+	status: ItemStatusView,
+	/**  UUID of the item on an earlier day this one was carried over from. */
+	carriedFrom?: string | null,
+	/**  `null` exactly when `plannedSource` is `unplanned`. */
+	plannedSecs?: number | null,
+	plannedSource: PlannedSourceView,
+	/**  Closed segments plus the open one up to the engine's `now`. */
+	actualSecs: number,
+	/**  `actualSecs − plannedSecs`, signed and saturating; `null` with no planned value. */
+	differenceSecs?: number | null,
+};
+
+export type ReportRowView_Serialize = {
+	/**  UUID of the item. */
+	itemId: string,
+	title: string,
+	status: ItemStatusView,
+	/**  UUID of the item on an earlier day this one was carried over from. */
+	carriedFrom: string | null,
+	/**  `null` exactly when `plannedSource` is `unplanned`. */
+	plannedSecs: number | null,
+	plannedSource: PlannedSourceView,
+	/**  Closed segments plus the open one up to the engine's `now`. */
+	actualSecs: number,
+	/**  `actualSecs − plannedSecs`, signed and saturating; `null` with no planned value. */
+	differenceSecs: number | null,
 };
 
 export type RunningView = {
@@ -195,6 +358,17 @@ export type RunningView = {
 	/**  RFC 3339 UTC instant, e.g. `2026-11-10T09:00:00Z`. */
 	segmentStartedAt: string,
 	accumulatedSecs: number,
+};
+
+/**  One stretch of actual work. An open one ends at the engine's `now`. */
+export type SegmentView = {
+	/**  UUID of the item. */
+	itemId: string,
+	/**  RFC 3339 UTC instant. */
+	start: string,
+	/**  RFC 3339 UTC instant. */
+	end: string,
+	open: boolean,
 };
 
 /**

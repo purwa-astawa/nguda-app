@@ -106,3 +106,71 @@ body {
 .actions {
   margin-top: 0.3rem;
 }
+
+.tabs {
+  display: flex;
+  gap: 0.2rem;
+  border-bottom: 1px solid #ccc;
+  margin-bottom: 0.6rem;
+}
+
+.tabs button {
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: none;
+  padding: 0.3rem 0.8rem;
+  cursor: pointer;
+}
+
+.tabs button.active {
+  border-color: #ccc;
+  border-radius: 4px 4px 0 0;
+  background: #fff;
+  font-weight: bold;
+  margin-bottom: -1px;
+}
+
+.summary > label,
+.summary > button {
+  margin-right: 0.4rem;
+}
+
+.report {
+  border-collapse: collapse;
+  margin-top: 0.6rem;
+  width: 100%;
+}
+
+.report th,
+.report td {
+  text-align: left;
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid #ddd;
+}
+
+.report .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.report tr.removed td,
+.report tr.carriedOver td {
+  color: #777;
+}
+
+.report .over {
+  color: #b00020;
+}
+
+.report .under {
+  color: #1b5e20;
+}
+
+.mark {
+  font-size: 0.75em;
+  margin-left: 0.4rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  color: #6b4500;
+}

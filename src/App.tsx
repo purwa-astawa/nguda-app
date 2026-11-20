@@ -18,6 +18,7 @@ import {
   type Snapshot,
 } from "./plan";
 import { PlanItemRow } from "./PlanItemRow";
+import { Summary } from "./Summary";
 import "./App.css";
 
 /** Sends one command. Resolves to the error text of a malformed-input `Err`. */
@@ -67,8 +68,17 @@ async function dispatch(cmd: Command): Promise<string | null> {
   return res.status === "error" ? res.error : null;
 }
 
-// Thin view (AD-5): it keeps only the newest snapshot plus local form state, shows
-// items in the order given, and sends every change as a command.
+type Tab = "plan" | "summary" | "week";
+
+const TABS: { value: Tab; label: string }[] = [
+  { value: "plan", label: "Plan" },
+  { value: "summary", label: "Summary" },
+  { value: "week", label: "Week" },
+];
+
+// Thin view (AD-5): it keeps only the newest snapshot, the shown summary's query
+// result, and local form state; it shows items in the order given and sends every
+// change as a command.
 function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -86,9 +96,28 @@ function App() {
   const [askingLock, setAskingLock] = useState<Command | null>(null);
   // Runs once the held command is sent (not on Cancel), e.g. to clear its form.
   const [afterAsk, setAfterAsk] = useState<(() => void) | null>(null);
+  const [tab, setTab] = useState<Tab>("plan");
+  // The summary's picked date; `null` follows the snapshot's today.
+  const [summaryDate, setSummaryDate] = useState<string | null>(null);
+  // Bumped by the tray's "Today's summary", so it asks again even when already shown.
+  const [summaryOpened, setSummaryOpened] = useState(0);
 
   useEffect(() => {
-    const unlisten = events.focusExtendEvent.listen(() => setFocusExtend((n) => n + 1));
+    const unlisten = events.openSummaryEvent.listen(() => {
+      setTab("summary");
+      setSummaryDate(null);
+      setSummaryOpened((n) => n + 1);
+    });
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = events.focusExtendEvent.listen(() => {
+      setTab("plan");
+      setFocusExtend((n) => n + 1);
+    });
     return () => {
       unlisten.then((stop) => stop());
     };
@@ -164,33 +193,9 @@ function App() {
   const lockDay = lockDayCommand(snap);
   const badge = lockBadge(snap);
 
-  return (
-    <main>
-      <h1>
-        nguda{snap.day ? ` · ${snap.day.date}` : ""}
-        {badge && <span className={`badge ${badge}`}>{badge}</span>}
-      </h1>
-      {lockDay && (
-        <button type="button" className="lock-day" onClick={() => send(lockDay)}>
-          Lock day
-        </button>
-      )}
-
-      {askingLock && (
-        <div className="ask-lock" role="dialog" aria-label="Lock the day?">
-          <p>Lock today's plan as the baseline before starting?</p>
-          <button type="button" onClick={() => answerLock("lock")}>
-            Lock &amp; start
-          </button>
-          <button type="button" onClick={() => answerLock("noLock")}>
-            Start without lock
-          </button>
-          <button type="button" onClick={() => answerLock(null)}>
-            Cancel
-          </button>
-        </div>
-      )}
-
+  // Status entries and local errors, shown on every tab.
+  const statusView = (
+    <>
       {snap.status.map((s) =>
         s.key === "overflow" ? (
           <div key={s.key} className="status overflow" role="alert">
@@ -214,6 +219,32 @@ function App() {
         <p className="status" role="alert">
           {localError}
         </p>
+      )}
+    </>
+  );
+
+  // The Plan tab: the day plan and its forms.
+  const planView = (
+    <>
+      {lockDay && (
+        <button type="button" className="lock-day" onClick={() => send(lockDay)}>
+          Lock day
+        </button>
+      )}
+
+      {askingLock && (
+        <div className="ask-lock" role="dialog" aria-label="Lock the day?">
+          <p>Lock today's plan as the baseline before starting?</p>
+          <button type="button" onClick={() => answerLock("lock")}>
+            Lock &amp; start
+          </button>
+          <button type="button" onClick={() => answerLock("noLock")}>
+            Start without lock
+          </button>
+          <button type="button" onClick={() => answerLock(null)}>
+            Cancel
+          </button>
+        </div>
       )}
 
       <form
@@ -320,6 +351,49 @@ function App() {
           ))}
         </ol>
       )}
+    </>
+  );
+
+  return (
+    <main>
+      <h1>
+        nguda{snap.day ? ` · ${snap.day.date}` : ""}
+        {tab === "plan" && badge && <span className={`badge ${badge}`}>{badge}</span>}
+      </h1>
+      <nav className="tabs" role="tablist">
+        {TABS.map((t) => (
+          <button
+            key={t.value}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.value}
+            className={tab === t.value ? "active" : ""}
+            onClick={() => setTab(t.value)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
+
+      {statusView}
+
+      {tab === "summary" &&
+        (snap.day ? (
+          <Summary
+            date={summaryDate ?? snap.day.date}
+            today={snap.day.date}
+            rev={snap.rev}
+            opened={summaryOpened}
+            onDate={(d) => setSummaryDate(d === snap.day?.date ? null : d)}
+          />
+        ) : (
+          <p>Starting…</p>
+        ))}
+
+      {tab === "week" && <p>Weekly view coming soon.</p>}
+
+      {/* Kept mounted so the tray's Extend… can always focus the running row. */}
+      <div hidden={tab !== "plan"}>{planView}</div>
     </main>
   );
 }

@@ -401,6 +401,21 @@ impl MemoryStore {
         self.data.lock().unwrap().work_end = Some(work_end);
     }
 
+    /// Stores `baseline` as its date's baseline as is, bypassing batches.
+    pub(crate) fn seed_baseline(&self, baseline: Baseline) {
+        self.data
+            .lock()
+            .unwrap()
+            .baselines
+            .insert(baseline.date, baseline);
+    }
+
+    /// Appends `entries` to `date`'s day log as is, bypassing batches.
+    pub(crate) fn seed_day_log(&self, date: Date, entries: Vec<DayLogEntry>) {
+        let mut data = self.data.lock().unwrap();
+        data.day_log.extend(entries.into_iter().map(|e| (date, e)));
+    }
+
     pub(crate) fn seed_last_alive(&self, at: Option<Timestamp>) {
         self.data.lock().unwrap().last_alive = at;
     }

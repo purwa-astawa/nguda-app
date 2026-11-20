@@ -1,13 +1,12 @@
-//! One test per row of the engine's I/O matrices (startup and recovery, and the
-//! plan commands, the work-end setting and overflow), and the exactly-once effect
-//! check. All run against `MemoryStore`
-//! in UTC.
+//! One test per row of the engine's I/O matrices (startup and recovery, the plan
+//! commands, the work-end setting and overflow, and the day query), and the
+//! exactly-once effect check. All run against `MemoryStore` in UTC.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Baseline, BaselineItem, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, LockChoice,
+    Baseline, BaselineItem, Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, LockChoice,
     LockDecision, OrderKey, PlanItem, PromptKind, Segment, SlotKind, StoreOp, TimeZone, WorkEnd,
 };
 use tokio::sync::{mpsc, watch};
@@ -2631,4 +2630,221 @@ async fn a_second_baseline_for_a_date_fails_and_rolls_back_its_batch() {
         LockDecision::None,
         "rolled back"
     );
+}
+
+// --- Day query (AD-4, AD-16) ---
+
+use nguda_core::{ActualSegment, PlannedSource, ReportRow};
+
+use crate::QueryError;
+
+/// A report row's id, status, planned, source, actual and difference.
+type RowFigures = (
+    ItemId,
+    ItemStatus,
+    Option<u64>,
+    PlannedSource,
+    u64,
+    Option<i64>,
+);
+
+/// Day 1 locked at 50 with A, B and C in the baseline: A done (700 s, extended
+/// by 100 after lock), C removed, and D inserted after lock and done (300 s).
+fn locked_past_day() -> (Day, Baseline, Vec<DayLogEntry>) {
+    let mut day = locked(undecided_abc());
+    day.start(id(100), ts(100)).unwrap();
+    day.extend(id(100), 100).unwrap();
+    day.finish(id(100), ts(800)).unwrap();
+    day.remove(id(102), ts(850)).unwrap();
+    day.add(item(103, "D", "X")).unwrap();
+    day.start(id(103), ts(900)).unwrap();
+    day.finish(id(103), ts(1_200)).unwrap();
+    let baseline = Baseline {
+        date: day1(),
+        locked_at: ts(50),
+        items: vec![
+            frozen(100, 600, 50, 650),
+            frozen(101, 600, 650, 1_250),
+            frozen(102, 600, 1_250, 1_850),
+        ],
+    };
+    let log = vec![
+        DayLogEntry {
+            at: ts(500),
+            kind: DayLogKind::Extended {
+                item_id: id(100),
+                secs: 100,
+            },
+        },
+        removed_at(102, 850),
+        DayLogEntry {
+            at: ts(900),
+            kind: DayLogKind::Inserted { item_id: id(103) },
+        },
+    ];
+    (day, baseline, log)
+}
+
+/// Asserts the query changed nothing: the next command publishes exactly rev 2
+/// and the store saw no batch besides those before the query.
+async fn expect_untouched(h: &mut Harness, store: &MemoryStore, batches_before: usize) {
+    assert_eq!(store.batches().len(), batches_before, "no batch");
+    let snap = h.rx.borrow().clone();
+    assert_eq!(snap.rev, 1);
+    assert!(snap.status.is_empty());
+    h.send(create("Next", 60));
+    h.rev(2).await;
+}
+
+#[tokio::test]
+async fn a_locked_past_day_is_reported_from_the_store_read_only() {
+    let (past, baseline, log) = locked_past_day();
+    let (clock, store) = (FakeClock::at(DAY_SECS + 1_000), MemoryStore::new());
+    store.seed(&past);
+    store.seed_baseline(baseline.clone());
+    store.seed_day_log(day1(), log.clone());
+    let mut h = start(&clock, &store);
+    let today = h.rev(1).await;
+    assert_eq!(day_of(&today).date(), day2());
+    let batches = store.batches().len();
+
+    let report = h.engine.query_day(day1()).await.unwrap().unwrap();
+    assert_eq!(report.date, day1());
+    assert_eq!(report.lock_decision, LockDecision::Locked);
+    assert_eq!(report.locked_at, Some(ts(50)));
+    assert_eq!(report.baseline, baseline.items);
+    assert_eq!(report.markers, log);
+    let rows: Vec<RowFigures> = report
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r.item_id,
+                r.status,
+                r.planned_secs,
+                r.planned_source,
+                r.actual_secs,
+                r.difference_secs,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                id(100),
+                ItemStatus::Done,
+                Some(600),
+                PlannedSource::Baseline,
+                700,
+                Some(100)
+            ),
+            (
+                id(103),
+                ItemStatus::Done,
+                None,
+                PlannedSource::Unplanned,
+                300,
+                None
+            ),
+            (
+                id(101),
+                ItemStatus::Pending,
+                Some(600),
+                PlannedSource::Baseline,
+                0,
+                Some(-600)
+            ),
+            (
+                id(102),
+                ItemStatus::Removed,
+                Some(600),
+                PlannedSource::Baseline,
+                0,
+                Some(-600)
+            ),
+        ]
+    );
+    assert_eq!(report.segments.len(), 2);
+    assert!(report.segments.iter().all(|s| !s.open));
+    expect_untouched(&mut h, &store, batches).await;
+}
+
+#[tokio::test]
+async fn today_is_reported_from_live_state_with_the_running_item_counting_to_now() {
+    let mut day = no_lock(Day::new(day1(), "UTC"));
+    day.add(item(100, "other", "V")).unwrap();
+    let (mut h, _store) = running_on(1_000, Some(&day)).await;
+    h.send(start_msg(100, 1));
+    h.rev(2).await;
+    h.send(create("Fresh", 300));
+    h.rev(3).await;
+    h.clock.set(1_030);
+    let report = h.engine.query_day(day1()).await.unwrap().unwrap();
+    assert_eq!(report.lock_decision, LockDecision::NoLock);
+    assert!(report.baseline.is_empty());
+    assert_eq!(
+        report.rows[0],
+        ReportRow {
+            item_id: id(100),
+            title: "other".into(),
+            status: ItemStatus::Running,
+            carried_from: None,
+            planned_secs: Some(600),
+            planned_source: PlannedSource::Unlocked,
+            actual_secs: 30,
+            difference_secs: Some(-570),
+        }
+    );
+    assert_eq!(
+        report.rows.len(),
+        2,
+        "the task created a moment ago is there"
+    );
+    assert_eq!(report.rows[1].title, "Fresh");
+    assert_eq!(
+        report.segments,
+        vec![ActualSegment {
+            item_id: id(100),
+            start: ts(1_000),
+            end: ts(1_030),
+            open: true,
+        }]
+    );
+    assert_eq!(h.rx.borrow().rev, 3, "no publish");
+}
+
+#[tokio::test]
+async fn an_unknown_date_reports_none() {
+    let (mut h, store) = running_on(1_000, None).await;
+    let batches = store.batches().len();
+    assert_eq!(h.engine.query_day(day2()).await, Ok(None));
+    let before = Date::constant(1969, 12, 31);
+    assert_eq!(h.engine.query_day(before).await, Ok(None));
+    expect_untouched(&mut h, &store, batches).await;
+}
+
+#[tokio::test]
+async fn a_failed_load_is_a_store_error_and_leaves_state_and_status_untouched() {
+    let (past, _, _) = locked_past_day();
+    let (clock, store) = (FakeClock::at(DAY_SECS + 1_000), MemoryStore::new());
+    store.seed(&past);
+    let mut h = start(&clock, &store);
+    h.rev(1).await;
+    let batches = store.batches().len();
+
+    store.fail_load_day(true);
+    let err = QueryError::Store(nguda_core::StoreError::new(INJECTED));
+    assert_eq!(h.engine.query_day(day1()).await, Err(err.clone()));
+    store.fail_load_day(false);
+    // Today comes from memory, but its log still has to be read.
+    store.fail_loads(true);
+    assert_eq!(h.engine.query_day(day2()).await, Err(err.clone()));
+    store.fail_loads(false);
+    assert_eq!(err.to_string(), format!("store read failed: {INJECTED}"));
+    assert_eq!(
+        QueryError::EngineClosed.to_string(),
+        "engine is not running"
+    );
+    expect_untouched(&mut h, &store, batches).await;
 }

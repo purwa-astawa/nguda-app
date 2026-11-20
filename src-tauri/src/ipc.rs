@@ -10,9 +10,14 @@
 //! Commands are fire-and-forget (AD-4). Each one only parses its arguments, failing
 //! with `Err` on malformed input without sending anything; every semantic check
 //! happens in the engine, which reports rejections through `Snapshot.status`.
+//!
+//! The one exception is [`query_day`] (AD-16), a read-only request/reply. It is an
+//! `async` command, so Tauri runs it off the main thread and nothing there waits
+//! on the engine (AD-4). Dates cross as `YYYY-MM-DD`.
 
 use nguda_core::{
-    Day, ItemId, ItemStatus, LockChoice, LockDecision, PlanItem, Slot, Timestamp, Uuid, closed_secs,
+    BaselineItem, Date, Day, DayLogEntry, DayLogKind, DayReport, ItemId, ItemStatus, LockChoice,
+    LockDecision, PlanItem, PlannedSource, ReportRow, Slot, Timestamp, Uuid, closed_secs,
 };
 use nguda_engine::{EngineHandle, EngineMsg, InsertAnchor, ReorderAnchor, Snapshot, StatusKey};
 use serde::{Deserialize, Serialize};
@@ -231,7 +236,37 @@ pub fn carry_over_to_tomorrow(
     send(&engine, Ok(carry_over_to_tomorrow_msg(expected_rev)))
 }
 
+/// The planned-versus-actual report of `date` (`YYYY-MM-DD`), or `null` when no
+/// such day is stored. Read-only (AD-16). A malformed date is an `Err` and sends
+/// nothing.
+#[tauri::command]
+#[specta::specta]
+pub async fn query_day(
+    engine: State<'_, EngineHandle>,
+    date: String,
+) -> Result<Option<DayReportView>, String> {
+    let date = parse_date(&date)?;
+    let report = engine.query_day(date).await.map_err(|e| e.to_string())?;
+    Ok(report.as_ref().map(DayReportView::from))
+}
+
 // --- Argument parsing: syntax only, no semantic checks ---
+
+fn parse_date(s: &str) -> Result<Date, String> {
+    let bad = || "invalid date: expected YYYY-MM-DD".to_owned();
+    let shaped = s.len() == 10
+        && s.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !shaped {
+        return Err(bad());
+    }
+    s.parse::<Date>().map_err(|_| bad())
+}
 
 fn parse_item_id(s: &str) -> Result<ItemId, String> {
     Uuid::parse_str(s)
@@ -382,6 +417,11 @@ fn insert_task_msg(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type, Event)]
 pub struct FocusExtendEvent;
 
+/// The tray's "Today's summary" was picked: the view shows the Summary tab for
+/// the snapshot's today. Carries nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type, Event)]
+pub struct OpenSummaryEvent;
+
 /// The last engine snapshot, as the view sees it. Also the reply of
 /// [`current_snapshot`], so a window that loads late still gets the latest state.
 #[derive(Clone, Debug, PartialEq, Serialize, specta::Type, Event)]
@@ -517,6 +557,187 @@ pub struct RunningView {
     pub accumulated_secs: u32,
 }
 
+/// A day's planned-versus-actual report (AD-16), the reply of [`query_day`].
+#[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DayReportView {
+    /// Local date, `YYYY-MM-DD`.
+    pub date: String,
+    /// Anything but `locked` means "planned" is the current plan (`unlocked`).
+    pub lock_decision: LockDecisionView,
+    /// RFC 3339 UTC instant the day was locked; `null` unless locked with a baseline.
+    pub locked_at: Option<String>,
+    /// Every item of the day, removed and carried-over ones included: schedule
+    /// order, then removed items. The view shows them as given.
+    pub rows: Vec<ReportRowView>,
+    /// The frozen baseline in schedule order at lock; empty unless locked.
+    pub baseline: Vec<BaselineSlotView>,
+    /// Every stretch of actual work, by start.
+    pub segments: Vec<SegmentView>,
+    /// The day log in append order.
+    pub markers: Vec<MarkerView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportRowView {
+    /// UUID of the item.
+    pub item_id: String,
+    pub title: String,
+    pub status: ItemStatusView,
+    /// UUID of the item on an earlier day this one was carried over from.
+    pub carried_from: Option<String>,
+    /// `null` exactly when `plannedSource` is `unplanned`.
+    pub planned_secs: Option<u32>,
+    pub planned_source: PlannedSourceView,
+    /// Closed segments plus the open one up to the engine's `now`.
+    pub actual_secs: u32,
+    /// `actualSecs − plannedSecs`, signed and saturating; `null` with no planned value.
+    pub difference_secs: Option<i32>,
+}
+
+/// Where a row's planned value comes from (AD-6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum PlannedSourceView {
+    /// The frozen baseline of a locked day.
+    Baseline,
+    /// The current plan of a day that is not locked.
+    Unlocked,
+    /// Added to a locked day after lock: no planned value.
+    Unplanned,
+}
+
+impl From<PlannedSource> for PlannedSourceView {
+    fn from(p: PlannedSource) -> Self {
+        match p {
+            PlannedSource::Baseline => Self::Baseline,
+            PlannedSource::Unlocked => Self::Unlocked,
+            PlannedSource::Unplanned => Self::Unplanned,
+        }
+    }
+}
+
+/// One frozen baseline item: its planned length and scheduled span at lock.
+#[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineSlotView {
+    /// UUID of the item.
+    pub item_id: String,
+    pub planned_secs: u32,
+    /// RFC 3339 UTC instant; `null` for a done item without time at lock.
+    pub scheduled_start: Option<String>,
+    /// RFC 3339 UTC instant; set exactly when `scheduledStart` is.
+    pub scheduled_end: Option<String>,
+}
+
+/// One stretch of actual work. An open one ends at the engine's `now`.
+#[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentView {
+    /// UUID of the item.
+    pub item_id: String,
+    /// RFC 3339 UTC instant.
+    pub start: String,
+    /// RFC 3339 UTC instant.
+    pub end: String,
+    pub open: bool,
+}
+
+/// One day-log entry.
+#[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkerView {
+    /// RFC 3339 UTC instant.
+    pub at: String,
+    pub kind: MarkerKindView,
+    /// UUID of the item the entry is about (for `switched`, the item switched from).
+    pub item_id: String,
+    /// UUID of the other item: the switch target (`null` when nothing was left) or
+    /// the carried-over copy. `null` for every other kind.
+    pub to_item_id: Option<String>,
+    /// The seconds an `extended` entry added; `null` for every other kind.
+    pub secs: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum MarkerKindView {
+    Recovered,
+    Removed,
+    Switched,
+    Extended,
+    Inserted,
+    CarriedOver,
+}
+
+impl From<&DayReport> for DayReportView {
+    fn from(r: &DayReport) -> Self {
+        Self {
+            date: r.date.to_string(),
+            lock_decision: r.lock_decision.into(),
+            locked_at: r.locked_at.map(|t| t.to_string()),
+            rows: r.rows.iter().map(row_view).collect(),
+            baseline: r.baseline.iter().map(baseline_view).collect(),
+            segments: r
+                .segments
+                .iter()
+                .map(|s| SegmentView {
+                    item_id: s.item_id.to_string(),
+                    start: s.start.to_string(),
+                    end: s.end.to_string(),
+                    open: s.open,
+                })
+                .collect(),
+            markers: r.markers.iter().map(marker_view).collect(),
+        }
+    }
+}
+
+fn row_view(r: &ReportRow) -> ReportRowView {
+    ReportRowView {
+        item_id: r.item_id.to_string(),
+        title: r.title.clone(),
+        status: r.status.into(),
+        carried_from: r.carried_from.map(|id| id.to_string()),
+        planned_secs: r.planned_secs.map(saturating_u32),
+        planned_source: r.planned_source.into(),
+        actual_secs: saturating_u32(r.actual_secs),
+        difference_secs: r.difference_secs.map(saturating_i32),
+    }
+}
+
+fn baseline_view(b: &BaselineItem) -> BaselineSlotView {
+    BaselineSlotView {
+        item_id: b.item_id.to_string(),
+        planned_secs: saturating_u32(b.planned_secs),
+        scheduled_start: b.span.map(|sp| sp.start.to_string()),
+        scheduled_end: b.span.map(|sp| sp.end.to_string()),
+    }
+}
+
+fn marker_view(e: &DayLogEntry) -> MarkerView {
+    let (kind, item_id, to, secs) = match &e.kind {
+        DayLogKind::Recovered { item_id } => (MarkerKindView::Recovered, item_id, None, None),
+        DayLogKind::Removed { item_id } => (MarkerKindView::Removed, item_id, None, None),
+        DayLogKind::Switched { from, to } => (MarkerKindView::Switched, from, *to, None),
+        DayLogKind::Extended { item_id, secs } => {
+            (MarkerKindView::Extended, item_id, None, Some(*secs))
+        }
+        DayLogKind::Inserted { item_id } => (MarkerKindView::Inserted, item_id, None, None),
+        DayLogKind::CarriedOver { item_id, to } => {
+            (MarkerKindView::CarriedOver, item_id, Some(*to), None)
+        }
+    };
+    MarkerView {
+        at: e.at.to_string(),
+        kind,
+        item_id: item_id.to_string(),
+        to_item_id: to.map(|id| id.to_string()),
+        secs: secs.map(saturating_u32),
+    }
+}
+
 impl From<&Snapshot> for SnapshotEvent {
     fn from(s: &Snapshot) -> Self {
         let items: Vec<ItemView> = s
@@ -585,6 +806,10 @@ fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+fn saturating_i32(n: i64) -> i32 {
+    i32::try_from(n).unwrap_or(if n < 0 { i32::MIN } else { i32::MAX })
+}
+
 pub fn specta_builder() -> Builder<Wry> {
     Builder::<Wry>::new()
         .commands(collect_commands![
@@ -601,9 +826,14 @@ pub fn specta_builder() -> Builder<Wry> {
             insert_task,
             set_work_end,
             carry_over_to_tomorrow,
-            current_snapshot
+            current_snapshot,
+            query_day
         ])
-        .events(collect_events![SnapshotEvent, FocusExtendEvent])
+        .events(collect_events![
+            SnapshotEvent,
+            FocusExtendEvent,
+            OpenSummaryEvent
+        ])
 }
 
 #[cfg(any(debug_assertions, test))]
@@ -667,11 +897,13 @@ mod tests {
             "setWorkEnd",
             "carryOverToTomorrow",
             "currentSnapshot",
+            "queryDay",
         ] {
             assert!(committed.contains(&format!("\t{name}: ")), "{name}");
         }
         assert!(!committed.contains("startDemo"));
         assert!(committed.contains("focusExtendEvent"));
+        assert!(committed.contains("openSummaryEvent"));
     }
 
     #[test]
@@ -1115,6 +1347,192 @@ mod tests {
         let r = SnapshotEvent::from(&snap).running.unwrap();
         assert_eq!(r.item_id, A);
         assert_eq!(r.segment_started_at, "1970-01-01T00:00:01.5Z");
+    }
+
+    #[test]
+    fn query_day_dates_parse_only_as_yyyy_mm_dd() {
+        assert_eq!(parse_date("2026-11-21"), Ok(Date::constant(2026, 11, 21)));
+        for bad in [
+            "",
+            "2026-13-40",
+            "2026-02-30",
+            "2026-1-01",
+            "20261121",
+            "2026-11-21T00:00",
+            " 2026-11-21",
+            "2026/11/21",
+            "+002026-11",
+        ] {
+            assert!(parse_date(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn day_report_view_converts_every_field() {
+        use nguda_core::{ActualSegment, Span};
+        let report = DayReport {
+            date: Date::constant(2026, 11, 21),
+            lock_decision: LockDecision::Locked,
+            locked_at: Some(ts("2026-11-21T08:00:00Z")),
+            rows: vec![
+                ReportRow {
+                    item_id: item(A),
+                    title: "Write".into(),
+                    status: ItemStatus::CarriedOver,
+                    carried_from: Some(item(B)),
+                    planned_secs: Some(1500),
+                    planned_source: PlannedSource::Baseline,
+                    actual_secs: 1900,
+                    difference_secs: Some(400),
+                },
+                ReportRow {
+                    item_id: item(B),
+                    title: "Call".into(),
+                    status: ItemStatus::Done,
+                    carried_from: None,
+                    planned_secs: None,
+                    planned_source: PlannedSource::Unplanned,
+                    actual_secs: u64::MAX,
+                    difference_secs: None,
+                },
+                ReportRow {
+                    item_id: item(F),
+                    title: "Huge".into(),
+                    status: ItemStatus::Removed,
+                    carried_from: None,
+                    planned_secs: Some(u64::MAX),
+                    planned_source: PlannedSource::Unlocked,
+                    actual_secs: 0,
+                    difference_secs: Some(i64::MIN),
+                },
+            ],
+            baseline: vec![
+                BaselineItem {
+                    item_id: item(A),
+                    planned_secs: 1500,
+                    span: Some(Span {
+                        start: ts("2026-11-21T09:00:00Z"),
+                        end: ts("2026-11-21T09:25:00Z"),
+                    }),
+                },
+                BaselineItem {
+                    item_id: item(F),
+                    planned_secs: 60,
+                    span: None,
+                },
+            ],
+            segments: vec![ActualSegment {
+                item_id: item(A),
+                start: ts("2026-11-21T09:00:00Z"),
+                end: ts("2026-11-21T09:31:40Z"),
+                open: true,
+            }],
+            markers: [
+                DayLogKind::Recovered { item_id: item(A) },
+                DayLogKind::Removed { item_id: item(A) },
+                DayLogKind::Switched {
+                    from: item(A),
+                    to: Some(item(B)),
+                },
+                DayLogKind::Switched {
+                    from: item(A),
+                    to: None,
+                },
+                DayLogKind::Extended {
+                    item_id: item(A),
+                    secs: 300,
+                },
+                DayLogKind::Inserted { item_id: item(B) },
+                DayLogKind::CarriedOver {
+                    item_id: item(A),
+                    to: item(B),
+                },
+            ]
+            .into_iter()
+            .map(|kind| DayLogEntry {
+                at: ts("2026-11-21T10:00:00Z"),
+                kind,
+            })
+            .collect(),
+        };
+        let v = DayReportView::from(&report);
+        assert_eq!(v.date, "2026-11-21");
+        assert_eq!(v.lock_decision, LockDecisionView::Locked);
+        assert_eq!(v.locked_at.as_deref(), Some("2026-11-21T08:00:00Z"));
+        assert_eq!(
+            v.rows[0],
+            ReportRowView {
+                item_id: A.into(),
+                title: "Write".into(),
+                status: ItemStatusView::CarriedOver,
+                carried_from: Some(B.into()),
+                planned_secs: Some(1500),
+                planned_source: PlannedSourceView::Baseline,
+                actual_secs: 1900,
+                difference_secs: Some(400),
+            }
+        );
+        assert_eq!(v.rows[1].planned_secs, None);
+        assert_eq!(v.rows[1].planned_source, PlannedSourceView::Unplanned);
+        assert_eq!(v.rows[1].actual_secs, u32::MAX, "saturating");
+        assert_eq!(v.rows[1].difference_secs, None);
+        assert_eq!(v.rows[2].planned_secs, Some(u32::MAX));
+        assert_eq!(v.rows[2].planned_source, PlannedSourceView::Unlocked);
+        assert_eq!(v.rows[2].difference_secs, Some(i32::MIN), "saturating");
+        assert_eq!(saturating_i32(i64::MAX), i32::MAX);
+        assert_eq!(
+            v.baseline,
+            [
+                BaselineSlotView {
+                    item_id: A.into(),
+                    planned_secs: 1500,
+                    scheduled_start: Some("2026-11-21T09:00:00Z".into()),
+                    scheduled_end: Some("2026-11-21T09:25:00Z".into()),
+                },
+                BaselineSlotView {
+                    item_id: F.into(),
+                    planned_secs: 60,
+                    scheduled_start: None,
+                    scheduled_end: None,
+                },
+            ]
+        );
+        assert_eq!(
+            v.segments,
+            [SegmentView {
+                item_id: A.into(),
+                start: "2026-11-21T09:00:00Z".into(),
+                end: "2026-11-21T09:31:40Z".into(),
+                open: true,
+            }]
+        );
+        let markers: Vec<(MarkerKindView, &str, Option<&str>, Option<u32>)> = v
+            .markers
+            .iter()
+            .map(|m| {
+                assert_eq!(m.at, "2026-11-21T10:00:00Z");
+                (m.kind, m.item_id.as_str(), m.to_item_id.as_deref(), m.secs)
+            })
+            .collect();
+        assert_eq!(
+            markers,
+            [
+                (MarkerKindView::Recovered, A, None, None),
+                (MarkerKindView::Removed, A, None, None),
+                (MarkerKindView::Switched, A, Some(B), None),
+                (MarkerKindView::Switched, A, None, None),
+                (MarkerKindView::Extended, A, None, Some(300)),
+                (MarkerKindView::Inserted, B, None, None),
+                (MarkerKindView::CarriedOver, A, Some(B), None),
+            ]
+        );
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["lockDecision"], "locked");
+        assert_eq!(json["rows"][0]["plannedSource"], "baseline");
+        assert_eq!(json["rows"][0]["differenceSecs"], 400);
+        assert_eq!(json["rows"][0]["carriedFrom"], B);
+        assert_eq!(json["markers"][6]["kind"], "carriedOver");
+        assert_eq!(json["markers"][6]["toItemId"], B);
     }
 
     /// The item without its scheduled times, which follow the system clock.
