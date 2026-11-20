@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { commands } from "./bindings";
 import { diffClass, formatDiff, formatSecs, isUnlocked, rowMarks, type DayReport } from "./report";
+import { Timeline } from "./Timeline";
 
 /** The last reply, with the date it answers. */
 type Loaded = { date: string } & (
@@ -75,7 +76,11 @@ export function Summary({ date, today, rev, opened, onDate }: Props) {
         </p>
       ) : loaded.kind === "none" ? (
         <p>No data for this day.</p>
-      ) : !report ? null : report.rows.length === 0 ? (
+      ) : null}
+
+      {report && <Timeline report={report} />}
+
+      {!report ? null : report.rows.length === 0 ? (
         <p>No tasks on this day.</p>
       ) : (
         <table className="report">
