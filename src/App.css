@@ -135,6 +135,23 @@ body {
   margin-right: 0.4rem;
 }
 
+.week h2 {
+  font-size: 1.1rem;
+  margin: 0.8rem 0 0.4rem;
+}
+
+.week h2 small,
+.week .counts,
+.week .excluded {
+  color: #666;
+  font-weight: normal;
+}
+
+.week .gap strong {
+  font-size: 1.3em;
+  font-variant-numeric: tabular-nums;
+}
+
 .report {
   border-collapse: collapse;
   margin-top: 0.6rem;

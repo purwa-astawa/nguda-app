@@ -1,5 +1,5 @@
 //! One test per row of the engine's I/O matrices (startup and recovery, the plan
-//! commands, the work-end setting and overflow, and the day query), and the
+//! commands, the work-end setting and overflow, and the day and week queries), and the
 //! exactly-once effect check. All run against `MemoryStore` in UTC.
 
 use std::sync::Arc;
@@ -2847,6 +2847,125 @@ async fn a_failed_load_is_a_store_error_and_leaves_state_and_status_untouched() 
         QueryError::EngineClosed.to_string(),
         "engine is not running"
     );
+    expect_untouched(&mut h, &store, batches).await;
+}
+
+// --- Week query (AD-4, AD-6, AD-16) ---
+
+use nguda_core::{GapFigure, IsoWeek, TagGap};
+
+/// 1970-W01: Monday 1969-12-29 to Sunday 1970-01-04, holding day 1 and day 2.
+fn week1() -> IsoWeek {
+    IsoWeek::new(1970, 1).unwrap()
+}
+
+#[tokio::test]
+async fn a_week_counts_its_locked_days_lists_its_unlocked_ones_and_is_read_only() {
+    let (mut past, baseline, log) = locked_past_day();
+    past.set_tags(id(100), vec!["proposals".into()]).unwrap();
+    let monday = Date::constant(1969, 12, 29);
+    let unlocked = no_lock(Day::new(monday, "UTC"));
+    let (clock, store) = (FakeClock::at(DAY_SECS + 1_000), MemoryStore::new());
+    store.seed(&past);
+    store.seed(&unlocked);
+    store.seed_baseline(baseline);
+    store.seed_day_log(day1(), log);
+    let mut h = start(&clock, &store);
+    h.rev(1).await;
+    let batches = store.batches().len();
+
+    let r = h.engine.query_week(week1()).await.unwrap();
+    assert_eq!(r.week, week1());
+    // A (700 of 600) and pending B (0 of 600) count; removed C and unplanned D don't.
+    assert_eq!(
+        r.overall,
+        GapFigure {
+            items: 2,
+            actual_secs: 700,
+            planned_secs: 1_200,
+        }
+    );
+    assert_eq!(
+        r.tags,
+        vec![TagGap {
+            tag: "proposals".into(),
+            figure: GapFigure {
+                items: 1,
+                actual_secs: 700,
+                planned_secs: 600,
+            },
+        }]
+    );
+    assert_eq!(r.counted_days, vec![day1()]);
+    // Today (day 2) is undecided, so it is excluded as unlocked too.
+    assert_eq!(r.unlocked_days, vec![monday, day2()]);
+    expect_untouched(&mut h, &store, batches).await;
+}
+
+#[tokio::test]
+async fn todays_running_item_counts_in_the_week_up_to_now() {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(item(100, "A", "U")).unwrap();
+    let (mut h, _store) = running_on(1_000, Some(&day)).await;
+    h.send(start_with(100, 1, LockChoice::Lock));
+    h.rev(2).await;
+    h.clock.set(1_300);
+    let r = h.engine.query_week(week1()).await.unwrap();
+    assert_eq!(
+        r.overall,
+        GapFigure {
+            items: 1,
+            actual_secs: 300,
+            planned_secs: 600,
+        }
+    );
+    assert_eq!(r.overall.ratio(), Some(0.5));
+    assert_eq!(r.counted_days, vec![day1()]);
+    assert_eq!(h.rx.borrow().rev, 2, "no publish");
+}
+
+#[tokio::test]
+async fn a_week_without_locked_days_has_no_ratio() {
+    let (mut h, store) = running_on(1_000, None).await;
+    let batches = store.batches().len();
+    let empty = IsoWeek::new(1970, 2).unwrap();
+    let r = h.engine.query_week(empty).await.unwrap();
+    assert_eq!(r.overall, GapFigure::default());
+    assert_eq!(r.overall.ratio(), None);
+    assert!(r.tags.is_empty() && r.counted_days.is_empty() && r.unlocked_days.is_empty());
+    let r = h.engine.query_week(week1()).await.unwrap();
+    assert_eq!(r.overall.ratio(), None);
+    assert_eq!(r.unlocked_days, vec![day1()]);
+    expect_untouched(&mut h, &store, batches).await;
+}
+
+#[tokio::test]
+async fn a_future_day_in_the_week_is_not_listed_as_unlocked() {
+    let (mut h, store) = leftovers("UTC").await;
+    h.send(carry(2));
+    h.rev(3).await;
+    assert!(store.stored_day(day2()).is_some(), "tomorrow is stored");
+    let r = h.engine.query_week(week1()).await.unwrap();
+    assert_eq!(r.unlocked_days, vec![day1()]);
+    assert!(r.counted_days.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_load_fails_the_week_and_leaves_state_and_status_untouched() {
+    let (past, _, _) = locked_past_day();
+    let (clock, store) = (FakeClock::at(DAY_SECS + 1_000), MemoryStore::new());
+    store.seed(&past);
+    let mut h = start(&clock, &store);
+    h.rev(1).await;
+    let batches = store.batches().len();
+
+    let err = QueryError::Store(nguda_core::StoreError::new(INJECTED));
+    store.fail_load_day(true);
+    assert_eq!(h.engine.query_week(week1()).await, Err(err.clone()));
+    store.fail_load_day(false);
+    store.fail_loads(true);
+    assert_eq!(h.engine.query_week(week1()).await, Err(err));
+    store.fail_loads(false);
     expect_untouched(&mut h, &store, batches).await;
 }
 
