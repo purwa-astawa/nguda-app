@@ -33,6 +33,7 @@ export type Command =
   | { name: "pauseTask"; args: [itemId: string] }
   | { name: "switchTask"; args: [itemId: string, expectedRev: number] }
   | { name: "extendTask"; args: [itemId: string, secs: number, expectedRev: number] }
+  | { name: "setTags"; args: [itemId: string, tags: string[], expectedRev: number] }
   | {
       name: "insertTask";
       args: [
@@ -124,6 +125,30 @@ export function extendCommand(snap: Snapshot, item: Item, minutes: string): Comm
   if (item.status !== "running") return null;
   const secs = minutesToSecs(minutes);
   return secs > 0 ? { name: "extendTask", args: [item.id, secs, snap.rev] } : null;
+}
+
+/** Replaces `item`'s tags with `tags` at the rendered rev. The engine normalises
+ * them (trim, blanks, case-insensitive duplicates, a known tag's spelling). */
+export function setTagsCommand(snap: Snapshot, item: Item, tags: readonly string[]): Command {
+  return { name: "setTags", args: [item.id, [...tags], snap.rev] };
+}
+
+/** The tag list after adding the typed `text`. Blank text gives back `tags`
+ * itself, so the caller can skip sending; anything else is appended as typed. */
+export function addTag(tags: readonly string[], text: string): readonly string[] {
+  return text.trim() === "" ? tags : [...tags, text];
+}
+
+/** The tag list without `tag`. */
+export function removeTag(tags: readonly string[], tag: string): string[] {
+  return tags.filter((t) => t !== tag);
+}
+
+/** The known tags to suggest for an item: those it does not already carry,
+ * compared case-insensitively, in the order given. */
+export function tagSuggestions(known: readonly string[], current: readonly string[]): string[] {
+  const have = new Set(current.map((t) => t.toLowerCase()));
+  return known.filter((k) => !have.has(k.toLowerCase()));
 }
 
 /** The Insert form's positions, in this order: "Now" and "After current" while an

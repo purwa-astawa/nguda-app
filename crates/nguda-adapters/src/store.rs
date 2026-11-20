@@ -66,6 +66,7 @@ enum Request {
     LoadDayLog(Date, oneshot::Sender<Result<Vec<DayLogEntry>, StoreError>>),
     LoadSettings(oneshot::Sender<Result<Settings, StoreError>>),
     LoadBaseline(Date, oneshot::Sender<Result<Option<Baseline>, StoreError>>),
+    LoadTagNames(oneshot::Sender<Result<Vec<String>, StoreError>>),
 }
 
 /// The SQLite implementation of the [`Store`] port.
@@ -156,6 +157,11 @@ impl Store for SqliteStore {
     fn load_baseline(&self, date: Date) -> StoreFuture<Option<Baseline>> {
         let (tx, rx) = oneshot::channel();
         self.call(Request::LoadBaseline(date, tx), rx)
+    }
+
+    fn load_tag_names(&self) -> StoreFuture<Vec<String>> {
+        let (tx, rx) = oneshot::channel();
+        self.call(Request::LoadTagNames(tx), rx)
     }
 }
 
@@ -267,6 +273,9 @@ fn serve(mut conn: Connection, rx: mpsc::Receiver<Request>) {
             Request::LoadBaseline(date, reply) => {
                 let _ = reply.send(load_baseline(&conn, date));
             }
+            Request::LoadTagNames(reply) => {
+                let _ = reply.send(load_tag_names(&conn));
+            }
         }
     }
 }
@@ -357,6 +366,7 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                     "{ctx}: item belongs to another day"
                 )));
             }
+            put_item_tags(tx, id, item.tags(), &ctx)?;
         }
         StoreOp::OpenSegment {
             item_id,
@@ -753,6 +763,47 @@ fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, Store
         .collect()
 }
 
+/// Replaces item `id`'s tag links with `tags`, in order, storing each name not yet
+/// known. Names match case-insensitively, so a link to a known name reads back with
+/// its stored spelling.
+fn put_item_tags(
+    tx: &Transaction<'_>,
+    id: ItemId,
+    tags: &[String],
+    ctx: &str,
+) -> Result<(), StoreError> {
+    let id = id.to_string();
+    tx.execute("DELETE FROM plan_item_tag WHERE item_id = ?1", [&id])
+        .map_err(sql_err(ctx))?;
+    for (position, name) in tags.iter().enumerate() {
+        let position = i64::try_from(position)
+            .map_err(|_| StoreError::new(format!("{ctx}: too many tags")))?;
+        tx.execute(
+            "INSERT INTO tag (name) VALUES (?1) ON CONFLICT (name) DO NOTHING",
+            [name],
+        )
+        .map_err(sql_err(ctx))?;
+        tx.execute(
+            "INSERT INTO plan_item_tag (item_id, tag_id, position)
+             SELECT ?1, id, ?3 FROM tag WHERE name = ?2",
+            params![id, name, position],
+        )
+        .map_err(sql_err(ctx))?;
+    }
+    Ok(())
+}
+
+/// Every stored tag name.
+fn load_tag_names(conn: &Connection) -> Result<Vec<String>, StoreError> {
+    query_all(
+        conn,
+        "SELECT name FROM tag ORDER BY name",
+        [],
+        "load tag names",
+        |r| r.get(0),
+    )
+}
+
 /// One plan-item row before its segments are attached.
 struct ItemRow {
     id: String,
@@ -830,12 +881,29 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
         });
     }
 
+    let mut tags: HashMap<ItemId, Vec<String>> = HashMap::new();
+    let tag_rows = query_all(
+        conn,
+        "SELECT l.item_id, t.name
+         FROM plan_item_tag l
+         JOIN tag t ON t.id = l.tag_id
+         JOIN plan_item p ON p.id = l.item_id
+         WHERE p.day_date = ?1 ORDER BY l.item_id, l.position",
+        [&date_text],
+        &ctx,
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )?;
+    for (item_id, name) in tag_rows {
+        tags.entry(parse_id(&item_id)?).or_default().push(name);
+    }
+
     let items = rows
         .into_iter()
         .map(|row| {
             let id = parse_id(&row.id)?;
             let segments = segments.remove(&id).unwrap_or_default();
-            restore_item(id, row, segments)
+            let tags = tags.remove(&id).unwrap_or_default();
+            restore_item(id, row, segments, tags)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let stack = query_all(
@@ -857,7 +925,12 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
         .map_err(|e| StoreError::new(format!("{ctx}: {e}")))
 }
 
-fn restore_item(id: ItemId, row: ItemRow, segments: Vec<Segment>) -> Result<PlanItem, StoreError> {
+fn restore_item(
+    id: ItemId,
+    row: ItemRow,
+    segments: Vec<Segment>,
+    tags: Vec<String>,
+) -> Result<PlanItem, StoreError> {
     let bad = |what: &str| StoreError::new(format!("item {id}: invalid {what}"));
     let ctx = format!("item {id}");
     let record = PlanItemRecord {
@@ -871,6 +944,7 @@ fn restore_item(id: ItemId, row: ItemRow, segments: Vec<Segment>) -> Result<Plan
         removed_at: row.removed_at.map(|n| from_nanos(n, &ctx)).transpose()?,
         segments,
         carried_from: row.carried_from.as_deref().map(parse_id).transpose()?,
+        tags,
     };
     PlanItem::restore(record).map_err(|e| StoreError::new(e.to_string()))
 }

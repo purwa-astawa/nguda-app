@@ -55,6 +55,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
     case "extendTask":
       res = await commands.extendTask(...cmd.args);
       break;
+    case "setTags":
+      res = await commands.setTags(...cmd.args);
+      break;
     case "insertTask":
       res = await commands.insertTask(...cmd.args);
       break;

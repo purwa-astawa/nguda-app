@@ -18,6 +18,10 @@ import {
   overflowItems,
   pinCommand,
   pinInstant,
+  addTag,
+  removeTag,
+  setTagsCommand,
+  tagSuggestions,
   rowActions,
   rowTime,
   scheduleLabel,
@@ -40,6 +44,7 @@ function item(id: string, extra: Partial<Item> = {}): Item {
     scheduledStart: null,
     scheduledEnd: null,
     interrupted: false,
+    tags: [],
     ...extra,
   };
 }
@@ -61,6 +66,7 @@ function snap(rev: number, items: Item[] = [F, A, B], running: Snapshot["running
     workEnd: "17:00",
     overflow: [],
     status: [],
+    knownTags: [],
   };
 }
 
@@ -352,4 +358,36 @@ test("Lock day shows only while undecided; the badge reads locked or unlocked", 
     assert.equal(asksLockChoice(decided, now), false);
   }
   assert.equal(lockDayCommand({ ...snap(4), day: null }), null);
+});
+
+test("setTags sends the whole next list at the rendered rev", () => {
+  const tagged = item("A", { tags: ["deep"] });
+  assert.deepEqual(setTagsCommand(snap(6), tagged, ["deep", "admin"]), {
+    name: "setTags",
+    args: ["A", ["deep", "admin"], 6],
+  });
+  assert.deepEqual(setTagsCommand(snap(6), tagged, []), { name: "setTags", args: ["A", [], 6] });
+});
+
+test("addTag appends what was typed and keeps the list for blank text", () => {
+  const tags = ["deep"];
+  assert.deepEqual(addTag(tags, "Work"), ["deep", "Work"]);
+  // The engine trims and de-duplicates; the view sends what was typed.
+  assert.deepEqual(addTag(tags, " deep "), ["deep", " deep "]);
+  assert.equal(addTag(tags, ""), tags);
+  assert.equal(addTag(tags, "   "), tags);
+  assert.deepEqual(tags, ["deep"], "input untouched");
+});
+
+test("removeTag drops only that tag", () => {
+  assert.deepEqual(removeTag(["a", "b", "c"], "b"), ["a", "c"]);
+  assert.deepEqual(removeTag(["a"], "x"), ["a"]);
+  assert.deepEqual(removeTag([], "a"), []);
+});
+
+test("tag suggestions are the known tags the item lacks, case-insensitively", () => {
+  const known = ["admin", "Deep", "Work"];
+  assert.deepEqual(tagSuggestions(known, []), known);
+  assert.deepEqual(tagSuggestions(known, ["deep", "WORK"]), ["admin"]);
+  assert.deepEqual(tagSuggestions([], ["x"]), []);
 });

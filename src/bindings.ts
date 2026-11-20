@@ -29,6 +29,11 @@ export const commands = {
 	/**  Adds `secs` to the running item's planned length; later items re-flow. */
 	extendTask: (itemId: string, secs: number, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("extend_task", { itemId, secs, expectedRev })),
 	/**
+	 *  Replaces an item's tags with `tags`. The engine trims them, drops blanks and
+	 *  case-insensitive duplicates, and takes a known tag's spelling.
+	 */
+	setTags: (itemId: string, tags: string[], expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("set_tags", { itemId, tags, expectedRev })),
+	/**
 	 *  Inserts a new task at `anchor`; `now` starts it, pausing the running item.
 	 *  `lock` is the lock choice for `now` on an undecided day, else `null`.
 	 */
@@ -216,6 +221,8 @@ export type ItemView_Deserialize = {
 	 *  schedule, so it is never an insert anchor.
 	 */
 	interrupted: boolean,
+	/**  The item's tags, in order. */
+	tags: string[],
 };
 
 export type ItemView_Serialize = {
@@ -244,6 +251,8 @@ export type ItemView_Serialize = {
 	 *  schedule, so it is never an insert anchor.
 	 */
 	interrupted: boolean,
+	/**  The item's tags, in order. */
+	tags: string[],
 };
 
 /**
@@ -326,6 +335,8 @@ export type ReportRowView_Deserialize = {
 	status: ItemStatusView,
 	/**  UUID of the item on an earlier day this one was carried over from. */
 	carriedFrom?: string | null,
+	/**  The item's tags, in order. */
+	tags: string[],
 	/**  `null` exactly when `plannedSource` is `unplanned`. */
 	plannedSecs?: number | null,
 	plannedSource: PlannedSourceView,
@@ -342,6 +353,8 @@ export type ReportRowView_Serialize = {
 	status: ItemStatusView,
 	/**  UUID of the item on an earlier day this one was carried over from. */
 	carriedFrom: string | null,
+	/**  The item's tags, in order. */
+	tags: string[],
 	/**  `null` exactly when `plannedSource` is `unplanned`. */
 	plannedSecs: number | null,
 	plannedSource: PlannedSourceView,
@@ -400,6 +413,11 @@ export type SnapshotEvent_Deserialize = {
 	overflow: string[],
 	/**  One entry per status key, sorted by key. */
 	status: StatusView[],
+	/**
+	 *  Every tag name ever stored, sorted case-insensitively: the suggestions for
+	 *  an item's tag editor.
+	 */
+	knownTags: string[],
 };
 
 /**
@@ -425,6 +443,11 @@ export type SnapshotEvent_Serialize = {
 	overflow: string[],
 	/**  One entry per status key, sorted by key. */
 	status: StatusView[],
+	/**
+	 *  Every tag name ever stored, sorted case-insensitively: the suggestions for
+	 *  an item's tag editor.
+	 */
+	knownTags: string[],
 };
 
 export type StatusKeyView = "store" | "commandRejected" | "overflow";

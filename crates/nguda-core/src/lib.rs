@@ -18,6 +18,7 @@ mod report;
 mod segment;
 mod settings;
 mod store;
+mod tags;
 #[cfg(test)]
 mod test_support;
 
@@ -39,4 +40,5 @@ pub use report::{ActualSegment, DayReport, PlannedSource, ReportRow, report};
 pub use segment::{Segment, actual_secs, closed_secs};
 pub use settings::{ParseWorkEndError, Settings, WorkEnd};
 pub use store::{OpenSegmentRef, Store, StoreBatch, StoreError, StoreFuture, StoreOp};
+pub use tags::{merge_tag_names, normalize_tags, sort_tag_names};
 pub use uuid::Uuid;

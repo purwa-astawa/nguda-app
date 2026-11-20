@@ -139,6 +139,9 @@ struct Data {
     decisions: BTreeMap<Date, LockDecision>,
     /// date → its write-once baseline.
     baselines: BTreeMap<Date, Baseline>,
+    /// Every tag name ever stored, in first-stored order, unique ASCII
+    /// case-insensitively like the SQLite `NOCASE` column.
+    tag_names: Vec<String>,
 }
 
 impl Data {
@@ -149,6 +152,15 @@ impl Data {
             .filter(|(d, _)| *d == date)
             .map(|(_, e)| e.clone())
             .collect()
+    }
+
+    /// Stores every name of `tags` not yet stored (ASCII case-insensitively).
+    fn add_tag_names(&mut self, tags: &[String]) {
+        for tag in tags {
+            if !self.tag_names.iter().any(|n| n.eq_ignore_ascii_case(tag)) {
+                self.tag_names.push(tag.clone());
+            }
+        }
     }
 
     fn item_date(&self, id: ItemId) -> Option<Date> {
@@ -174,6 +186,7 @@ impl Data {
                     return Err(StoreError::new(format!("put item {id}: no day {date}")));
                 }
                 let record = record_of(item);
+                self.add_tag_names(item.tags());
                 match self.items.iter_mut().find(|(_, r)| r.id == id) {
                     Some((stored, _)) if stored != date => {
                         return Err(StoreError::new(format!(
@@ -341,6 +354,7 @@ fn record_of(item: &PlanItem) -> PlanItemRecord {
         removed_at: item.removed_at(),
         segments: Vec::new(),
         carried_from: item.carried_from(),
+        tags: item.tags().to_vec(),
     }
 }
 
@@ -381,6 +395,7 @@ impl MemoryStore {
         let mut data = self.data.lock().unwrap();
         data.days.insert(day.date(), day.tz().to_owned());
         for item in day.items() {
+            data.add_tag_names(item.tags());
             data.items.push((day.date(), record_of(item)));
             for seg in item.segments() {
                 data.segments.push((item.id(), seg.clone()));
@@ -435,6 +450,11 @@ impl MemoryStore {
     /// The stored baseline of `date`, as committed.
     pub(crate) fn stored_baseline(&self, date: Date) -> Option<Baseline> {
         self.data.lock().unwrap().baselines.get(&date).cloned()
+    }
+
+    /// Every stored tag name, in first-stored order.
+    pub(crate) fn tag_names(&self) -> Vec<String> {
+        self.data.lock().unwrap().tag_names.clone()
     }
 
     /// Every successfully committed batch, in order.
@@ -503,5 +523,9 @@ impl Store for MemoryStore {
 
     fn load_baseline(&self, date: Date) -> StoreFuture<Option<Baseline>> {
         self.read(|d| Ok(d.baselines.get(&date).cloned()))
+    }
+
+    fn load_tag_names(&self) -> StoreFuture<Vec<String>> {
+        self.read(|d| Ok(d.tag_names.clone()))
     }
 }
