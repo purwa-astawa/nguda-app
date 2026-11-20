@@ -97,6 +97,11 @@ export function Summary({ date, today, rev, opened, onDate }: Props) {
                       {m}
                     </span>
                   ))}
+                  {row.tags.map((t) => (
+                    <span key={t} className="tag">
+                      {t}
+                    </span>
+                  ))}
                 </td>
                 <td className="num">{formatSecs(row.plannedSecs)}</td>
                 <td className="num">{formatSecs(row.actualSecs)}</td>

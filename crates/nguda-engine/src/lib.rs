@@ -37,6 +37,11 @@
 //! item linked by `carried_from`, all with `CarriedOver` day-log entries in one
 //! batch. The emptied list then ends the overflow episode.
 //!
+//! Tags (CAP-8, AD-9): [`EngineMsg::SetTags`] replaces an item's tags through the
+//! normal plan path. The actor keeps every tag name ever stored (loaded at startup,
+//! merged after each committed `SetTags`, never shrinking) and publishes them as
+//! [`Snapshot::known_tags`]. Carry-over copies keep their original's tags.
+//!
 //! Rollover (AD-8): "today" is the day the engine last made current. While nothing
 //! runs, the next local midnight after today is a deadline; when the local date has
 //! moved past today, the engine loads (or creates) the new date's day and publishes
@@ -131,6 +136,15 @@ pub enum EngineMsg {
         secs: u64,
         expected_rev: u64,
     },
+    /// Replaces a non-removed item's tags with `tags`, normalised in core (trimmed,
+    /// blanks and case-insensitive duplicates dropped, a known name's spelling
+    /// taken; see [`nguda_core::normalize_tags`]). Rev-checked. Once committed,
+    /// new names join [`Snapshot::known_tags`].
+    SetTags {
+        item_id: ItemId,
+        tags: Vec<String>,
+        expected_rev: u64,
+    },
     /// Adds a new flexible item at `anchor` and logs `Inserted`, in one batch.
     /// Always rev-checked. The title must not be blank and `planned_secs` must be
     /// positive. `Now` starts the new item, first pausing any running item and
@@ -223,6 +237,8 @@ pub struct Snapshot {
     pub overflow: Vec<ItemId>,
     /// Sorted by key.
     pub status: Vec<StatusEntry>,
+    /// Every tag name ever stored, sorted case-insensitively. Never shrinks.
+    pub known_tags: Vec<String>,
 }
 
 /// The item the tray shows while nothing runs.

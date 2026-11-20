@@ -191,13 +191,15 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 8);
+    assert_eq!(user_version(&path), 9);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
     assert!(has_table(&path, "interrupt_entry"));
     assert!(has_table(&path, "settings"));
     assert!(has_table(&path, "baseline"));
+    assert!(has_table(&path, "tag"));
+    assert!(has_table(&path, "plan_item_tag"));
     assert!(has_table(&path, "baseline_item"));
     assert!(backups(&dir).is_empty());
 }
@@ -278,7 +280,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     // connection: a read-write open closing it would checkpoint them.
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-    raw.pragma_update(None, "user_version", 9).unwrap();
+    raw.pragma_update(None, "user_version", 10).unwrap();
     let copy = dir.path().join("newer.db");
     let wal = |p: &Path| PathBuf::from(format!("{}-wal", p.display()));
     std::fs::copy(&path, &copy).unwrap();
@@ -293,14 +295,14 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     assert_eq!(
         err,
         OpenError::NewerSchema {
-            found: 9,
-            supported: 8
+            found: 10,
+            supported: 9
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read(wal(&path)).unwrap(), wal_before);
     assert!(backups(&dir).is_empty());
-    assert_eq!(user_version(&path), 9);
+    assert_eq!(user_version(&path), 10);
 }
 
 #[tokio::test]
@@ -502,7 +504,7 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 8);
+    assert_eq!(user_version(&path), 9);
     assert!(has_table(&path, "engine_meta"));
 }
 
@@ -948,6 +950,7 @@ async fn a_carried_item_round_trips_its_link_across_a_reopen() {
             900,
             OrderKey::new("V").unwrap(),
             id(1),
+            Vec::new(),
         ))
         .unwrap();
     store.commit(batch_for(&tomorrow)).await.unwrap();
@@ -1167,12 +1170,27 @@ async fn the_stored_baseline_refuses_updates_and_deletes() {
 async fn v8_decides_days_with_time_no_lock_and_leaves_the_rest_undecided() {
     let dir = TempDir::new().unwrap();
     let path = db(&dir);
-    let v7 = SqliteStore::open_with(&path, &migrations_through(7)).unwrap();
-    v7.commit(batch_for(&sample_day())).await.unwrap();
+    drop(SqliteStore::open_with(&path, &migrations_through(7)).unwrap());
+    // The adapter writes tables v7 lacks, so the rows go through a current-schema
+    // scratch database and are copied over with v7's columns only.
+    let scratch = dir.path().join("scratch.sqlite");
+    let current = seeded(&scratch).await;
     let mut idle = Day::new(other_date(), "UTC");
     idle.add(item(10, "V")).unwrap();
-    v7.commit(batch_for(&idle)).await.unwrap();
-    drop(v7);
+    current.commit(batch_for(&idle)).await.unwrap();
+    drop(current);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute("ATTACH DATABASE ?1 AS src", [scratch.to_str().unwrap()])
+        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO day SELECT date, tz FROM src.day ORDER BY rowid;
+         INSERT INTO plan_item SELECT * FROM src.plan_item ORDER BY rowid;
+         INSERT INTO time_segment SELECT * FROM src.time_segment ORDER BY id;
+         DETACH DATABASE src;",
+    )
+    .unwrap();
+    drop(conn);
+    std::fs::remove_file(&scratch).unwrap();
     assert_eq!(user_version(&path), 7);
 
     let store = SqliteStore::open(&path).unwrap();
@@ -1182,7 +1200,7 @@ async fn v8_decides_days_with_time_no_lock_and_leaves_the_rest_undecided() {
     assert_eq!(untouched.lock_decision(), LockDecision::None);
     assert_eq!(store.load_baseline(date()).await.unwrap(), None);
     drop(store);
-    assert_eq!(user_version(&path), 8);
+    assert_eq!(user_version(&path), 9);
     assert_eq!(backups(&dir), vec![backup_path(&path, 7)]);
 }
 
@@ -1212,4 +1230,90 @@ async fn a_second_lock_decision_fails_and_rolls_back_its_batch() {
         None,
         "rolled back"
     );
+}
+
+/// Every stored tag name, as the store reports them, sorted.
+async fn tag_names(store: &SqliteStore) -> Vec<String> {
+    let mut names = store.load_tag_names().await.unwrap();
+    names.sort();
+    names
+}
+
+fn strings(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// Stores `tags` on `sample_day`'s item `n`.
+async fn put_tags(store: &SqliteStore, n: u128, tags: &[&str]) -> Day {
+    let mut day = store.load_day(date()).await.unwrap().unwrap();
+    day.set_tags(id(n), strings(tags)).unwrap();
+    store
+        .commit(batch([StoreOp::PutItem {
+            date: date(),
+            item: day.item(id(n)).unwrap().clone(),
+        }]))
+        .await
+        .unwrap();
+    day
+}
+
+#[tokio::test]
+async fn tags_round_trip_in_order_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let expected = put_tags(&store, 2, &["zeta", "Alpha", "mid"]).await;
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let loaded = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(loaded, expected);
+    assert_eq!(
+        loaded.item(id(2)).unwrap().tags(),
+        strings(&["zeta", "Alpha", "mid"])
+    );
+    assert!(loaded.item(id(1)).unwrap().tags().is_empty());
+    assert_eq!(tag_names(&store).await, strings(&["Alpha", "mid", "zeta"]));
+}
+
+#[tokio::test]
+async fn replacing_tags_rewrites_the_links() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    put_tags(&store, 2, &["a", "b"]).await;
+    let expected = put_tags(&store, 2, &["c", "a"]).await;
+    let loaded = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(loaded, expected);
+    assert_eq!(loaded.item(id(2)).unwrap().tags(), strings(&["c", "a"]));
+    let links: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT count(*) FROM plan_item_tag", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(links, 2);
+}
+
+#[tokio::test]
+async fn known_tag_names_keep_a_removed_tag_and_match_case_insensitively() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    put_tags(&store, 2, &["Work", "old"]).await;
+    put_tags(&store, 2, &[]).await;
+    assert!(
+        store
+            .load_day(date())
+            .await
+            .unwrap()
+            .unwrap()
+            .item(id(2))
+            .unwrap()
+            .tags()
+            .is_empty()
+    );
+    assert_eq!(tag_names(&store).await, strings(&["Work", "old"]));
+    // A link to an existing name in other case reads back with the stored spelling.
+    put_tags(&store, 1, &["work"]).await;
+    let loaded = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(loaded.item(id(1)).unwrap().tags(), strings(&["Work"]));
+    assert_eq!(tag_names(&store).await, strings(&["Work", "old"]));
 }

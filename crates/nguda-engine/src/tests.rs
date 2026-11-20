@@ -2790,6 +2790,7 @@ async fn today_is_reported_from_live_state_with_the_running_item_counting_to_now
             title: "other".into(),
             status: ItemStatus::Running,
             carried_from: None,
+            tags: Vec::new(),
             planned_secs: Some(600),
             planned_source: PlannedSource::Unlocked,
             actual_secs: 30,
@@ -2847,4 +2848,148 @@ async fn a_failed_load_is_a_store_error_and_leaves_state_and_status_untouched() 
         "engine is not running"
     );
     expect_untouched(&mut h, &store, batches).await;
+}
+
+// --- Tags ---
+
+fn tags(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn set_tags(n: u128, names: &[&str], expected_rev: u64) -> EngineMsg {
+    EngineMsg::SetTags {
+        item_id: id(n),
+        tags: tags(names),
+        expected_rev,
+    }
+}
+
+fn tags_of(snap: &Snapshot, n: u128) -> Vec<String> {
+    day_of(snap).item(id(n)).unwrap().tags().to_vec()
+}
+
+#[tokio::test]
+async fn set_tags_normalises_replaces_and_keeps_every_known_name() {
+    let (mut h, store) = running_on(1_000, Some(&abc_day())).await;
+    h.send(set_tags(100, &[" b ", "", "a", "B"], 1));
+    let snap = h.rev(2).await;
+    assert_eq!(tags_of(&snap, 100), tags(&["b", "a"]));
+    assert_eq!(snap.known_tags, tags(&["a", "b"]));
+    assert_eq!(store.stored_day(day1()), snap.day);
+
+    h.send(set_tags(100, &["c"], 2));
+    let snap = h.rev(3).await;
+    assert_eq!(tags_of(&snap, 100), tags(&["c"]));
+    assert_eq!(snap.known_tags, tags(&["a", "b", "c"]));
+    assert_eq!(store.stored_day(day1()), snap.day);
+    assert!(snap.status.is_empty());
+}
+
+#[tokio::test]
+async fn clearing_tags_leaves_the_known_names() {
+    let (mut h, store) = running_on(1_000, Some(&abc_day())).await;
+    h.send(set_tags(100, &["x"], 1));
+    h.rev(2).await;
+    h.send(set_tags(100, &[], 2));
+    let snap = h.rev(3).await;
+    assert!(tags_of(&snap, 100).is_empty());
+    assert_eq!(snap.known_tags, tags(&["x"]));
+    assert_eq!(store.stored_day(day1()), snap.day);
+}
+
+#[tokio::test]
+async fn a_tag_in_other_case_takes_the_known_spelling() {
+    let mut day = abc_day();
+    day.set_tags(id(101), tags(&["Work"])).unwrap();
+    let (mut h, _store) = running_on(1_000, Some(&day)).await;
+    assert_eq!(h.rx.borrow().known_tags, tags(&["Work"]));
+    h.send(set_tags(100, &["work"], 1));
+    let snap = h.rev(2).await;
+    assert_eq!(tags_of(&snap, 100), tags(&["Work"]));
+    assert_eq!(snap.known_tags, tags(&["Work"]));
+}
+
+#[tokio::test]
+async fn a_stale_set_tags_applies_nothing() {
+    let (mut h, store) = running_on(1_000, Some(&abc_day())).await;
+    let snap = expect_rejected(&mut h, &store, set_tags(100, &["x"], 0), 2).await;
+    assert_eq!(rejected(&snap), Some("stale rev: expected 0, current 1"));
+    assert!(snap.known_tags.is_empty());
+}
+
+#[tokio::test]
+async fn set_tags_on_an_unknown_or_removed_item_is_rejected_without_tag_text() {
+    let (mut h, store) = running_on(1_000, Some(&abc_day())).await;
+    h.send(EngineMsg::RemoveTask { item_id: id(102) });
+    h.rev(2).await;
+    let snap = expect_rejected(&mut h, &store, set_tags(9, &["secret"], 2), 3).await;
+    assert!(rejected(&snap).unwrap().starts_with("SetTags: "));
+    assert!(!rejected(&snap).unwrap().contains("secret"));
+    let snap = expect_rejected(&mut h, &store, set_tags(102, &["secret"], 3), 4).await;
+    assert!(rejected(&snap).unwrap().starts_with("SetTags: "));
+    assert!(!rejected(&snap).unwrap().contains("secret"));
+    assert!(snap.known_tags.is_empty());
+    assert!(store.tag_names().is_empty());
+}
+
+#[tokio::test]
+async fn item_tags_and_known_names_reload_after_a_restart() {
+    let (mut h, store) = running_on(1_000, Some(&abc_day())).await;
+    h.send(set_tags(100, &["deep", "Admin"], 1));
+    h.rev(2).await;
+    h.send(set_tags(101, &["old"], 2));
+    h.rev(3).await;
+    h.send(set_tags(101, &[], 3));
+    let before = h.rev(4).await;
+    drop(h);
+    let mut h = start(&FakeClock::at(1_100), &store);
+    let snap = h.rev(1).await;
+    assert_eq!(tags_of(&snap, 100), tags(&["deep", "Admin"]));
+    assert!(tags_of(&snap, 101).is_empty());
+    assert_eq!(snap.known_tags, tags(&["Admin", "deep", "old"]));
+    assert_eq!(snap.known_tags, before.known_tags);
+}
+
+#[tokio::test]
+async fn a_carried_over_copy_keeps_its_tags() {
+    let mut day = no_lock(Day::new(day1(), "UTC"));
+    day.add(PlanItem::new(id(100), "A", 2_700, key("U")))
+        .unwrap();
+    day.add(PlanItem::new(id(101), "B", 2_400, key("V")))
+        .unwrap();
+    day.set_tags(id(101), tags(&["x"])).unwrap();
+    let (mut h, store) = a_started_at_four(&day).await;
+    assert_eq!(h.rx.borrow().overflow, vec![id(101)]);
+    h.send(carry(2));
+    h.rev(3).await;
+    let tomorrow = store.stored_day(day2()).unwrap();
+    let copy = tomorrow.item(id(1)).unwrap();
+    assert_eq!(copy.carried_from(), Some(id(101)));
+    assert_eq!(copy.tags(), tags(&["x"]));
+}
+
+#[tokio::test]
+async fn report_rows_carry_their_item_tags() {
+    let (mut h, _store) = running_on(1_000, Some(&abc_day())).await;
+    h.send(set_tags(101, &["deep", "work"], 1));
+    h.rev(2).await;
+    let report = h.engine.query_day(day1()).await.unwrap().unwrap();
+    let row = report.rows.iter().find(|r| r.item_id == id(101)).unwrap();
+    assert_eq!(row.tags, tags(&["deep", "work"]));
+    let other = report.rows.iter().find(|r| r.item_id == id(100)).unwrap();
+    assert!(other.tags.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_set_tags_commit_keeps_the_day_and_the_known_names() {
+    let (mut h, store) = running_on(1_000, Some(&abc_day())).await;
+    h.send(set_tags(100, &["a"], 1));
+    let before = h.rev(2).await;
+    store.fail_commits(true);
+    h.send(set_tags(100, &["b"], 2));
+    let snap = h.rev(3).await;
+    assert_eq!(snap.day, before.day);
+    assert_eq!(snap.known_tags, tags(&["a"]));
+    assert_eq!(snap.status, store_status());
+    assert_eq!(store.tag_names(), tags(&["a"]));
 }

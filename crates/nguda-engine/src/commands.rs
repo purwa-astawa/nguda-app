@@ -4,12 +4,17 @@
 //! for [`EngineMsg::SetWorkEnd`], changes the work-end setting), returning the
 //! store ops to append after [`crate::batch::diff`] (the extras), or a
 //! [`Reject`]. On a reject `day` may be half-changed: callers pass a copy and drop it.
+//!
+//! [`EngineMsg::SetTags`] normalises its tags against the known tag names the
+//! actor passes in ([`nguda_core::normalize_tags`]), so an item takes a known
+//! name's spelling.
 
 use std::fmt;
 
 use nguda_core::{
     Date, Day, DayLogEntry, DayLogKind, DomainError, IdGen, ItemId, ItemStatus, LockChoice,
     LockDecision, OrderKey, PlanItem, StoreOp, Timestamp, WorkEnd, baseline, closed_secs,
+    normalize_tags,
 };
 
 use crate::{EngineMsg, InsertAnchor, ReorderAnchor};
@@ -92,6 +97,7 @@ pub(crate) const START: &str = "Start";
 const PAUSE: &str = "Pause";
 const SWITCH: &str = "Switch";
 const EXTEND_TASK: &str = "ExtendTask";
+const SET_TAGS: &str = "SetTags";
 const INSERT_TASK: &str = "InsertTask";
 const SET_WORK_END: &str = "SetWorkEnd";
 const LOCK_DAY: &str = "LockDay";
@@ -112,6 +118,7 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::Pause { .. } => PAUSE,
         EngineMsg::Switch { .. } => SWITCH,
         EngineMsg::ExtendTask { .. } => EXTEND_TASK,
+        EngineMsg::SetTags { .. } => SET_TAGS,
         EngineMsg::InsertTask { .. } => INSERT_TASK,
         EngineMsg::SetWorkEnd { .. } => SET_WORK_END,
         EngineMsg::LockDay { .. } => LOCK_DAY,
@@ -137,12 +144,14 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
         | EngineMsg::Start { item_id, .. }
         | EngineMsg::Pause { item_id }
         | EngineMsg::Switch { item_id, .. }
-        | EngineMsg::ExtendTask { item_id, .. } => Some(*item_id),
+        | EngineMsg::ExtendTask { item_id, .. }
+        | EngineMsg::SetTags { item_id, .. } => Some(*item_id),
     }
 }
 
-/// Applies `msg` to `day` and `work_end` at `now`. A rev-checked command whose
-/// `expected_rev` is not `rev` is rejected before anything else.
+/// Applies `msg` to `day` and `work_end` at `now`, with `known_tags` the tag names
+/// stored so far. A rev-checked command whose `expected_rev` is not `rev` is
+/// rejected before anything else.
 pub(crate) fn apply(
     msg: EngineMsg,
     day: &mut Day,
@@ -150,6 +159,7 @@ pub(crate) fn apply(
     now: Timestamp,
     ids: &dyn IdGen,
     rev: u64,
+    known_tags: &[String],
 ) -> Result<Vec<StoreOp>, Reject> {
     let check = |expected: u64| {
         if expected == rev {
@@ -214,6 +224,14 @@ pub(crate) fn apply(
         } => {
             check(expected_rev)?;
             extend_task(day, now, item_id, secs)
+        }
+        EngineMsg::SetTags {
+            item_id,
+            tags,
+            expected_rev,
+        } => {
+            check(expected_rev)?;
+            set_tags(day, item_id, &tags, known_tags)
         }
         EngineMsg::InsertTask {
             title,
@@ -404,6 +422,20 @@ fn edit_task(
     if let Some(secs) = planned_secs {
         day.set_planned_secs(item_id, secs).map_err(domain(CMD))?;
     }
+    Ok(Vec::new())
+}
+
+/// Replaces a non-removed item's tags with `tags`, normalised against `known`.
+fn set_tags(
+    day: &mut Day,
+    item_id: ItemId,
+    tags: &[String],
+    known: &[String],
+) -> Result<Vec<StoreOp>, Reject> {
+    const CMD: &str = SET_TAGS;
+    live_item(day, CMD, item_id, "item")?;
+    day.set_tags(item_id, normalize_tags(tags, known))
+        .map_err(domain(CMD))?;
     Ok(Vec::new())
 }
 
@@ -665,10 +697,10 @@ fn insert_task(
 /// Carries each of `items` (in that order) over from `today` to `tomorrow` (AD-6):
 /// the original turns `carried_over` and stays on its day, and a fresh flexible,
 /// pending item with the same title and the original's remaining time
-/// (`planned_secs − closed segments`, at least 60 s) is added after tomorrow's
-/// last flexible item, linked by `carried_from`. Returns one `CarriedOver` entry
-/// per item, logged on today. An empty list is invalid input; an item that is not
-/// pending or paused is a domain reject.
+/// (`planned_secs − closed segments`, at least 60 s) and the same tags is added
+/// after tomorrow's last flexible item, linked by `carried_from`. Returns one
+/// `CarriedOver` entry per item, logged on today. An empty list is invalid input;
+/// an item that is not pending or paused is a domain reject.
 pub(crate) fn carry_over(
     today: &mut Day,
     tomorrow: &mut Day,
@@ -689,6 +721,7 @@ pub(crate) fn carry_over(
             .ok_or(DomainError::UnknownItem(item_id))
             .map_err(domain(CMD))?;
         let title = item.title().to_owned();
+        let tags = item.tags().to_vec();
         let left = item
             .planned_secs()
             .saturating_sub(closed_secs(item.segments()))
@@ -698,7 +731,7 @@ pub(crate) fn carry_over(
         let order = after_last_flexible(tomorrow).map_err(domain(CMD))?;
         let to = ids.new_item_id();
         tomorrow
-            .add(PlanItem::carried(to, title, left, order, item_id))
+            .add(PlanItem::carried(to, title, left, order, item_id, tags))
             .map_err(domain(CMD))?;
         ops.push(log_op(
             today.date(),
@@ -871,6 +904,7 @@ mod tests {
             ts(0),
             &SeqIds::default(),
             5,
+            &[],
         )
         .unwrap_err();
         assert_eq!(stale.to_string(), "stale rev: expected 3, current 5");

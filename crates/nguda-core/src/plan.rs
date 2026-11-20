@@ -105,6 +105,7 @@ pub struct PlanItem {
     removed_at: Option<Timestamp>,
     segments: Vec<Segment>,
     carried_from: Option<ItemId>,
+    tags: Vec<String>,
 }
 
 /// Every field of a [`PlanItem`], public, for rehydrating stored rows. Turn it into
@@ -122,6 +123,8 @@ pub struct PlanItemRecord {
     pub segments: Vec<Segment>,
     /// The item on an earlier day this one was carried over from (AD-6).
     pub carried_from: Option<ItemId>,
+    /// The item's tags, already normalised (see [`crate::normalize_tags`]), in order.
+    pub tags: Vec<String>,
 }
 
 impl PlanItem {
@@ -164,6 +167,7 @@ impl PlanItem {
             removed_at,
             segments,
             carried_from,
+            tags,
         } = record;
         Ok(Self {
             id,
@@ -176,6 +180,7 @@ impl PlanItem {
             removed_at,
             segments,
             carried_from,
+            tags,
         })
     }
 
@@ -192,20 +197,23 @@ impl PlanItem {
             removed_at: None,
             segments: Vec::new(),
             carried_from: None,
+            tags: Vec::new(),
         }
     }
 
     /// A new flexible, pending item carried over from item `from` of an earlier day
-    /// (AD-6: the original stays on its day as `carried_over`).
+    /// (AD-6: the original stays on its day as `carried_over`), keeping its `tags`.
     pub fn carried(
         id: ItemId,
         title: impl Into<String>,
         planned_secs: u64,
         order: OrderKey,
         from: ItemId,
+        tags: Vec<String>,
     ) -> Self {
         Self {
             carried_from: Some(from),
+            tags,
             ..Self::new(id, title, planned_secs, order)
         }
     }
@@ -251,6 +259,11 @@ impl PlanItem {
         self.carried_from
     }
 
+    /// The item's tags, in order.
+    pub fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
     /// Pins the item at `pinned_start`, making it fixed.
     pub(crate) fn set_fixed(&mut self, pinned_start: Timestamp) {
         self.fixed = true;
@@ -273,6 +286,10 @@ impl PlanItem {
 
     pub(crate) fn set_planned_secs(&mut self, secs: u64) {
         self.planned_secs = secs;
+    }
+
+    pub(crate) fn set_tags(&mut self, tags: Vec<String>) {
+        self.tags = tags;
     }
 
     /// Returns a copy with `f` applied. Every state except Removed allows plan edits.
@@ -658,6 +675,12 @@ impl Day {
     /// Sets item `id`'s current planned length in whole seconds.
     pub fn set_planned_secs(&mut self, id: ItemId, secs: u64) -> Result<(), DomainError> {
         self.apply(id, |i| i.edit(|n| n.set_planned_secs(secs)))
+    }
+
+    /// Replaces item `id`'s tags with `tags`, which the caller has already
+    /// normalised (see [`crate::normalize_tags`]). A removed item rejects it.
+    pub fn set_tags(&mut self, id: ItemId, tags: Vec<String>) -> Result<(), DomainError> {
+        self.apply(id, |i| i.edit(|n| n.set_tags(tags)))
     }
 
     /// Adds `secs` to the running item `id`'s planned length (AD-6: the plan grows,
@@ -1080,6 +1103,7 @@ mod tests {
             d.set_order(id, key("k")),
             d.set_title(id, "renamed"),
             d.set_planned_secs(id, 600),
+            d.set_tags(id, vec!["t".into()]),
         ]
     }
 
@@ -1197,6 +1221,7 @@ mod tests {
             removed_at: None,
             segments: Vec::new(),
             carried_from: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1231,6 +1256,7 @@ mod tests {
                 removed_at: i.removed_at(),
                 segments: i.segments().to_vec(),
                 carried_from: i.carried_from(),
+                tags: i.tags().to_vec(),
             };
             assert_eq!(PlanItem::restore(r), Ok(i), "{s}");
         }
@@ -1238,7 +1264,8 @@ mod tests {
 
     #[test]
     fn carried_item_is_flexible_pending_and_restores_with_its_link() {
-        let c = PlanItem::carried(id(2), "item 1", 600, key("V"), id(1));
+        let c = PlanItem::carried(id(2), "item 1", 600, key("V"), id(1), vec!["x".into()]);
+        assert_eq!(c.tags(), ["x".to_owned()]);
         assert!(!c.fixed());
         assert_eq!(c.status(), ItemStatus::Pending);
         assert!(c.segments().is_empty());
@@ -1249,6 +1276,22 @@ mod tests {
             ..record(ItemStatus::Pending)
         };
         assert_eq!(PlanItem::restore(r).unwrap().carried_from(), Some(id(9)));
+    }
+
+    #[test]
+    fn set_tags_replaces_the_tags_and_restores_with_them() {
+        let mut d = day(vec![item(1, "V")]);
+        d.set_tags(id(1), vec!["a".into(), "b".into()]).unwrap();
+        d.set_tags(id(1), vec!["c".into()]).unwrap();
+        let i = d.item(id(1)).unwrap();
+        assert_eq!(i.tags(), ["c".to_owned()]);
+        d.set_tags(id(1), Vec::new()).unwrap();
+        assert!(d.item(id(1)).unwrap().tags().is_empty());
+        let r = PlanItemRecord {
+            tags: vec!["x".into()],
+            ..record(ItemStatus::Pending)
+        };
+        assert_eq!(PlanItem::restore(r).unwrap().tags(), ["x".to_owned()]);
     }
 
     #[test]

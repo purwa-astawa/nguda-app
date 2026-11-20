@@ -37,6 +37,8 @@ pub struct ReportRow {
     pub status: ItemStatus,
     /// The item this one was carried over from, on an earlier day.
     pub carried_from: Option<ItemId>,
+    /// The item's tags, in order.
+    pub tags: Vec<String>,
     /// `None` exactly when `planned_source` is `Unplanned`.
     pub planned_secs: Option<u64>,
     pub planned_source: PlannedSource,
@@ -104,6 +106,7 @@ pub fn report(
             title: item.title().to_owned(),
             status: item.status(),
             carried_from: item.carried_from(),
+            tags: item.tags().to_vec(),
             planned_secs,
             planned_source,
             actual_secs: actual,
@@ -171,6 +174,7 @@ mod tests {
             removed_at: None,
             segments: Vec::new(),
             carried_from: None,
+            tags: Vec::new(),
         }
     }
 
@@ -211,6 +215,7 @@ mod tests {
             vec![PlanItemRecord {
                 status: ItemStatus::Done,
                 segments: vec![closed(100, 2_000)],
+                tags: vec!["deep".into(), "Work".into()],
                 ..record(1, 1_800, "a")
             }],
         );
@@ -234,6 +239,7 @@ mod tests {
                 title: "item 1".into(),
                 status: ItemStatus::Done,
                 carried_from: None,
+                tags: vec!["deep".into(), "Work".into()],
                 planned_secs: Some(1_500),
                 planned_source: PlannedSource::Baseline,
                 actual_secs: 1_900,

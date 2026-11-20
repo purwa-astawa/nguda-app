@@ -100,6 +100,7 @@ mod tests {
             removed_at: None,
             segments: Vec::new(),
             carried_from: None,
+            tags: Vec::new(),
         }
     }
 

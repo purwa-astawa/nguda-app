@@ -199,6 +199,19 @@ pub fn extend_task(
     send(&engine, extend_task_msg(&item_id, secs, expected_rev))
 }
 
+/// Replaces an item's tags with `tags`. The engine trims them, drops blanks and
+/// case-insensitive duplicates, and takes a known tag's spelling.
+#[tauri::command]
+#[specta::specta]
+pub fn set_tags(
+    engine: State<'_, EngineHandle>,
+    item_id: String,
+    tags: Vec<String>,
+    expected_rev: u32,
+) -> Result<(), String> {
+    send(&engine, set_tags_msg(&item_id, tags, expected_rev))
+}
+
 /// Inserts a new task at `anchor`; `now` starts it, pausing the running item.
 /// `lock` is the lock choice for `now` on an undecided day, else `null`.
 #[tauri::command]
@@ -373,6 +386,14 @@ fn extend_task_msg(item_id: &str, secs: u32, expected_rev: u32) -> Result<Engine
     })
 }
 
+fn set_tags_msg(item_id: &str, tags: Vec<String>, expected_rev: u32) -> Result<EngineMsg, String> {
+    Ok(EngineMsg::SetTags {
+        item_id: parse_item_id(item_id)?,
+        tags,
+        expected_rev: expected_rev.into(),
+    })
+}
+
 fn set_work_end_msg(minutes: u32) -> EngineMsg {
     EngineMsg::SetWorkEnd { minutes }
 }
@@ -441,6 +462,9 @@ pub struct SnapshotEvent {
     pub overflow: Vec<String>,
     /// One entry per status key, sorted by key.
     pub status: Vec<StatusView>,
+    /// Every tag name ever stored, sorted case-insensitively: the suggestions for
+    /// an item's tag editor.
+    pub known_tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
@@ -495,6 +519,8 @@ pub struct ItemView {
     /// The item is paused on the interrupt stack: `Switch` resumes it before the
     /// schedule, so it is never an insert anchor.
     pub interrupted: bool,
+    /// The item's tags, in order.
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type)]
@@ -587,6 +613,8 @@ pub struct ReportRowView {
     pub status: ItemStatusView,
     /// UUID of the item on an earlier day this one was carried over from.
     pub carried_from: Option<String>,
+    /// The item's tags, in order.
+    pub tags: Vec<String>,
     /// `null` exactly when `plannedSource` is `unplanned`.
     pub planned_secs: Option<u32>,
     pub planned_source: PlannedSourceView,
@@ -700,6 +728,7 @@ fn row_view(r: &ReportRow) -> ReportRowView {
         title: r.title.clone(),
         status: r.status.into(),
         carried_from: r.carried_from.map(|id| id.to_string()),
+        tags: r.tags.clone(),
         planned_secs: r.planned_secs.map(saturating_u32),
         planned_source: r.planned_source.into(),
         actual_secs: saturating_u32(r.actual_secs),
@@ -767,6 +796,7 @@ impl From<&Snapshot> for SnapshotEvent {
             }),
             work_end: s.work_end.to_string(),
             overflow: s.overflow.iter().map(ToString::to_string).collect(),
+            known_tags: s.known_tags.clone(),
             status: s
                 .status
                 .iter()
@@ -791,6 +821,7 @@ fn item_view(day: &Day, i: &PlanItem, slot: &Slot) -> ItemView {
         scheduled_start: slot.span.map(|sp| sp.start.to_string()),
         scheduled_end: slot.span.map(|sp| sp.end.to_string()),
         interrupted: day.interrupt_stack().contains(&i.id()),
+        tags: i.tags().to_vec(),
     }
 }
 
@@ -823,6 +854,7 @@ pub fn specta_builder() -> Builder<Wry> {
             pause_task,
             switch_task,
             extend_task,
+            set_tags,
             insert_task,
             set_work_end,
             carry_over_to_tomorrow,
@@ -893,6 +925,7 @@ mod tests {
             "pauseTask",
             "switchTask",
             "extendTask",
+            "setTags",
             "insertTask",
             "setWorkEnd",
             "carryOverToTomorrow",
@@ -1028,6 +1061,14 @@ mod tests {
             })
         );
         assert_eq!(
+            set_tags_msg(A, vec!["deep".into(), " Work ".into()], 9),
+            Ok(EngineMsg::SetTags {
+                item_id: item(A),
+                tags: vec!["deep".into(), " Work ".into()],
+                expected_rev: 9
+            })
+        );
+        assert_eq!(
             set_work_end_msg(1080),
             EngineMsg::SetWorkEnd { minutes: 1080 }
         );
@@ -1081,6 +1122,7 @@ mod tests {
             assert!(pause_task_msg(bad).is_err(), "{bad}");
             assert!(switch_task_msg(bad, 1).is_err(), "{bad}");
             assert!(extend_task_msg(bad, 300, 1).is_err(), "{bad}");
+            assert!(set_tags_msg(bad, vec!["t".into()], 1).is_err(), "{bad}");
             assert!(toggle_fixed_msg(bad, None, 1).is_err(), "{bad}");
             let anchor = ReorderAnchorArg {
                 place: AnchorPlace::After,
@@ -1141,6 +1183,7 @@ mod tests {
             removed_at: None,
             segments: Vec::new(),
             carried_from: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1152,6 +1195,7 @@ mod tests {
         let f = PlanItemRecord {
             fixed: true,
             pinned_start: Some(ts("2026-11-11T08:00:00Z")),
+            tags: vec!["meeting".into(), "Team".into()],
             ..record(F, "Standup", "V")
         };
         let a = PlanItemRecord {
@@ -1192,9 +1236,11 @@ mod tests {
                 key: StatusKey::CommandRejected,
                 message: "stale revision".into(),
             }],
+            known_tags: vec!["meeting".into(), "old".into(), "Team".into()],
         };
         let ev = SnapshotEvent::from(&snap);
         assert_eq!(ev.rev, 5);
+        assert_eq!(ev.known_tags, ["meeting", "old", "Team"]);
         assert_eq!(ev.work_end, "18:05");
         assert_eq!(ev.overflow, [B]);
         assert_eq!(
@@ -1220,8 +1266,10 @@ mod tests {
                 scheduled_start: Some("2026-11-11T08:00:00Z".into()),
                 scheduled_end: Some("2026-11-11T08:25:00Z".into()),
                 interrupted: false,
+                tags: vec!["meeting".into(), "Team".into()],
             }
         );
+        assert!(ev.items[1].tags.is_empty());
         // A ends at its planned end (1500 s less 60 banked); B flows after it.
         let times = |n: usize| {
             let i = &ev.items[n];
@@ -1327,6 +1375,7 @@ mod tests {
                 work_end: "17:00".into(),
                 overflow: vec![],
                 status: vec![],
+                known_tags: vec![],
             }
         );
     }
@@ -1380,6 +1429,7 @@ mod tests {
                     title: "Write".into(),
                     status: ItemStatus::CarriedOver,
                     carried_from: Some(item(B)),
+                    tags: vec!["deep".into(), "Work".into()],
                     planned_secs: Some(1500),
                     planned_source: PlannedSource::Baseline,
                     actual_secs: 1900,
@@ -1390,6 +1440,7 @@ mod tests {
                     title: "Call".into(),
                     status: ItemStatus::Done,
                     carried_from: None,
+                    tags: Vec::new(),
                     planned_secs: None,
                     planned_source: PlannedSource::Unplanned,
                     actual_secs: u64::MAX,
@@ -1400,6 +1451,7 @@ mod tests {
                     title: "Huge".into(),
                     status: ItemStatus::Removed,
                     carried_from: None,
+                    tags: Vec::new(),
                     planned_secs: Some(u64::MAX),
                     planned_source: PlannedSource::Unlocked,
                     actual_secs: 0,
@@ -1466,6 +1518,7 @@ mod tests {
                 title: "Write".into(),
                 status: ItemStatusView::CarriedOver,
                 carried_from: Some(B.into()),
+                tags: vec!["deep".into(), "Work".into()],
                 planned_secs: Some(1500),
                 planned_source: PlannedSourceView::Baseline,
                 actual_secs: 1900,

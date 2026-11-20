@@ -140,8 +140,25 @@ CREATE TRIGGER baseline_item_no_delete BEFORE DELETE ON baseline_item
 BEGIN SELECT RAISE(ABORT, 'baseline is write-once'); END;
 "#;
 
+/// v9: tags (CAP-8, AD-9). A tag name is stored once, unique case-insensitively, and
+/// is never deleted, so the known names only grow. `plan_item_tag` links an item to
+/// its tags, `position` 0 first in the item's order.
+const V9: &str = r#"
+CREATE TABLE tag (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+) STRICT;
+
+CREATE TABLE plan_item_tag (
+    item_id  TEXT NOT NULL REFERENCES plan_item (id),
+    tag_id   INTEGER NOT NULL REFERENCES tag (id),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    PRIMARY KEY (item_id, tag_id)
+) STRICT;
+"#;
+
 /// Every migration's SQL, oldest first.
-const ALL: [&str; 8] = [V1, V2, V3, V4, V5, V6, V7, V8];
+const ALL: [&str; 9] = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
 
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {

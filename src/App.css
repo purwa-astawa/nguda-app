@@ -174,3 +174,41 @@ body {
   border: 1px solid currentColor;
   color: #6b4500;
 }
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  margin: 0.3rem 0;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  font-size: 0.75em;
+  margin-left: 0.4rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  background: #e8eaf6;
+  color: #283593;
+}
+
+.tags .tag {
+  margin-left: 0;
+}
+
+.tag button {
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+.add-tag input {
+  width: 7rem;
+  font-size: 0.85em;
+}

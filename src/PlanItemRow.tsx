@@ -1,12 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
+  addTag,
   editCommand,
   extendCommand,
   pinCommand,
+  removeTag,
   rowActions,
   rowTime,
   scheduleLabel,
   secsToMinutes,
+  setTagsCommand,
+  tagSuggestions,
   type Command,
   type Item,
   type Snapshot,
@@ -44,6 +48,10 @@ export function PlanItemRow({ snap, item, now, send, start, focusExtend }: Props
   const [minutes, setMinutes] = useState(String(secsToMinutes(item.plannedSecs)));
   const [pinTime, setPinTime] = useState("");
   const [extendMinutes, setExtendMinutes] = useState("5");
+  const [tagText, setTagText] = useState("");
+  const suggestionsId = useId();
+  const taggable = item.status !== "removed";
+  const suggestions = tagSuggestions(snap.knownTags, item.tags);
   const extendRef = useRef<HTMLInputElement>(null);
   // The last focus request from the tray's or a notification's Extend… this row has
   // handled; starts at the value at mount.
@@ -104,6 +112,48 @@ export function PlanItemRow({ snap, item, now, send, start, focusExtend }: Props
           </span>
         </div>
       )}
+
+      <div className="tags">
+        {item.tags.map((tag) => (
+          <span key={tag} className="tag">
+            {tag}
+            {taggable && (
+              <button
+                type="button"
+                aria-label={`Remove tag ${tag}`}
+                onClick={() => send(setTagsCommand(snap, item, removeTag(item.tags, tag)))}
+              >
+                ×
+              </button>
+            )}
+          </span>
+        ))}
+        {taggable && (
+          <form
+            noValidate
+            className="add-tag"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const next = addTag(item.tags, tagText);
+              if (next !== item.tags) send(setTagsCommand(snap, item, next));
+              setTagText("");
+            }}
+          >
+            <input
+              aria-label="Add tag"
+              placeholder="add tag"
+              list={suggestionsId}
+              value={tagText}
+              onChange={(e) => setTagText(e.target.value)}
+            />
+            <datalist id={suggestionsId}>
+              {suggestions.map((t) => (
+                <option key={t} value={t} />
+              ))}
+            </datalist>
+          </form>
+        )}
+      </div>
 
       <div className="actions">
         {actions.start && <button onClick={() => start(actions.start!)}>Start</button>}

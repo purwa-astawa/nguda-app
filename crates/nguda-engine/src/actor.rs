@@ -11,7 +11,7 @@ use std::time::Duration;
 use nguda_core::{
     Clock, Date, Day, DayLogKind, IdGen, ItemId, LockDecision, OpenSegmentRef, PlanItem, PromptId,
     PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
-    WorkEnd, reflow, report,
+    WorkEnd, merge_tag_names, reflow, report, sort_tag_names,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -54,6 +54,9 @@ struct Actor {
     day: Day,
     /// The work-end setting, as last committed or loaded.
     work_end: WorkEnd,
+    /// Every tag name ever stored, sorted case-insensitively: loaded at startup and
+    /// merged after each committed `SetTags`, so a failed commit adds nothing.
+    known_tags: Vec<String>,
     /// The overflow list of the last publish, in schedule order.
     overflow: Vec<ItemId>,
     /// The prompt of the open overflow episode, if one is open: set when the list
@@ -96,6 +99,7 @@ impl Actor {
             tz: deps.tz,
             day,
             work_end: WorkEnd::DEFAULT,
+            known_tags: Vec::new(),
             overflow: Vec::new(),
             overflow_prompt: None,
             status: BTreeMap::new(),
@@ -108,8 +112,8 @@ impl Actor {
         }
     }
 
-    /// Recovers a crash-left open segment, loads today and the settings, and
-    /// publishes rev 1. Runs before any message is handled.
+    /// Recovers a crash-left open segment, loads today, the settings and the known
+    /// tag names, and publishes rev 1. Runs before any message is handled.
     async fn startup(&mut self) {
         let now = self.clock.now();
         let today = today(now, &self.tz);
@@ -137,6 +141,16 @@ impl Actor {
             Err(e) => {
                 self.store_failed("load settings", &e);
                 WorkEnd::DEFAULT
+            }
+        };
+        self.known_tags = match self.store.load_tag_names().await {
+            Ok(mut names) => {
+                sort_tag_names(&mut names);
+                names
+            }
+            Err(e) => {
+                self.store_failed("load tag names", &e);
+                Vec::new()
             }
         };
         self.heartbeat_at = deadline_after(now);
@@ -277,9 +291,13 @@ impl Actor {
         let status_before = self.status.clone();
         let name = commands::name(&msg);
         let item_id = commands::target(&msg);
-        // `msg` moves into `apply`, so note an extension's target first.
+        // `msg` moves into `apply`, so note an extension's and a retag's target first.
         let extend_target = match &msg {
             EngineMsg::ExtendTask { item_id, .. } => Some(*item_id),
+            _ => None,
+        };
+        let tags_target = match &msg {
+            EngineMsg::SetTags { item_id, .. } => Some(*item_id),
             _ => None,
         };
         let now = self.clock.now();
@@ -292,6 +310,7 @@ impl Actor {
             now,
             self.ids.as_ref(),
             self.rev,
+            &self.known_tags,
         );
         let changed = match applied {
             Err(reject) => {
@@ -315,6 +334,9 @@ impl Actor {
                 }
             }
         };
+        if changed && let Some(item) = tags_target.and_then(|id| self.day.item(id)) {
+            merge_tag_names(&mut self.known_tags, item.tags());
+        }
         if changed || self.status != status_before {
             self.publish();
         }
@@ -623,6 +645,7 @@ impl Actor {
             schedule,
             work_end: self.work_end,
             overflow: self.overflow.clone(),
+            known_tags: self.known_tags.clone(),
             status: self
                 .status
                 .iter()

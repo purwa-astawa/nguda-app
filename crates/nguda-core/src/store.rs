@@ -20,9 +20,10 @@ use crate::settings::{Settings, WorkEnd};
 pub enum StoreOp {
     /// Creates the day, or confirms it exists. A day's zone never changes once stored.
     PutDay { date: Date, tz: String },
-    /// Inserts or updates the item's plan fields. Its segments are ignored: they
-    /// change only through [`StoreOp::OpenSegment`] and [`StoreOp::CloseSegment`]. An
-    /// item never moves to another day.
+    /// Inserts or updates the item's plan fields, its tags included (replacing its
+    /// tag links; a new tag name is stored once, matched case-insensitively). Its
+    /// segments are ignored: they change only through [`StoreOp::OpenSegment`] and
+    /// [`StoreOp::CloseSegment`]. An item never moves to another day.
     PutItem { date: Date, item: PlanItem },
     /// Opens a segment for `item_id` at `started_at`. At most one segment is open.
     OpenSegment {
@@ -143,4 +144,8 @@ pub trait Store: Send + Sync + 'static {
     /// The day's baseline with its items in schedule order, or `None` if the day
     /// was never locked.
     fn load_baseline(&self, date: Date) -> StoreFuture<Option<Baseline>>;
+
+    /// Every tag name ever stored, in any order. A name stays known after the last
+    /// item using it drops it.
+    fn load_tag_names(&self) -> StoreFuture<Vec<String>>;
 }

@@ -17,6 +17,7 @@ function row(extra: Partial<ReportRow> = {}): ReportRow {
     title: "A",
     status: "done",
     carriedFrom: null,
+    tags: [],
     plannedSecs: 1500,
     plannedSource: "baseline",
     actualSecs: 1900,
