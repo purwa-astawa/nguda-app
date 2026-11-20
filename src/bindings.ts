@@ -59,6 +59,12 @@ export const commands = {
 	 *  nothing.
 	 */
 	queryDay: (date: string) => typedError<DayReportView_Serialize | null, string>(__TAURI_INVOKE("query_day", { date })),
+	/**
+	 *  The estimate gap of the ISO week (Monday to Sunday, local dates) holding
+	 *  `date` (`YYYY-MM-DD`). Read-only (AD-16). A malformed date, or one in the last
+	 *  days of the calendar whose week runs past it, is an `Err` and sends nothing.
+	 */
+	queryWeek: (date: string) => typedError<WeekReportView_Serialize, string>(__TAURI_INVOKE("query_week", { date })),
 };
 
 /** Events */
@@ -159,6 +165,27 @@ export type DayView = {
  *  extend-minutes field. Carries nothing.
  */
 export type FocusExtendEvent = null;
+
+/**  One gap figure and the counts behind it. */
+export type GapView = GapView_Serialize | GapView_Deserialize;
+
+/**  One gap figure and the counts behind it. */
+export type GapView_Deserialize = {
+	/**  `actualSecs ÷ plannedSecs`, from core; `null` when nothing was planned. */
+	ratio?: number | null,
+	items: number,
+	actualSecs: number,
+	plannedSecs: number,
+};
+
+/**  One gap figure and the counts behind it. */
+export type GapView_Serialize = {
+	/**  `actualSecs ÷ plannedSecs`, from core; `null` when nothing was planned. */
+	ratio: number | null,
+	items: number,
+	actualSecs: number,
+	plannedSecs: number,
+};
 
 /**
  *  An insert target, never a numeric index (AD-15). `before` and `after` need
@@ -455,6 +482,72 @@ export type StatusKeyView = "store" | "commandRejected" | "overflow";
 export type StatusView = {
 	key: StatusKeyView,
 	message: string,
+};
+
+/**  One tag's gap. */
+export type TagGapView = TagGapView_Serialize | TagGapView_Deserialize;
+
+/**  One tag's gap. */
+export type TagGapView_Deserialize = {
+	tag: string,
+	gap: GapView_Deserialize,
+};
+
+/**  One tag's gap. */
+export type TagGapView_Serialize = {
+	tag: string,
+	gap: GapView_Serialize,
+};
+
+/**  A week's estimate gap (AD-6, AD-16), the reply of [`query_week`]. */
+export type WeekReportView = WeekReportView_Serialize | WeekReportView_Deserialize;
+
+/**  A week's estimate gap (AD-6, AD-16), the reply of [`query_week`]. */
+export type WeekReportView_Deserialize = {
+	/**  The ISO year, which can differ from the calendar year of some dates. */
+	year: number,
+	/**  The ISO week number, `1..=53`. */
+	week: number,
+	/**  The Monday, `YYYY-MM-DD`. */
+	start: string,
+	/**  The Sunday, `YYYY-MM-DD`. */
+	end: string,
+	/**  The previous week's Monday; `null` at the start of the calendar. */
+	previousStart?: string | null,
+	/**  The next week's Monday; `null` at the end of the calendar. */
+	nextStart?: string | null,
+	/**  Σ actual ÷ Σ baseline planned over every counted item. */
+	overall: GapView_Deserialize,
+	/**  Each tag of a counted item, sorted case-insensitively. */
+	tags: TagGapView_Deserialize[],
+	/**  The locked days of the week, ascending. */
+	countedDays: string[],
+	/**  The days excluded as unlocked (undecided or no-lock), ascending. */
+	unlockedDays: string[],
+};
+
+/**  A week's estimate gap (AD-6, AD-16), the reply of [`query_week`]. */
+export type WeekReportView_Serialize = {
+	/**  The ISO year, which can differ from the calendar year of some dates. */
+	year: number,
+	/**  The ISO week number, `1..=53`. */
+	week: number,
+	/**  The Monday, `YYYY-MM-DD`. */
+	start: string,
+	/**  The Sunday, `YYYY-MM-DD`. */
+	end: string,
+	/**  The previous week's Monday; `null` at the start of the calendar. */
+	previousStart: string | null,
+	/**  The next week's Monday; `null` at the end of the calendar. */
+	nextStart: string | null,
+	/**  Σ actual ÷ Σ baseline planned over every counted item. */
+	overall: GapView_Serialize,
+	/**  Each tag of a counted item, sorted case-insensitively. */
+	tags: TagGapView_Serialize[],
+	/**  The locked days of the week, ascending. */
+	countedDays: string[],
+	/**  The days excluded as unlocked (undecided or no-lock), ascending. */
+	unlockedDays: string[],
 };
 
 /* Tauri Specta runtime */

@@ -19,6 +19,7 @@ import {
 } from "./plan";
 import { PlanItemRow } from "./PlanItemRow";
 import { Summary } from "./Summary";
+import { Week } from "./Week.tsx";
 import "./App.css";
 
 /** Sends one command. Resolves to the error text of a malformed-input `Err`. */
@@ -79,9 +80,9 @@ const TABS: { value: Tab; label: string }[] = [
   { value: "week", label: "Week" },
 ];
 
-// Thin view (AD-5): it keeps only the newest snapshot, the shown summary's query
-// result, and local form state; it shows items in the order given and sends every
-// change as a command.
+// Thin view (AD-5): it keeps only the newest snapshot, the shown summary's and
+// week's query results, and local form state; it shows items in the order given
+// and sends every change as a command.
 function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -102,6 +103,8 @@ function App() {
   const [tab, setTab] = useState<Tab>("plan");
   // The summary's picked date; `null` follows the snapshot's today.
   const [summaryDate, setSummaryDate] = useState<string | null>(null);
+  // A date in the week view's week; `null` follows the snapshot's today.
+  const [weekDate, setWeekDate] = useState<string | null>(null);
   // Bumped by the tray's "Today's summary", so it asks again even when already shown.
   const [summaryOpened, setSummaryOpened] = useState(0);
 
@@ -393,7 +396,17 @@ function App() {
           <p>Starting…</p>
         ))}
 
-      {tab === "week" && <p>Weekly view coming soon.</p>}
+      {tab === "week" &&
+        (snap.day ? (
+          <Week
+            date={weekDate ?? snap.day.date}
+            today={snap.day.date}
+            rev={snap.rev}
+            onDate={setWeekDate}
+          />
+        ) : (
+          <p>Starting…</p>
+        ))}
 
       {/* Kept mounted so the tray's Extend… can always focus the running row. */}
       <div hidden={tab !== "plan"}>{planView}</div>

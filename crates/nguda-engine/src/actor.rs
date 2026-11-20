@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Date, Day, DayLogKind, IdGen, ItemId, LockDecision, OpenSegmentRef, PlanItem, PromptId,
-    PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
-    WorkEnd, merge_tag_names, reflow, report, sort_tag_names,
+    Clock, Date, Day, DayLogKind, IdGen, IsoWeek, ItemId, LockDecision, OpenSegmentRef, PlanItem,
+    PromptId, PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone,
+    Timestamp, WorkEnd, merge_tag_names, reflow, report, sort_tag_names, week_report,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -19,7 +19,7 @@ use crate::batch::diff;
 use crate::commands::{self, Reject, domain_kind};
 use crate::{
     DayReply, Effect, EngineDeps, EngineMsg, HEARTBEAT_EVERY, Inbox, NextItem, Snapshot,
-    StatusEntry, StatusKey,
+    StatusEntry, StatusKey, WeekReply,
 };
 
 pub(crate) async fn run(
@@ -36,6 +36,7 @@ pub(crate) async fn run(
             msg = rx.recv() => match msg {
                 Some(Inbox::Command(msg)) => actor.handle(msg).await,
                 Some(Inbox::QueryDay { date, reply }) => actor.query_day(date, reply),
+                Some(Inbox::QueryWeek { week, reply }) => actor.query_week(week, reply),
                 None => break,
             },
             () = deadline => actor.on_deadline().await,
@@ -261,6 +262,39 @@ impl Actor {
             let result = build_report(store.as_ref(), date, today, now).await;
             if let Err(e) = &result {
                 tracing::warn!(%date, error = %e, "day query failed");
+            }
+            // The asker may have gone away; nothing to do then.
+            let _ = reply.send(result);
+        });
+    }
+
+    /// Answers a week query without waiting (AD-4, AD-16): notes `now`, clones
+    /// today's committed day when today is in `week`, and spawns the reports of
+    /// the week's dates up to today and the gap. Dates after today are skipped: a
+    /// stored future day (such as tomorrow's, made by carry-over) has not happened
+    /// yet, so it is neither counted nor excluded as unlocked. Read-only, like
+    /// [`Self::query_day`]. A dropped reply is ignored. Logs the week only (AD-14).
+    fn query_week(&self, week: IsoWeek, reply: oneshot::Sender<WeekReply>) {
+        let now = self.clock.now();
+        let today_date = self.day.date();
+        let mut today = week.contains(today_date).then(|| self.day.clone());
+        let store = self.store.clone();
+        let (year, number) = (week.year(), week.week());
+        tracing::debug!(year, week = number, live = today.is_some(), "week queried");
+        tokio::spawn(async move {
+            let result = async {
+                let mut reports = Vec::with_capacity(7);
+                for date in week.days().into_iter().filter(|d| *d <= today_date) {
+                    let live = today.take_if(|d| d.date() == date);
+                    if let Some(r) = build_report(store.as_ref(), date, live, now).await? {
+                        reports.push(r);
+                    }
+                }
+                Ok(week_report(week, &reports))
+            }
+            .await;
+            if let Err(e) = &result {
+                tracing::warn!(year, week = number, error = %e, "week query failed");
             }
             // The asker may have gone away; nothing to do then.
             let _ = reply.send(result);

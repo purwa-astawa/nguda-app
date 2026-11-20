@@ -11,13 +11,16 @@
 //! with `Err` on malformed input without sending anything; every semantic check
 //! happens in the engine, which reports rejections through `Snapshot.status`.
 //!
-//! The one exception is [`query_day`] (AD-16), a read-only request/reply. It is an
-//! `async` command, so Tauri runs it off the main thread and nothing there waits
-//! on the engine (AD-4). Dates cross as `YYYY-MM-DD`.
+//! The exceptions are [`query_day`] and [`query_week`] (AD-16), read-only
+//! request/replies. They are `async` commands, so Tauri runs them off the main
+//! thread and nothing there waits on the engine (AD-4). Dates cross as
+//! `YYYY-MM-DD`. A gap ratio crosses as `f64` (`number | null`): it is never NaN,
+//! because core gives `None` instead of dividing by zero.
 
 use nguda_core::{
-    BaselineItem, Date, Day, DayLogEntry, DayLogKind, DayReport, ItemId, ItemStatus, LockChoice,
-    LockDecision, PlanItem, PlannedSource, ReportRow, Slot, Timestamp, Uuid, closed_secs,
+    BaselineItem, Date, Day, DayLogEntry, DayLogKind, DayReport, GapFigure, IsoWeek, ItemId,
+    ItemStatus, LockChoice, LockDecision, PlanItem, PlannedSource, ReportRow, Slot, Timestamp,
+    Uuid, WeekReport, closed_secs,
 };
 use nguda_engine::{EngineHandle, EngineMsg, InsertAnchor, ReorderAnchor, Snapshot, StatusKey};
 use serde::{Deserialize, Serialize};
@@ -263,7 +266,25 @@ pub async fn query_day(
     Ok(report.as_ref().map(DayReportView::from))
 }
 
+/// The estimate gap of the ISO week (Monday to Sunday, local dates) holding
+/// `date` (`YYYY-MM-DD`). Read-only (AD-16). A malformed date, or one in the last
+/// days of the calendar whose week runs past it, is an `Err` and sends nothing.
+#[tauri::command]
+#[specta::specta]
+pub async fn query_week(
+    engine: State<'_, EngineHandle>,
+    date: String,
+) -> Result<WeekReportView, String> {
+    let week = week_of(&date)?;
+    let report = engine.query_week(week).await.map_err(|e| e.to_string())?;
+    Ok(WeekReportView::from(&report))
+}
+
 // --- Argument parsing: syntax only, no semantic checks ---
+
+fn week_of(s: &str) -> Result<IsoWeek, String> {
+    IsoWeek::containing(parse_date(s)?).ok_or_else(|| "date out of range".to_owned())
+}
 
 fn parse_date(s: &str) -> Result<Date, String> {
     let bad = || "invalid date: expected YYYY-MM-DD".to_owned();
@@ -699,6 +720,87 @@ pub enum MarkerKindView {
     CarriedOver,
 }
 
+/// A week's estimate gap (AD-6, AD-16), the reply of [`query_week`].
+#[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WeekReportView {
+    /// The ISO year, which can differ from the calendar year of some dates.
+    pub year: i32,
+    /// The ISO week number, `1..=53`.
+    pub week: u32,
+    /// The Monday, `YYYY-MM-DD`.
+    pub start: String,
+    /// The Sunday, `YYYY-MM-DD`.
+    pub end: String,
+    /// The previous week's Monday; `null` at the start of the calendar.
+    pub previous_start: Option<String>,
+    /// The next week's Monday; `null` at the end of the calendar.
+    pub next_start: Option<String>,
+    /// Σ actual ÷ Σ baseline planned over every counted item.
+    pub overall: GapView,
+    /// Each tag of a counted item, sorted case-insensitively.
+    pub tags: Vec<TagGapView>,
+    /// The locked days of the week, ascending.
+    pub counted_days: Vec<String>,
+    /// The days excluded as unlocked (undecided or no-lock), ascending.
+    pub unlocked_days: Vec<String>,
+}
+
+/// One gap figure and the counts behind it.
+#[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GapView {
+    /// `actualSecs ÷ plannedSecs`, from core; `null` when nothing was planned.
+    pub ratio: Option<f64>,
+    pub items: u32,
+    pub actual_secs: u32,
+    pub planned_secs: u32,
+}
+
+/// One tag's gap.
+#[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TagGapView {
+    pub tag: String,
+    pub gap: GapView,
+}
+
+impl From<&GapFigure> for GapView {
+    fn from(g: &GapFigure) -> Self {
+        Self {
+            ratio: g.ratio(),
+            items: g.items,
+            actual_secs: saturating_u32(g.actual_secs),
+            planned_secs: saturating_u32(g.planned_secs),
+        }
+    }
+}
+
+impl From<&WeekReport> for WeekReportView {
+    fn from(r: &WeekReport) -> Self {
+        let dates = |days: &[Date]| days.iter().map(ToString::to_string).collect();
+        Self {
+            year: i32::from(r.week.year()),
+            week: u32::try_from(r.week.week()).unwrap_or(0),
+            start: r.week.start().to_string(),
+            end: r.week.end().to_string(),
+            previous_start: r.week.previous().map(|w| w.start().to_string()),
+            next_start: r.week.next().map(|w| w.start().to_string()),
+            overall: GapView::from(&r.overall),
+            tags: r
+                .tags
+                .iter()
+                .map(|t| TagGapView {
+                    tag: t.tag.clone(),
+                    gap: GapView::from(&t.figure),
+                })
+                .collect(),
+            counted_days: dates(&r.counted_days),
+            unlocked_days: dates(&r.unlocked_days),
+        }
+    }
+}
+
 impl From<&DayReport> for DayReportView {
     fn from(r: &DayReport) -> Self {
         Self {
@@ -859,7 +961,8 @@ pub fn specta_builder() -> Builder<Wry> {
             set_work_end,
             carry_over_to_tomorrow,
             current_snapshot,
-            query_day
+            query_day,
+            query_week
         ])
         .events(collect_events![
             SnapshotEvent,
@@ -931,6 +1034,7 @@ mod tests {
             "carryOverToTomorrow",
             "currentSnapshot",
             "queryDay",
+            "queryWeek",
         ] {
             assert!(committed.contains(&format!("\t{name}: ")), "{name}");
         }
@@ -1414,6 +1518,83 @@ mod tests {
         ] {
             assert!(parse_date(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn query_week_dates_parse_into_the_week_holding_them() {
+        assert_eq!(week_of("2027-01-01"), Ok(IsoWeek::new(2026, 53).unwrap()));
+        assert!(week_of("2026-13-40").is_err());
+        assert_eq!(week_of("9999-12-31"), Err("date out of range".to_owned()));
+    }
+
+    fn week_report(year: i16, week: i8, overall: GapFigure) -> WeekReport {
+        WeekReport {
+            week: IsoWeek::new(year, week).unwrap(),
+            overall,
+            tags: vec![nguda_core::TagGap {
+                tag: "proposals".into(),
+                figure: overall,
+            }],
+            counted_days: vec![Date::constant(2026, 11, 16)],
+            unlocked_days: vec![Date::constant(2026, 11, 17), Date::constant(2026, 11, 18)],
+        }
+    }
+
+    #[test]
+    fn week_report_view_converts_the_ratio_counts_and_neighbours() {
+        let figure = GapFigure {
+            items: 2,
+            actual_secs: 1600,
+            planned_secs: 1000,
+        };
+        let v = WeekReportView::from(&week_report(2026, 47, figure));
+        let gap = GapView {
+            ratio: Some(1.6),
+            items: 2,
+            actual_secs: 1600,
+            planned_secs: 1000,
+        };
+        assert_eq!(
+            v,
+            WeekReportView {
+                year: 2026,
+                week: 47,
+                start: "2026-11-16".into(),
+                end: "2026-11-22".into(),
+                previous_start: Some("2026-11-09".into()),
+                next_start: Some("2026-11-23".into()),
+                overall: gap.clone(),
+                tags: vec![TagGapView {
+                    tag: "proposals".into(),
+                    gap,
+                }],
+                counted_days: vec!["2026-11-16".into()],
+                unlocked_days: vec!["2026-11-17".into(), "2026-11-18".into()],
+            }
+        );
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["overall"]["ratio"], 1.6);
+        assert_eq!(json["overall"]["actualSecs"], 1600);
+        assert_eq!(json["previousStart"], "2026-11-09");
+        assert_eq!(json["unlockedDays"][1], "2026-11-18");
+    }
+
+    #[test]
+    fn week_report_view_has_a_null_ratio_without_planned_time_and_crosses_years() {
+        let v = WeekReportView::from(&week_report(2026, 53, GapFigure::default()));
+        assert_eq!(v.overall.ratio, None);
+        assert_eq!(
+            serde_json::to_value(&v).unwrap()["overall"]["ratio"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            (v.start.as_str(), v.end.as_str()),
+            ("2026-12-28", "2027-01-03")
+        );
+        assert_eq!(v.previous_start.as_deref(), Some("2026-12-21"));
+        assert_eq!(v.next_start.as_deref(), Some("2027-01-04"));
+        let last = WeekReportView::from(&week_report(9999, 51, GapFigure::default()));
+        assert_eq!(last.next_start, None);
     }
 
     #[test]
