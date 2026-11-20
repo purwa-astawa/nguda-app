@@ -212,3 +212,117 @@ body {
   width: 7rem;
   font-size: 0.85em;
 }
+
+/* Day timeline (Summary): lane names in the first column, a shared track in the second. */
+.timeline {
+  display: grid;
+  grid-template-columns: 4.5rem 1fr;
+  grid-template-rows: auto auto auto auto;
+  row-gap: 0.25rem;
+  margin-top: 0.6rem;
+  font-size: 0.8em;
+}
+
+.tl-name {
+  grid-column: 1;
+  color: #555;
+  align-self: center;
+}
+
+.tl-ticks,
+.tl-lane,
+.tl-markers {
+  position: relative;
+}
+
+.tl-ticks {
+  height: 1.1rem;
+  border-bottom: 1px solid #ccc;
+}
+
+.tl-tick {
+  position: absolute;
+  bottom: 0;
+  padding-left: 0.15rem;
+  border-left: 1px solid #ccc;
+  color: #777;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.tl-lane {
+  background: #f6f6f6;
+  border-radius: 3px;
+}
+
+.tl-bar {
+  position: absolute;
+  box-sizing: border-box;
+  height: 1.3rem;
+  margin-top: 0.1rem;
+  padding: 0;
+  text-indent: 0.25rem;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  line-height: 1.3rem;
+  border-radius: 3px;
+  border: 1px solid transparent;
+}
+
+.tl-lane.planned .tl-bar {
+  background: #e8eaf6;
+  border-color: #9fa8da;
+  color: #283593;
+}
+
+.tl-lane.actual .tl-bar {
+  background: #c8e6c9;
+  border-color: #66bb6a;
+  color: #1b5e20;
+}
+
+.tl-lane.actual .tl-bar.open {
+  border-style: dashed;
+  background: repeating-linear-gradient(
+    45deg,
+    #c8e6c9,
+    #c8e6c9 6px,
+    #e8f5e9 6px,
+    #e8f5e9 12px
+  );
+}
+
+.tl-unlocked {
+  display: inline-block;
+  margin: 0.15rem 0.3rem;
+  padding: 0 0.5rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  color: #555;
+}
+
+.tl-markers {
+  min-height: 1.2rem;
+}
+
+.tl-marker {
+  position: absolute;
+  white-space: nowrap;
+  color: #6b4500;
+}
+
+/* Marker lines run through both lanes and the marker row. */
+.tl-lines {
+  grid-column: 2;
+  grid-row: 2 / 5;
+  position: relative;
+  pointer-events: none;
+}
+
+.tl-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid #e0b040;
+}
