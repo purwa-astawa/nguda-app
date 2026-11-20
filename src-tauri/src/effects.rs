@@ -9,7 +9,9 @@
 //! ids and kinds only (AD-14), never titles. `Recovered` needs no rendering
 //! and is ignored. `AskLockOnStart` is only logged, with its item id: the window
 //! asks for the lock choice itself before it sends a Start, and no other surface
-//! sends a choiceless one yet.
+//! sends a choiceless one yet. `ExportDone` goes to the injected
+//! [`ExportDoneCallback`] with its row count (the shell emits it to the view);
+//! nothing is logged here (the engine logs the count).
 //!
 //! Actions (AD-15): when it posts, the consumer records the prompt's target, the
 //! item and the rev of the snapshot it rendered from, in [`PromptTargets`]. The
@@ -103,19 +105,28 @@ pub fn resolve(
     Some(action_msg(target, action))
 }
 
+/// Told the row count of each finished CSV export, saturated to `u32`.
+pub type ExportDoneCallback = Arc<dyn Fn(u32) + Send + Sync>;
+
 /// Posts each prompt at most once.
 struct Consumer {
     notifier: Arc<dyn Notifier>,
     posted: HashSet<PromptId>,
     targets: PromptTargets,
+    on_export_done: ExportDoneCallback,
 }
 
 impl Consumer {
-    fn new(notifier: Arc<dyn Notifier>, targets: PromptTargets) -> Self {
+    fn new(
+        notifier: Arc<dyn Notifier>,
+        targets: PromptTargets,
+        on_export_done: ExportDoneCallback,
+    ) -> Self {
         Self {
             notifier,
             posted: HashSet::new(),
             targets,
+            on_export_done,
         }
     }
 
@@ -135,6 +146,9 @@ impl Consumer {
             Effect::Recovered { .. } => {}
             Effect::AskLockOnStart { item_id } => {
                 eprintln!("nguda: start of item {item_id} needs a lock choice");
+            }
+            Effect::ExportDone { rows } => {
+                (self.on_export_done)(u32::try_from(rows).unwrap_or(u32::MAX));
             }
         }
     }
@@ -205,14 +219,15 @@ fn action_name(action: PromptAction) -> &'static str {
 }
 
 /// Renders effects until the engine stops, recording each actioned prompt's
-/// target in `targets`.
+/// target in `targets` and passing each export's row count to `on_export_done`.
 pub async fn consume(
     mut effects: mpsc::UnboundedReceiver<Effect>,
     snapshots: watch::Receiver<Snapshot>,
     notifier: Arc<dyn Notifier>,
     targets: PromptTargets,
+    on_export_done: ExportDoneCallback,
 ) {
-    let mut consumer = Consumer::new(notifier, targets);
+    let mut consumer = Consumer::new(notifier, targets, on_export_done);
     while let Some(effect) = effects.recv().await {
         // Copy out, so the lock is not held while posting.
         let snapshot = snapshots.borrow().clone();
@@ -224,7 +239,7 @@ pub async fn consume(
 mod tests {
     use std::time::Duration;
 
-    use nguda_adapters::{SqliteStore, SystemClock, UuidV7Ids};
+    use nguda_adapters::{FsFileSink, SqliteStore, SystemClock, UuidV7Ids};
     use nguda_core::{
         Date, Day, ItemStatus, LockChoice, NotifierError, OrderKey, PlanItem, Running, TimeZone,
         Timestamp, Uuid,
@@ -233,6 +248,26 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+
+    fn no_export() -> ExportDoneCallback {
+        Arc::new(|_| {})
+    }
+
+    #[test]
+    fn export_done_calls_the_callback_with_the_row_count_and_posts_nothing() {
+        let fake = Arc::new(FakeNotifier::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let mut c = Consumer::new(
+            fake.clone(),
+            PromptTargets::default(),
+            Arc::new(move |rows| record.lock().unwrap().push(rows)),
+        );
+        c.handle(Effect::ExportDone { rows: 3 }, &snapshot());
+        c.handle(Effect::ExportDone { rows: 0 }, &snapshot());
+        assert_eq!(*seen.lock().unwrap(), vec![3, 0]);
+        assert!(fake.posted.lock().unwrap().is_empty());
+    }
 
     #[derive(Default)]
     struct FakeNotifier {
@@ -307,7 +342,7 @@ mod tests {
     #[test]
     fn a_prompt_is_posted_once_with_the_task_title() {
         let fake = Arc::new(FakeNotifier::default());
-        let mut c = Consumer::new(fake.clone(), PromptTargets::default());
+        let mut c = Consumer::new(fake.clone(), PromptTargets::default(), no_export());
         c.handle(notify(1), &snapshot());
         c.handle(notify(1), &snapshot());
         c.handle(notify(2), &snapshot());
@@ -337,7 +372,7 @@ mod tests {
             fail: true,
             ..Default::default()
         });
-        let mut c = Consumer::new(fake.clone(), PromptTargets::default());
+        let mut c = Consumer::new(fake.clone(), PromptTargets::default(), no_export());
         c.handle(notify(1), &snapshot());
         c.handle(notify(1), &snapshot());
         assert_eq!(fake.posted.lock().unwrap().len(), 1);
@@ -346,7 +381,7 @@ mod tests {
     #[test]
     fn recovered_ask_lock_and_unknown_items_post_nothing() {
         let fake = Arc::new(FakeNotifier::default());
-        let mut c = Consumer::new(fake.clone(), PromptTargets::default());
+        let mut c = Consumer::new(fake.clone(), PromptTargets::default(), no_export());
         c.handle(Effect::Recovered { item_id: item_id() }, &snapshot());
         c.handle(Effect::AskLockOnStart { item_id: item_id() }, &snapshot());
         c.handle(notify(1), &Snapshot::default());
@@ -356,7 +391,7 @@ mod tests {
     #[test]
     fn withdraw_reaches_the_notifier_once_and_never_re_posts() {
         let fake = Arc::new(FakeNotifier::default());
-        let mut c = Consumer::new(fake.clone(), PromptTargets::default());
+        let mut c = Consumer::new(fake.clone(), PromptTargets::default(), no_export());
         c.handle(notify(1), &snapshot());
         c.handle(
             Effect::WithdrawNotification {
@@ -375,7 +410,7 @@ mod tests {
             fail: true,
             ..Default::default()
         });
-        let mut c = Consumer::new(fake.clone(), PromptTargets::default());
+        let mut c = Consumer::new(fake.clone(), PromptTargets::default(), no_export());
         c.handle(notify(1), &snapshot());
         c.handle(
             Effect::WithdrawNotification {
@@ -391,7 +426,7 @@ mod tests {
     #[test]
     fn an_overflow_prompt_names_the_first_leftover_and_counts_the_rest() {
         let fake = Arc::new(FakeNotifier::default());
-        let mut c = Consumer::new(fake.clone(), PromptTargets::default());
+        let mut c = Consumer::new(fake.clone(), PromptTargets::default(), no_export());
         let mut snap = snapshot();
         snap.overflow = vec![item_id()];
         c.handle(notify_overflow(1), &snap);
@@ -425,7 +460,14 @@ mod tests {
         tx.send(notify(1)).unwrap();
         tx.send(notify(1)).unwrap();
         drop(tx);
-        consume(rx, snaps, fake.clone(), PromptTargets::default()).await;
+        consume(
+            rx,
+            snaps,
+            fake.clone(),
+            PromptTargets::default(),
+            no_export(),
+        )
+        .await;
         assert_eq!(fake.posted.lock().unwrap().len(), 1);
     }
 
@@ -433,7 +475,11 @@ mod tests {
     /// recorded.
     fn posted_targets(n: u128) -> PromptTargets {
         let targets = PromptTargets::default();
-        let mut c = Consumer::new(Arc::new(FakeNotifier::default()), targets.clone());
+        let mut c = Consumer::new(
+            Arc::new(FakeNotifier::default()),
+            targets.clone(),
+            no_export(),
+        );
         c.handle(notify(n), &snapshot());
         targets
     }
@@ -442,7 +488,7 @@ mod tests {
     fn a_planned_end_prompt_offers_the_four_actions_and_records_its_target() {
         let fake = Arc::new(FakeNotifier::default());
         let targets = PromptTargets::default();
-        let mut c = Consumer::new(fake.clone(), targets.clone());
+        let mut c = Consumer::new(fake.clone(), targets.clone(), no_export());
         c.handle(notify(1), &snapshot());
         assert_eq!(
             fake.posted.lock().unwrap()[0].actions,
@@ -509,7 +555,11 @@ mod tests {
     #[test]
     fn the_target_is_the_posted_snapshot_not_a_later_one() {
         let targets = PromptTargets::default();
-        let mut c = Consumer::new(Arc::new(FakeNotifier::default()), targets.clone());
+        let mut c = Consumer::new(
+            Arc::new(FakeNotifier::default()),
+            targets.clone(),
+            no_export(),
+        );
         c.handle(notify(1), &snapshot());
         // A later snapshot (a newer rev) changes nothing already recorded, and a
         // withdrawn prompt keeps its target, so a late click is rejected as stale.
@@ -531,7 +581,7 @@ mod tests {
     fn an_overflow_prompt_has_no_actions_and_no_target() {
         let fake = Arc::new(FakeNotifier::default());
         let targets = PromptTargets::default();
-        let mut c = Consumer::new(fake.clone(), targets.clone());
+        let mut c = Consumer::new(fake.clone(), targets.clone(), no_export());
         let mut snap = snapshot();
         snap.overflow = vec![item_id()];
         c.handle(notify_overflow(1), &snap);
@@ -549,6 +599,7 @@ mod tests {
             clock: Arc::new(SystemClock),
             store: Arc::new(store),
             ids: Arc::new(UuidV7Ids),
+            files: Arc::new(FsFileSink),
             tz: TimeZone::UTC,
         });
         let wait = Duration::from_secs(10);
@@ -584,7 +635,11 @@ mod tests {
 
         // The prompt is posted from the running snapshot (rev r).
         let targets = PromptTargets::default();
-        let mut c = Consumer::new(Arc::new(FakeNotifier::default()), targets.clone());
+        let mut c = Consumer::new(
+            Arc::new(FakeNotifier::default()),
+            targets.clone(),
+            no_export(),
+        );
         c.handle(
             Effect::Notify {
                 prompt_id: prompt(1),

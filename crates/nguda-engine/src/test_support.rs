@@ -3,13 +3,14 @@
 //! the engine's test modules (instants, ids, order keys, sample items and days).
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nguda_core::{
-    Baseline, Clock, Date, Day, DayLogEntry, IdGen, ItemId, LockChoice, LockDecision,
-    OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, PromptId, Segment, Settings, SleepFuture,
-    Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
+    Baseline, Clock, Date, Day, DayLogEntry, FileSink, FileSinkError, IdGen, ItemId, LockChoice,
+    LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, PromptId, Segment, Settings,
+    SleepFuture, Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
 };
 use tokio::sync::watch;
 
@@ -527,5 +528,47 @@ impl Store for MemoryStore {
 
     fn load_tag_names(&self) -> StoreFuture<Vec<String>> {
         self.read(|d| Ok(d.tag_names.clone()))
+    }
+
+    fn stored_dates(&self) -> StoreFuture<Vec<Date>> {
+        self.read(|d| Ok(d.days.keys().copied().collect()))
+    }
+}
+
+pub(crate) const SINK_FAILURE: &str = "injected sink failure";
+
+/// A [`FileSink`] that records each write as `(path, bytes)`, or fails while
+/// `fail` is set (recording nothing).
+#[derive(Default)]
+pub(crate) struct FakeFileSink {
+    writes: Mutex<Vec<(PathBuf, Vec<u8>)>>,
+    fail: AtomicBool,
+}
+
+impl FakeFileSink {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub(crate) fn fail(&self, fail: bool) {
+        self.fail.store(fail, Ordering::SeqCst);
+    }
+
+    /// Every successful write, in order.
+    pub(crate) fn writes(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+impl FileSink for FakeFileSink {
+    fn write(&self, path: &Path, contents: &[u8]) -> Result<(), FileSinkError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(FileSinkError::new(SINK_FAILURE));
+        }
+        self.writes
+            .lock()
+            .unwrap()
+            .push((path.to_owned(), contents.to_vec()));
+        Ok(())
     }
 }

@@ -16,17 +16,26 @@
 //! thread and nothing there waits on the engine (AD-4). Dates cross as
 //! `YYYY-MM-DD`. A gap ratio crosses as `f64` (`number | null`): it is never NaN,
 //! because core gives `None` instead of dividing by zero.
+//!
+//! [`export_csv`] (AD-16) is also `async`: it parses its range (an `Err` before
+//! any dialog opens), asks for a path in a native save dialog opened from Rust
+//! (`tauri-plugin-dialog`, so the webview needs no dialog permission), awaiting
+//! the dialog's callback through a oneshot rather than blocking, and then sends
+//! the fire-and-forget `ExportCsv`. Its `bool` only says whether a path was
+//! chosen (`false`: cancelled, nothing sent). The outcome arrives later as an
+//! [`ExportDoneEvent`] or an `export` status entry.
 
 use nguda_core::{
-    BaselineItem, Date, Day, DayLogEntry, DayLogKind, DayReport, GapFigure, IsoWeek, ItemId,
-    ItemStatus, LockChoice, LockDecision, PlanItem, PlannedSource, ReportRow, Slot, Timestamp,
-    Uuid, WeekReport, closed_secs,
+    BaselineItem, Date, Day, DayLogEntry, DayLogKind, DayReport, ExportRange, GapFigure, IsoWeek,
+    ItemId, ItemStatus, LockChoice, LockDecision, PlanItem, PlannedSource, ReportRow, Slot,
+    Timestamp, Uuid, WeekReport, closed_secs,
 };
 use nguda_engine::{EngineHandle, EngineMsg, InsertAnchor, ReorderAnchor, Snapshot, StatusKey};
 use serde::{Deserialize, Serialize};
 #[cfg(any(debug_assertions, test))]
 use specta_typescript::Typescript;
-use tauri::{State, Wry};
+use tauri::{AppHandle, State, WebviewWindow, Wry};
+use tauri_plugin_dialog::DialogExt;
 use tauri_specta::{Builder, Event, collect_commands, collect_events};
 
 /// Where debug builds write the bindings, relative to this crate.
@@ -280,7 +289,90 @@ pub async fn query_week(
     Ok(WeekReportView::from(&report))
 }
 
+/// Which days a CSV export covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportKind {
+    /// The ISO week holding `date`.
+    Week,
+    /// Every stored day up to today.
+    All,
+}
+
+/// A CSV export range. `week` needs `date` (`YYYY-MM-DD`, any day of the week);
+/// `all` ignores it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRangeArg {
+    pub kind: ExportKind,
+    pub date: Option<String>,
+}
+
+/// Exports `range` as CSV (AD-16): asks for a path in a native save dialog, then
+/// sends the export to the engine. `Ok(false)` when the dialog was cancelled
+/// (nothing sent), `Ok(true)` once the export is queued. A malformed range is an
+/// `Err` before any dialog opens. The written row count arrives as an
+/// [`ExportDoneEvent`]; a failure as an `export` status entry.
+#[tauri::command]
+#[specta::specta]
+pub async fn export_csv(
+    app: AppHandle,
+    window: WebviewWindow,
+    engine: State<'_, EngineHandle>,
+    range: ExportRangeArg,
+) -> Result<bool, String> {
+    let range = export_range_of(&range)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("CSV", &["csv"])
+        .set_file_name(default_file_name(range))
+        .save_file(move |chosen| {
+            // The command may have gone away; nothing to do then.
+            let _ = tx.send(chosen);
+        });
+    let chosen = rx
+        .await
+        .map_err(|_| "the save dialog closed without an answer".to_owned())?;
+    let path = chosen
+        .map(|c| c.into_path())
+        .transpose()
+        .map_err(|_| "the chosen location is not a local file".to_owned())?;
+    match export_msg(range, path) {
+        Some(msg) => send(&engine, Ok(msg)).map(|()| true),
+        None => Ok(false),
+    }
+}
+
+/// The message for a save dialog's answer: `None` when it was cancelled, so
+/// nothing is sent.
+fn export_msg(range: ExportRange, chosen: Option<std::path::PathBuf>) -> Option<EngineMsg> {
+    chosen.map(|path| EngineMsg::ExportCsv { path, range })
+}
+
 // --- Argument parsing: syntax only, no semantic checks ---
+
+fn export_range_of(arg: &ExportRangeArg) -> Result<ExportRange, String> {
+    match arg.kind {
+        ExportKind::All => Ok(ExportRange::All),
+        ExportKind::Week => {
+            let date = arg
+                .date
+                .as_deref()
+                .ok_or_else(|| "a week export needs a date".to_owned())?;
+            week_of(date).map(ExportRange::Week)
+        }
+    }
+}
+
+/// The save dialog's suggested name: `nguda-<year>-W<ww>.csv` or `nguda-all.csv`.
+fn default_file_name(range: ExportRange) -> String {
+    match range {
+        ExportRange::Week(w) => format!("nguda-{}-W{:02}.csv", w.year(), w.week()),
+        ExportRange::All => "nguda-all.csv".to_owned(),
+    }
+}
 
 fn week_of(s: &str) -> Result<IsoWeek, String> {
     IsoWeek::containing(parse_date(s)?).ok_or_else(|| "date out of range".to_owned())
@@ -459,6 +551,13 @@ fn insert_task_msg(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type, Event)]
 pub struct FocusExtendEvent;
 
+/// A CSV export finished: `rows` records (the header not counted) were written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportDoneEvent {
+    pub rows: u32,
+}
+
 /// The tray's "Today's summary" was picked: the view shows the Summary tab for
 /// the snapshot's today. Carries nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type, Event)]
@@ -581,6 +680,8 @@ pub enum StatusKeyView {
     Store,
     CommandRejected,
     Overflow,
+    /// The last CSV export failed; cleared by the next successful one.
+    Export,
 }
 
 impl From<StatusKey> for StatusKeyView {
@@ -589,6 +690,7 @@ impl From<StatusKey> for StatusKeyView {
             StatusKey::Store => Self::Store,
             StatusKey::CommandRejected => Self::CommandRejected,
             StatusKey::Overflow => Self::Overflow,
+            StatusKey::Export => Self::Export,
         }
     }
 }
@@ -962,12 +1064,14 @@ pub fn specta_builder() -> Builder<Wry> {
             carry_over_to_tomorrow,
             current_snapshot,
             query_day,
-            query_week
+            query_week,
+            export_csv
         ])
         .events(collect_events![
             SnapshotEvent,
             FocusExtendEvent,
-            OpenSummaryEvent
+            OpenSummaryEvent,
+            ExportDoneEvent
         ])
 }
 
@@ -981,7 +1085,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use nguda_adapters::{SqliteStore, SystemClock, UuidV7Ids};
+    use nguda_adapters::{FsFileSink, SqliteStore, SystemClock, UuidV7Ids};
     use nguda_core::{OrderKey, PlanItemRecord, Running, Segment, TimeZone, WorkEnd};
     use nguda_engine::{EngineDeps, StatusEntry};
     use tokio::time::timeout;
@@ -1445,6 +1549,7 @@ mod tests {
         assert_eq!(key(StatusKey::Store), "\"store\"");
         assert_eq!(key(StatusKey::CommandRejected), "\"commandRejected\"");
         assert_eq!(key(StatusKey::Overflow), "\"overflow\"");
+        assert_eq!(key(StatusKey::Export), "\"export\"");
         let status = |s| serde_json::to_string(&ItemStatusView::from(s)).unwrap();
         assert_eq!(status(ItemStatus::CarriedOver), "\"carriedOver\"");
         assert_eq!(status(ItemStatus::Paused), "\"paused\"");
@@ -1525,6 +1630,68 @@ mod tests {
         assert_eq!(week_of("2027-01-01"), Ok(IsoWeek::new(2026, 53).unwrap()));
         assert!(week_of("2026-13-40").is_err());
         assert_eq!(week_of("9999-12-31"), Err("date out of range".to_owned()));
+    }
+
+    fn range_arg(kind: ExportKind, date: Option<&str>) -> ExportRangeArg {
+        ExportRangeArg {
+            kind,
+            date: date.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn export_ranges_parse_before_any_dialog() {
+        let w47 = ExportRange::Week(IsoWeek::new(2026, 47).unwrap());
+        assert_eq!(
+            export_range_of(&range_arg(ExportKind::Week, Some("2026-11-21"))),
+            Ok(w47)
+        );
+        assert_eq!(
+            export_range_of(&range_arg(ExportKind::All, None)),
+            Ok(ExportRange::All)
+        );
+        assert_eq!(
+            export_range_of(&range_arg(ExportKind::All, Some("junk"))),
+            Ok(ExportRange::All),
+            "all ignores the date"
+        );
+        assert!(export_range_of(&range_arg(ExportKind::Week, Some("2026-13-40"))).is_err());
+        assert_eq!(
+            export_range_of(&range_arg(ExportKind::Week, None)),
+            Err("a week export needs a date".to_owned())
+        );
+        let arg: ExportRangeArg =
+            serde_json::from_str(r#"{"kind":"week","date":"2026-11-21"}"#).unwrap();
+        assert_eq!(export_range_of(&arg), Ok(w47));
+        let arg: ExportRangeArg = serde_json::from_str(r#"{"kind":"all","date":null}"#).unwrap();
+        assert_eq!(arg.kind, ExportKind::All);
+    }
+
+    #[test]
+    fn the_default_export_file_name_names_the_week_or_all() {
+        let week = |y, w| ExportRange::Week(IsoWeek::new(y, w).unwrap());
+        assert_eq!(default_file_name(week(2026, 3)), "nguda-2026-W03.csv");
+        assert_eq!(default_file_name(week(2026, 53)), "nguda-2026-W53.csv");
+        assert_eq!(default_file_name(ExportRange::All), "nguda-all.csv");
+    }
+
+    #[test]
+    fn a_cancelled_save_dialog_sends_nothing() {
+        assert_eq!(export_msg(ExportRange::All, None), None);
+        let path = std::path::PathBuf::from("/tmp/x.csv");
+        assert_eq!(
+            export_msg(ExportRange::All, Some(path.clone())),
+            Some(EngineMsg::ExportCsv {
+                path,
+                range: ExportRange::All
+            })
+        );
+    }
+
+    #[test]
+    fn export_done_carries_its_row_count() {
+        let json = serde_json::to_value(ExportDoneEvent { rows: 7 }).unwrap();
+        assert_eq!(json, serde_json::json!({ "rows": 7 }));
     }
 
     fn week_report(year: i16, week: i8, overall: GapFigure) -> WeekReport {
@@ -1791,6 +1958,7 @@ mod tests {
                 clock: Arc::new(SystemClock),
                 store: Arc::new(store),
                 ids: Arc::new(UuidV7Ids),
+                files: Arc::new(FsFileSink),
                 tz: TimeZone::UTC,
             })
             .0

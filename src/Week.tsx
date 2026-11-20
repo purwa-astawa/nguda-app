@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { commands } from "./bindings";
+import { commands, events, type ExportRangeArg_Deserialize } from "./bindings";
 import { formatSecs } from "./report";
-import { containsDate, formatRatio, type Gap, type WeekReport } from "./week.ts";
+import { containsDate, exportMessage, formatRatio, type Gap, type WeekReport } from "./week.ts";
 
 /** The last reply, with the date it answers. */
 type Loaded = { date: string } & (
@@ -34,6 +34,16 @@ function Counts({ gap }: { gap: Gap }) {
 // navigates with the dates it returns.
 export function Week({ date, today, rev, onDate }: Props) {
   const [reply, setReply] = useState<Loaded | null>(null);
+  // Which export command is waiting on its save dialog, if any.
+  const [exporting, setExporting] = useState<{ week: boolean; all: boolean }>({
+    week: false,
+    all: false,
+  });
+  // The last export outcome the view shows: a command error, or the row count.
+  // A failed write shows through the snapshot's status list instead.
+  const [exportNote, setExportNote] = useState<{ kind: "error" | "done"; text: string } | null>(
+    null,
+  );
   // Only the newest request may set the view; a late reply for an older one is dropped.
   const latest = useRef(0);
 
@@ -57,6 +67,29 @@ export function Week({ date, today, rev, onDate }: Props) {
       );
   }, [date, liveRev]);
 
+  useEffect(() => {
+    const unlisten = events.exportDoneEvent.listen((e) => {
+      setExportNote({ kind: "done", text: exportMessage(e.payload.rows) });
+    });
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  function runExport(which: "week" | "all") {
+    const range: ExportRangeArg_Deserialize =
+      which === "week" ? { kind: "week", date } : { kind: "all", date: null };
+    setExportNote(null);
+    setExporting((s) => ({ ...s, [which]: true }));
+    commands
+      .exportCsv(range)
+      .then((res) => {
+        if (res.status === "error") setExportNote({ kind: "error", text: res.error });
+      })
+      .catch((e) => setExportNote({ kind: "error", text: String(e) }))
+      .finally(() => setExporting((s) => ({ ...s, [which]: false })));
+  }
+
   return (
     <section className="summary week">
       <button
@@ -78,6 +111,22 @@ export function Week({ date, today, rev, onDate }: Props) {
           This week
         </button>
       )}
+      <button type="button" disabled={exporting.week} onClick={() => runExport("week")}>
+        Export week
+      </button>
+      <button type="button" disabled={exporting.all} onClick={() => runExport("all")}>
+        Export all
+      </button>
+      {exportNote &&
+        (exportNote.kind === "error" ? (
+          <p className="status" role="alert">
+            {exportNote.text}
+          </p>
+        ) : (
+          <p className="export-done" role="status">
+            {exportNote.text}
+          </p>
+        ))}
 
       {!loaded ? (
         <p>Loading…</p>

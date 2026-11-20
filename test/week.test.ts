@@ -1,7 +1,7 @@
 // The week view's pure helpers (src/week.ts).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { containsDate, formatRatio } from "../src/week.ts";
+import { containsDate, exportMessage, formatRatio } from "../src/week.ts";
 
 test("formatRatio shows one decimal and a times sign, or a dash for none", () => {
   assert.equal(formatRatio(1.6), "1.6×");
@@ -18,4 +18,10 @@ test("containsDate is inclusive on both ends and works across a year edge", () =
   assert.equal(containsDate(week, "2027-01-03"), true);
   assert.equal(containsDate(week, "2026-12-27"), false);
   assert.equal(containsDate(week, "2027-01-04"), false);
+});
+
+test("exportMessage counts rows in the singular or the plural", () => {
+  assert.equal(exportMessage(1), "Exported 1 row.");
+  assert.equal(exportMessage(0), "Exported 0 rows.");
+  assert.equal(exportMessage(12), "Exported 12 rows.");
 });

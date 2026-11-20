@@ -1,10 +1,12 @@
 //! nguda adapters: implementations of the `nguda-core` ports. Never depends on Tauri.
 
+mod file_sink;
 mod notifier;
 mod store;
 
 use nguda_core::{Clock, IdGen, ItemId, PromptId, SleepFuture, Timestamp, Uuid};
 
+pub use file_sink::FsFileSink;
 pub use notifier::{ActionCallback, SystemNotifier};
 pub use store::{OpenError, SqliteStore};
 

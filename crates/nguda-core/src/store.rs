@@ -148,4 +148,7 @@ pub trait Store: Send + Sync + 'static {
     /// Every tag name ever stored, in any order. A name stays known after the last
     /// item using it drops it.
     fn load_tag_names(&self) -> StoreFuture<Vec<String>>;
+
+    /// The date of every stored day, ascending.
+    fn stored_dates(&self) -> StoreFuture<Vec<Date>>;
 }
