@@ -14,6 +14,7 @@ mod notifier;
 mod order;
 mod plan;
 mod reflow;
+mod report;
 mod segment;
 mod settings;
 mod store;
@@ -34,6 +35,7 @@ pub use notifier::{Notification, Notifier, NotifierError, PromptAction, PromptKi
 pub use order::OrderKey;
 pub use plan::{Action, Day, ItemId, ItemStatus, PlanItem, PlanItemRecord};
 pub use reflow::{Schedule, Slot, SlotKind, Span, reflow};
+pub use report::{ActualSegment, DayReport, PlannedSource, ReportRow, report};
 pub use segment::{Segment, actual_secs, closed_secs};
 pub use settings::{ParseWorkEndError, Settings, WorkEnd};
 pub use store::{OpenSegmentRef, Store, StoreBatch, StoreError, StoreFuture, StoreOp};

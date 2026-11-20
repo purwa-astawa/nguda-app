@@ -43,6 +43,14 @@
 //! it. The check also runs before and after each command, so a command carrying a
 //! pre-rollover rev is stale-rejected. While an item runs no rollover is armed and
 //! its day stays current until it stops; segments are never split at midnight.
+//!
+//! Queries (AD-4, AD-16): [`EngineHandle::query_day`] is the one request/reply
+//! path. It shares the inbox with commands, but its reply sender lives outside
+//! [`EngineMsg`]. The actor answers it without waiting: it notes `now` and, for
+//! today, clones its committed day, then spawns a task that loads what else it
+//! needs (the day itself for any other date, the baseline of a locked day, and
+//! the day log), builds [`nguda_core::report`], and replies. A query is read-only:
+//! no commit, no rev bump, no publish, and no status change.
 
 mod actor;
 mod batch;
@@ -57,10 +65,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Day, IdGen, ItemId, LockChoice, PromptId, PromptKind, Running, Schedule, Store,
-    TimeZone, Timestamp, WorkEnd,
+    Clock, Date, Day, DayReport, IdGen, ItemId, LockChoice, PromptId, PromptKind, Running,
+    Schedule, Store, StoreError, TimeZone, Timestamp, WorkEnd,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// How often the engine records `last_alive_at` for crash recovery (AD-6).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
@@ -266,17 +274,63 @@ impl fmt::Display for EngineClosed {
 
 impl std::error::Error for EngineClosed {}
 
+/// A [`EngineHandle::query_day`] that got no report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryError {
+    /// The engine task has stopped, or dropped the request.
+    EngineClosed,
+    /// A store read failed. Engine state is untouched.
+    Store(StoreError),
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EngineClosed => EngineClosed.fmt(f),
+            Self::Store(e) => write!(f, "store read failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for QueryError {}
+
+/// The reply of a day query: the report, `None` for a day with no stored data.
+pub(crate) type DayReply = Result<Option<DayReport>, StoreError>;
+
+/// What arrives on the engine's channel. Kept apart from [`EngineMsg`] so the
+/// reply sender never needs its derives.
+pub(crate) enum Inbox {
+    Command(EngineMsg),
+    QueryDay {
+        date: Date,
+        reply: oneshot::Sender<DayReply>,
+    },
+}
+
 /// Cheap to clone: a sender for inputs and a receiver for snapshots.
 #[derive(Clone, Debug)]
 pub struct EngineHandle {
-    tx: mpsc::UnboundedSender<EngineMsg>,
+    tx: mpsc::UnboundedSender<Inbox>,
     snapshots: watch::Receiver<Snapshot>,
 }
 
 impl EngineHandle {
     /// Fire-and-forget: queues `msg` without waiting for the engine (AD-4).
     pub fn send(&self, msg: EngineMsg) -> Result<(), EngineClosed> {
-        self.tx.send(msg).map_err(|_| EngineClosed)
+        self.tx.send(Inbox::Command(msg)).map_err(|_| EngineClosed)
+    }
+
+    /// The report of `date` (AD-16): `Ok(None)` when no such day is stored. Today
+    /// reflects the live state as of the engine's `now`. Read-only. Await it only
+    /// off the main thread (AD-4).
+    pub async fn query_day(&self, date: Date) -> Result<Option<DayReport>, QueryError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Inbox::QueryDay { date, reply })
+            .map_err(|_| QueryError::EngineClosed)?;
+        rx.await
+            .map_err(|_| QueryError::EngineClosed)?
+            .map_err(QueryError::Store)
     }
 
     /// A receiver that starts at the latest snapshot.

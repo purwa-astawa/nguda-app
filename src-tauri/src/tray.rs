@@ -16,6 +16,10 @@
 //! window forward and emits [`FocusExtendEvent`] so the view focuses the running
 //! row's extend-minutes field. The notification actions (in `effects`) reuse the
 //! same message shapes and `focus_extend`, so each acts like its tray item.
+//!
+//! "Today's summary" is always enabled and sends nothing either: it brings the
+//! window forward and emits [`OpenSummaryEvent`], so the view shows the Summary
+//! tab for the snapshot's today. The summary never opens on its own.
 
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +32,7 @@ use tauri::{App, AppHandle, Manager, Wry};
 use tauri_specta::Event;
 use tokio::sync::watch;
 
-use crate::ipc::{FocusExtendEvent, SnapshotEvent};
+use crate::ipc::{FocusExtendEvent, OpenSummaryEvent, SnapshotEvent};
 
 const TRAY_ID: &str = "main";
 const IDLE_TITLE: &str = "nguda";
@@ -37,6 +41,7 @@ const SWITCH_ID: &str = "switch";
 const EXTEND_5_ID: &str = "extend_5";
 const EXTEND_15_ID: &str = "extend_15";
 const EXTEND_CUSTOM_ID: &str = "extend_custom";
+const SUMMARY_ID: &str = "summary";
 const QUIT_ID: &str = "quit";
 
 /// A black template image that macOS tints for the menu bar.
@@ -114,6 +119,8 @@ pub fn build(app: &App) -> tauri::Result<Tray> {
         item(EXTEND_15_ID, "Extend +15 min")?,
         item(EXTEND_CUSTOM_ID, "Extend…")?,
     ];
+    // Built enabled, like Quit: it works whether or not a task runs.
+    let summary = MenuItem::with_id(app, SUMMARY_ID, "Today's summary", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, QUIT_ID, "Quit", true, None::<&str>)?;
     let [switch, extend5, extend15, extend_custom] = &actions;
@@ -125,6 +132,7 @@ pub fn build(app: &App) -> tauri::Result<Tray> {
             extend5,
             extend15,
             extend_custom,
+            &summary,
             &separator,
             &quit,
         ],
@@ -141,6 +149,7 @@ pub fn build(app: &App) -> tauri::Result<Tray> {
             EXTEND_5_ID => send_target(app, Action::Extend5),
             EXTEND_15_ID => send_target(app, Action::Extend15),
             EXTEND_CUSTOM_ID => focus_extend(app),
+            SUMMARY_ID => open_summary(app),
             _ => {}
         })
         .build(app)?;
@@ -172,6 +181,15 @@ pub(crate) fn focus_extend(app: &AppHandle) {
     }
 }
 
+/// Today's summary: brings the window forward and asks the view to show the
+/// Summary tab for today. Sends nothing to the engine.
+fn open_summary(app: &AppHandle) {
+    show_main_window(app);
+    if let Err(e) = OpenSummaryEvent.emit(app) {
+        eprintln!("nguda: failed to emit open-summary: {e}");
+    }
+}
+
 /// Restores, shows and focuses the plan window.
 pub(crate) fn show_main_window(app: &AppHandle) {
     match app.get_webview_window("main") {
@@ -187,7 +205,7 @@ pub(crate) fn show_main_window(app: &AppHandle) {
                 eprintln!("nguda: failed to focus the main window: {e}");
             }
         }
-        None => eprintln!("nguda: no main window to focus for Extend"),
+        None => eprintln!("nguda: no main window to show"),
     }
 }
 

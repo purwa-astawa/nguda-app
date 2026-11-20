@@ -9,21 +9,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Date, Day, DayLogKind, IdGen, ItemId, OpenSegmentRef, PlanItem, PromptId, PromptKind,
-    Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp, WorkEnd,
-    reflow,
+    Clock, Date, Day, DayLogKind, IdGen, ItemId, LockDecision, OpenSegmentRef, PlanItem, PromptId,
+    PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone, Timestamp,
+    WorkEnd, reflow, report,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::batch::diff;
 use crate::commands::{self, Reject, domain_kind};
 use crate::{
-    Effect, EngineDeps, EngineMsg, HEARTBEAT_EVERY, NextItem, Snapshot, StatusEntry, StatusKey,
+    DayReply, Effect, EngineDeps, EngineMsg, HEARTBEAT_EVERY, Inbox, NextItem, Snapshot,
+    StatusEntry, StatusKey,
 };
 
 pub(crate) async fn run(
     deps: EngineDeps,
-    mut rx: mpsc::UnboundedReceiver<EngineMsg>,
+    mut rx: mpsc::UnboundedReceiver<Inbox>,
     snapshots: watch::Sender<Snapshot>,
     effects: mpsc::UnboundedSender<Effect>,
 ) {
@@ -33,7 +34,8 @@ pub(crate) async fn run(
         let deadline = actor.clock.sleep_until(actor.next_deadline());
         tokio::select! {
             msg = rx.recv() => match msg {
-                Some(msg) => actor.handle(msg).await,
+                Some(Inbox::Command(msg)) => actor.handle(msg).await,
+                Some(Inbox::QueryDay { date, reply }) => actor.query_day(date, reply),
                 None => break,
             },
             () = deadline => actor.on_deadline().await,
@@ -230,6 +232,25 @@ impl Actor {
             item_id: segment.item_id,
         });
         next
+    }
+
+    /// Answers a day query without waiting (AD-4, AD-16): notes `now`, clones
+    /// today's committed day when `date` is today, and spawns the loads and the
+    /// report. Read-only: no commit, rev bump, publish, or status change. A dropped
+    /// reply is ignored. Logs the date only (AD-14).
+    fn query_day(&self, date: Date, reply: oneshot::Sender<DayReply>) {
+        let now = self.clock.now();
+        let today = (date == self.day.date()).then(|| self.day.clone());
+        let store = self.store.clone();
+        tracing::debug!(%date, live = today.is_some(), "day queried");
+        tokio::spawn(async move {
+            let result = build_report(store.as_ref(), date, today, now).await;
+            if let Err(e) = &result {
+                tracing::warn!(%date, error = %e, "day query failed");
+            }
+            // The asker may have gone away; nothing to do then.
+            let _ = reply.send(result);
+        });
     }
 
     /// One command. Rollover runs first, so a command carrying a pre-rollover rev
@@ -616,6 +637,30 @@ impl Actor {
         self.snapshots.send_replace(snapshot);
         self.overflow_effects();
     }
+}
+
+/// The report of `date`: from `today` when given, else from the stored day
+/// (`None` when there is none), with its baseline (locked days only) and log.
+async fn build_report(
+    store: &dyn Store,
+    date: Date,
+    today: Option<Day>,
+    now: Timestamp,
+) -> DayReply {
+    let day = match today {
+        Some(day) => day,
+        None => match store.load_day(date).await? {
+            Some(day) => day,
+            None => return Ok(None),
+        },
+    };
+    let baseline = if day.lock_decision() == LockDecision::Locked {
+        store.load_baseline(date).await?
+    } else {
+        None
+    };
+    let log = store.load_day_log(date).await?;
+    Ok(Some(report(&day, baseline.as_ref(), &log, now)))
 }
 
 /// The first item that is running.

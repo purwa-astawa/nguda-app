@@ -1,9 +1,10 @@
 //! nguda shell: the composition root (AD-1). The only crate that knows Tauri.
 //!
 //! It builds the engine with the real clock, exposes fire-and-forget commands
-//! (AD-4), mirrors snapshots to the view as a typed event, and renders the tray
-//! from a snapshot subscriber (AD-11). The tray menu (status line, Switch, Extend
-//! +5 min, Extend +15 min, Extend…, and Quit) and its handlers live in `tray`;
+//! (AD-4) plus the one async read-only query (`query_day`, AD-16), mirrors
+//! snapshots to the view as a typed event, and renders the tray from a snapshot
+//! subscriber (AD-11). The tray menu (status line, Switch, Extend +5 min, Extend
+//! +15 min, Extend…, Today's summary, and Quit) and its handlers live in `tray`;
 //! engine effects are rendered by `effects` through the system notifier (AD-10),
 //! whose planned-end buttons come back here as `(prompt_id, action)` and are
 //! turned by `effects::resolve` into the same targeted commands as the tray's
