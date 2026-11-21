@@ -27,15 +27,22 @@
 //!
 //! [`sign_in`] is fire-and-forget like the plan commands: the engine runs the
 //! Google sign-in off its actor, and the snapshot's `google` field shows its
-//! progress (AD-17).
+//! progress (AD-17). So is [`add_calendar_event`]: the engine fetches the event
+//! off its actor, and it shows up in the snapshot (or a `sync` status entry).
+//!
+//! [`query_calendar_events`] is another `async` read-only request/reply, for the
+//! picker of today's events of one calendar (R4). A query superseded by a newer
+//! one, or for a day that is no longer today, fails with the error string
+//! `"stale"`, which the view ignores.
 
 use nguda_core::{
     BaselineItem, Date, Day, DayLogEntry, DayLogKind, DayReport, ExportRange, GapFigure, IsoWeek,
-    ItemId, ItemStatus, LockChoice, LockDecision, PlanItem, PlannedSource, ReportRow, Slot,
+    ItemId, ItemStatus, LockChoice, LockDecision, PlanItem, PlannedSource, ReportRow, Span,
     Timestamp, Uuid, WeekReport, closed_secs,
 };
 use nguda_engine::{
-    EngineHandle, EngineMsg, GoogleAccount, InsertAnchor, ReorderAnchor, Snapshot, StatusKey,
+    CalendarEvent, EngineHandle, EngineMsg, GoogleAccount, InsertAnchor, QueryError, ReorderAnchor,
+    Snapshot, StatusKey,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(any(debug_assertions, test))]
@@ -287,6 +294,109 @@ pub fn set_included_calendars(
     send(&engine, Ok(set_included_calendars_msg(calendar_ids)))
 }
 
+/// Leaves today's imported event `item_id` out of the schedule (R4): it stays in
+/// the plan, greyed. The engine rejects a stale rev, a local item, or one that
+/// has time recorded or is not pending.
+#[tauri::command]
+#[specta::specta]
+pub fn exclude_event(
+    engine: State<'_, EngineHandle>,
+    item_id: String,
+    expected_rev: u32,
+) -> Result<(), String> {
+    send(&engine, exclude_event_msg(&item_id, expected_rev))
+}
+
+/// Takes the excluded event `item_id` back into the schedule. The engine rejects
+/// a stale rev or an item that is not excluded.
+#[tauri::command]
+#[specta::specta]
+pub fn include_event(
+    engine: State<'_, EngineHandle>,
+    item_id: String,
+    expected_rev: u32,
+) -> Result<(), String> {
+    send(&engine, include_event_msg(&item_id, expected_rev))
+}
+
+/// Adds the single event `event_id` of calendar `calendar_id` to today's plan
+/// (R4). Fire-and-forget: it shows in the snapshot, or a failure as a `sync`
+/// status entry.
+#[tauri::command]
+#[specta::specta]
+pub fn add_calendar_event(
+    engine: State<'_, EngineHandle>,
+    calendar_id: String,
+    event_id: String,
+) -> Result<(), String> {
+    send(&engine, Ok(add_calendar_event_msg(calendar_id, event_id)))
+}
+
+/// Today's timed events of calendar `calendar_id`, sorted by start, each with
+/// whether today's plan already has it (R4). `date` (`YYYY-MM-DD`) must be
+/// today: any other date, or a query superseded by a newer one, fails with
+/// `"stale"`. Read-only. A malformed date is an `Err` and sends nothing.
+#[tauri::command]
+#[specta::specta]
+pub async fn query_calendar_events(
+    engine: State<'_, EngineHandle>,
+    calendar_id: String,
+    date: String,
+) -> Result<Vec<CalendarEventView>, String> {
+    let date = parse_date(&date)?;
+    let events = engine
+        .query_calendar_events(calendar_id, date)
+        .await
+        .map_err(|e| query_error_text(&e))?;
+    Ok(events.iter().map(CalendarEventView::from).collect())
+}
+
+/// The error string of a failed query: `"stale"` for a stale one, which the
+/// view ignores, else the error's message.
+fn query_error_text(e: &QueryError) -> String {
+    match e {
+        QueryError::Stale => "stale".to_owned(),
+        QueryError::Calendar(nguda_core::CalendarErrorKind::RateLimited) => {
+            "Google is limiting requests; try again later".to_owned()
+        }
+        QueryError::Calendar(nguda_core::CalendarErrorKind::NotSignedIn) => {
+            "not signed in to Google".to_owned()
+        }
+        QueryError::Calendar(_) => "could not list the calendar's events".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// One of today's events of a calendar, for the picker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarEventView {
+    /// Google's calendar id.
+    pub calendar_id: String,
+    /// Google's event (instance) id: what [`add_calendar_event`] takes.
+    pub event_id: String,
+    pub title: String,
+    /// RFC 3339 UTC instant.
+    pub start: String,
+    /// RFC 3339 UTC instant.
+    pub end: String,
+    /// Today's plan already has it, so it cannot be added again.
+    pub in_plan: bool,
+}
+
+impl From<&CalendarEvent> for CalendarEventView {
+    fn from(e: &CalendarEvent) -> Self {
+        Self {
+            calendar_id: e.calendar_id.clone(),
+            event_id: e.event_id.clone(),
+            title: e.title.clone(),
+            start: e.start.to_string(),
+            end: e.end.to_string(),
+            in_plan: e.in_plan,
+        }
+    }
+}
+
 /// The planned-versus-actual report of `date` (`YYYY-MM-DD`), or `null` when no
 /// such day is stored. Read-only (AD-16). A malformed date is an `Err` and sends
 /// nothing.
@@ -533,6 +643,27 @@ fn set_tags_msg(item_id: &str, tags: Vec<String>, expected_rev: u32) -> Result<E
     })
 }
 
+fn exclude_event_msg(item_id: &str, expected_rev: u32) -> Result<EngineMsg, String> {
+    Ok(EngineMsg::ExcludeEvent {
+        item_id: parse_item_id(item_id)?,
+        expected_rev: expected_rev.into(),
+    })
+}
+
+fn include_event_msg(item_id: &str, expected_rev: u32) -> Result<EngineMsg, String> {
+    Ok(EngineMsg::IncludeEvent {
+        item_id: parse_item_id(item_id)?,
+        expected_rev: expected_rev.into(),
+    })
+}
+
+fn add_calendar_event_msg(calendar_id: String, event_id: String) -> EngineMsg {
+    EngineMsg::AddCalendarEvent {
+        calendar_id,
+        event_id,
+    }
+}
+
 fn set_work_end_msg(minutes: u32) -> EngineMsg {
     EngineMsg::SetWorkEnd { minutes }
 }
@@ -605,8 +736,9 @@ pub struct SnapshotEvent {
     pub rev: u32,
     /// Today. `null` only before startup finishes (rev 0).
     pub day: Option<DayView>,
-    /// Today's non-removed items in schedule order (`Snapshot.schedule`). The view
-    /// shows them as given and never re-sorts.
+    /// Today's non-removed items in schedule order (`Snapshot.schedule`), then
+    /// today's excluded events (which the schedule leaves out) by pinned start,
+    /// with no scheduled times. The view shows them as given and never re-sorts.
     pub items: Vec<ItemView>,
     pub running: Option<RunningView>,
     /// The work-end time of day, `HH:MM` local.
@@ -719,6 +851,9 @@ pub struct ItemView {
     pub tags: Vec<String>,
     /// The item was imported from a calendar event.
     pub imported: bool,
+    /// The user left this imported event out of the schedule: shown greyed,
+    /// with no scheduled times.
+    pub excluded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type)]
@@ -903,6 +1038,8 @@ pub enum MarkerKindView {
     Inserted,
     CarriedOver,
     CalendarChanged,
+    Excluded,
+    Included,
 }
 
 /// A week's estimate gap (AD-6, AD-16), the reply of [`query_week`].
@@ -1047,6 +1184,8 @@ fn marker_view(e: &DayLogEntry) -> MarkerView {
         DayLogKind::CalendarChanged { item_id } => {
             (MarkerKindView::CalendarChanged, item_id, None, None)
         }
+        DayLogKind::Excluded { item_id } => (MarkerKindView::Excluded, item_id, None, None),
+        DayLogKind::Included { item_id } => (MarkerKindView::Included, item_id, None, None),
     };
     MarkerView {
         at: e.at.to_string(),
@@ -1063,11 +1202,25 @@ impl From<&Snapshot> for SnapshotEvent {
             .day
             .as_ref()
             .map(|day| {
-                s.schedule
+                let mut items: Vec<ItemView> = s
+                    .schedule
                     .slots()
                     .iter()
-                    .filter_map(|slot| day.item(slot.item_id).map(|i| item_view(day, i, slot)))
-                    .collect()
+                    .filter_map(|slot| day.item(slot.item_id).map(|i| item_view(day, i, slot.span)))
+                    .collect();
+                // Excluded events have no slot; they follow, by pin, unscheduled.
+                let mut excluded: Vec<&PlanItem> = day
+                    .items()
+                    .iter()
+                    .filter(|i| {
+                        i.excluded()
+                            && i.status() != ItemStatus::Removed
+                            && s.schedule.slot(i.id()).is_none()
+                    })
+                    .collect();
+                excluded.sort_by_key(|i| i.pinned_start());
+                items.extend(excluded.into_iter().map(|i| item_view(day, i, None)));
+                items
             })
             .unwrap_or_default();
         Self {
@@ -1110,7 +1263,7 @@ impl From<&Snapshot> for SnapshotEvent {
     }
 }
 
-fn item_view(day: &Day, i: &PlanItem, slot: &Slot) -> ItemView {
+fn item_view(day: &Day, i: &PlanItem, span: Option<Span>) -> ItemView {
     ItemView {
         id: i.id().to_string(),
         title: i.title().to_owned(),
@@ -1119,11 +1272,12 @@ fn item_view(day: &Day, i: &PlanItem, slot: &Slot) -> ItemView {
         pinned_start: i.pinned_start().map(|t| t.to_string()),
         status: i.status().into(),
         actual_secs: saturating_u32(closed_secs(i.segments())),
-        scheduled_start: slot.span.map(|sp| sp.start.to_string()),
-        scheduled_end: slot.span.map(|sp| sp.end.to_string()),
+        scheduled_start: span.map(|sp| sp.start.to_string()),
+        scheduled_end: span.map(|sp| sp.end.to_string()),
         interrupted: day.interrupt_stack().contains(&i.id()),
         tags: i.tags().to_vec(),
         imported: i.source().is_some(),
+        excluded: i.excluded(),
     }
 }
 
@@ -1162,8 +1316,12 @@ pub fn specta_builder() -> Builder<Wry> {
             carry_over_to_tomorrow,
             sign_in,
             set_included_calendars,
+            exclude_event,
+            include_event,
+            add_calendar_event,
             current_snapshot,
             query_day,
+            query_calendar_events,
             query_week,
             export_csv
         ])
@@ -1386,6 +1544,27 @@ mod tests {
         );
         assert_eq!(sign_in_msg(), EngineMsg::SignIn);
         assert_eq!(
+            exclude_event_msg(A, 9),
+            Ok(EngineMsg::ExcludeEvent {
+                item_id: item(A),
+                expected_rev: 9
+            })
+        );
+        assert_eq!(
+            include_event_msg(A, 9),
+            Ok(EngineMsg::IncludeEvent {
+                item_id: item(A),
+                expected_rev: 9
+            })
+        );
+        assert_eq!(
+            add_calendar_event_msg("b#c@y".into(), "ev_1".into()),
+            EngineMsg::AddCalendarEvent {
+                calendar_id: "b#c@y".into(),
+                event_id: "ev_1".into()
+            }
+        );
+        assert_eq!(
             set_included_calendars_msg(vec!["a@x".into(), "b#c@y".into()]),
             EngineMsg::SetIncludedCalendars {
                 calendar_ids: vec!["a@x".into(), "b#c@y".into()]
@@ -1437,6 +1616,8 @@ mod tests {
             assert!(pause_task_msg(bad).is_err(), "{bad}");
             assert!(switch_task_msg(bad, 1).is_err(), "{bad}");
             assert!(extend_task_msg(bad, 300, 1).is_err(), "{bad}");
+            assert!(exclude_event_msg(bad, 1).is_err(), "{bad}");
+            assert!(include_event_msg(bad, 1).is_err(), "{bad}");
             assert!(set_tags_msg(bad, vec!["t".into()], 1).is_err(), "{bad}");
             assert!(toggle_fixed_msg(bad, None, 1).is_err(), "{bad}");
             let anchor = ReorderAnchorArg {
@@ -1502,6 +1683,8 @@ mod tests {
             source: None,
             removed_by_source_at: None,
             hidden_at: None,
+            excluded: false,
+            added: false,
         }
     }
 
@@ -1625,6 +1808,7 @@ mod tests {
                 interrupted: false,
                 tags: vec!["meeting".into(), "Team".into()],
                 imported: true,
+                excluded: false,
             }
         );
         assert!(ev.items[1].tags.is_empty());
@@ -2096,6 +2280,117 @@ mod tests {
         assert_eq!(json["markers"][6]["kind"], "carriedOver");
         assert_eq!(json["markers"][6]["toItemId"], B);
         assert_eq!(json["markers"][7]["kind"], "calendarChanged");
+    }
+
+    const E1: &str = "0192f3a0-0000-7000-8000-0000000000e1";
+    const E2: &str = "0192f3a0-0000-7000-8000-0000000000e2";
+
+    /// An imported, excluded pending record pinned at `pin`.
+    fn excluded_record(id: &str, source_id: &str, pin: &str) -> PlanItemRecord {
+        PlanItemRecord {
+            fixed: true,
+            pinned_start: Some(ts(pin)),
+            source: Some(CalendarRef {
+                calendar_id: "me@example.com".into(),
+                source_id: source_id.into(),
+                instance_start: None,
+                source_secs: 1500,
+            }),
+            excluded: true,
+            ..record(id, "Skipped", "V")
+        }
+    }
+
+    #[test]
+    fn excluded_events_follow_the_schedule_by_pin_with_no_scheduled_times() {
+        let mut items: Vec<PlanItem> = sample_day().items().to_vec();
+        items.push(PlanItem::restore(excluded_record(E2, "late", "2026-11-11T15:00:00Z")).unwrap());
+        items
+            .push(PlanItem::restore(excluded_record(E1, "early", "2026-11-11T07:00:00Z")).unwrap());
+        let gone = PlanItemRecord {
+            status: ItemStatus::Removed,
+            removed_at: Some(ts("2026-11-11T07:30:00Z")),
+            ..excluded_record(
+                "0192f3a0-0000-7000-8000-0000000000e3",
+                "gone",
+                "2026-11-11T06:00:00Z",
+            )
+        };
+        items.push(PlanItem::restore(gone).unwrap());
+        let day = Day::restore("2026-11-11".parse().unwrap(), "Europe/Berlin", items).unwrap();
+        let schedule = nguda_core::reflow(&day, ts("2026-11-11T09:40:00Z"));
+        let snap = Snapshot {
+            rev: 2,
+            day: Some(day),
+            schedule,
+            ..Snapshot::default()
+        };
+        let ev = SnapshotEvent::from(&snap);
+        let ids: Vec<&str> = ev.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [F, A, B, E1, E2],
+            "excluded last, by pin; removed left out"
+        );
+        for i in &ev.items[3..] {
+            assert!(i.excluded && i.imported);
+            assert_eq!(i.scheduled_start, None);
+            assert_eq!(i.scheduled_end, None);
+            assert_eq!(i.status, ItemStatusView::Pending);
+        }
+        assert_eq!(
+            ev.items[3].pinned_start.as_deref(),
+            Some("2026-11-11T07:00:00Z")
+        );
+        assert!(ev.items[..3].iter().all(|i| !i.excluded));
+    }
+
+    #[test]
+    fn calendar_events_and_query_errors_cross_as_views() {
+        let e = CalendarEvent {
+            calendar_id: "b#c@y".into(),
+            event_id: "ev_1".into(),
+            title: "Review".into(),
+            start: ts("2026-11-21T09:00:00Z"),
+            end: ts("2026-11-21T09:30:00Z"),
+            in_plan: true,
+        };
+        assert_eq!(
+            CalendarEventView::from(&e),
+            CalendarEventView {
+                calendar_id: "b#c@y".into(),
+                event_id: "ev_1".into(),
+                title: "Review".into(),
+                start: "2026-11-21T09:00:00Z".into(),
+                end: "2026-11-21T09:30:00Z".into(),
+                in_plan: true,
+            }
+        );
+        let json = serde_json::to_value(CalendarEventView::from(&e)).unwrap();
+        assert_eq!(json["eventId"], "ev_1");
+        assert_eq!(json["inPlan"], true);
+        assert_eq!(query_error_text(&QueryError::Stale), "stale");
+        assert_eq!(
+            query_error_text(&QueryError::EngineClosed),
+            "engine is not running"
+        );
+        let other = query_error_text(&QueryError::Calendar(nguda_core::CalendarErrorKind::Other));
+        assert_ne!(other, "stale");
+        let marker = |kind| {
+            marker_view(&DayLogEntry {
+                at: ts("2026-11-21T10:00:00Z"),
+                kind,
+            })
+            .kind
+        };
+        assert_eq!(
+            marker(DayLogKind::Excluded { item_id: item(A) }),
+            MarkerKindView::Excluded
+        );
+        assert_eq!(
+            marker(DayLogKind::Included { item_id: item(A) }),
+            MarkerKindView::Included
+        );
     }
 
     /// The item without its scheduled times, which follow the system clock.

@@ -118,11 +118,23 @@ pub fn report(
         .iter()
         .filter_map(|s| day.item(s.item_id))
         .collect::<Vec<_>>();
+    // Excluded items stay in the plan but out of the schedule: they keep a row.
+    let excluded = day
+        .items()
+        .iter()
+        .filter(|i| i.excluded() && i.status() != ItemStatus::Removed)
+        .filter(|i| !scheduled.iter().any(|s| s.id() == i.id()));
     let removed = day
         .items()
         .iter()
         .filter(|i| i.status() == ItemStatus::Removed);
-    let rows = scheduled.into_iter().chain(removed).map(row).collect();
+    let rows = scheduled
+        .iter()
+        .copied()
+        .chain(excluded)
+        .chain(removed)
+        .map(row)
+        .collect();
 
     let mut segments: Vec<ActualSegment> = day
         .items()
@@ -321,6 +333,45 @@ mod tests {
         let r = report(&tomorrow, None, &[], ts(1_000));
         assert_eq!(row(&r, 9).carried_from, Some(id(1)));
         assert_eq!(row(&r, 9).planned_source, PlannedSource::Unlocked);
+    }
+
+    #[test]
+    fn an_excluded_item_keeps_its_row_with_its_planned_value_on_either_kind_of_day() {
+        let excluded = |n, order| PlanItemRecord {
+            source: Some(crate::plan::CalendarRef {
+                calendar_id: "cal".into(),
+                source_id: format!("ev{n}"),
+                instance_start: None,
+                source_secs: 600,
+            }),
+            excluded: true,
+            ..record(n, 600, order)
+        };
+        let removed = PlanItemRecord {
+            status: ItemStatus::Removed,
+            removed_at: Some(ts(10)),
+            ..record(3, 600, "c")
+        };
+        let records = || vec![excluded(1, "a"), record(2, 300, "b"), removed.clone()];
+
+        let d = day(LockDecision::Locked, records());
+        let b = baseline_of(&d, vec![frozen(1, 700), frozen(2, 300)]);
+        let r = report(&d, Some(&b), &[], ts(100));
+        let ids: Vec<ItemId> = r.rows.iter().map(|r| r.item_id).collect();
+        assert_eq!(
+            ids,
+            vec![id(2), id(1), id(3)],
+            "after the schedule, before removed"
+        );
+        assert_eq!(row(&r, 1).status, ItemStatus::Pending);
+        assert_eq!(row(&r, 1).planned_secs, Some(700));
+        assert_eq!(row(&r, 1).planned_source, PlannedSource::Baseline);
+
+        let d = day(LockDecision::NoLock, records());
+        let r = report(&d, None, &[], ts(100));
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(row(&r, 1).planned_secs, Some(600));
+        assert_eq!(row(&r, 1).planned_source, PlannedSource::Unlocked);
     }
 
     #[test]

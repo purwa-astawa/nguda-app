@@ -115,6 +115,10 @@ export function markerLabel(marker: Pick<MarkerView_Serialize, "kind" | "secs">)
       return "Recovered";
     case "calendarChanged":
       return "Calendar changed";
+    case "excluded":
+      return "Excluded";
+    case "included":
+      return "Included";
   }
 }
 

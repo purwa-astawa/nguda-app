@@ -60,6 +60,23 @@ export const commands = {
 	 */
 	setIncludedCalendars: (calendarIds: string[]) => typedError<null, string>(__TAURI_INVOKE("set_included_calendars", { calendarIds })),
 	/**
+	 *  Leaves today's imported event `item_id` out of the schedule (R4): it stays in
+	 *  the plan, greyed. The engine rejects a stale rev, a local item, or one that
+	 *  has time recorded or is not pending.
+	 */
+	excludeEvent: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("exclude_event", { itemId, expectedRev })),
+	/**
+	 *  Takes the excluded event `item_id` back into the schedule. The engine rejects
+	 *  a stale rev or an item that is not excluded.
+	 */
+	includeEvent: (itemId: string, expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("include_event", { itemId, expectedRev })),
+	/**
+	 *  Adds the single event `event_id` of calendar `calendar_id` to today's plan
+	 *  (R4). Fire-and-forget: it shows in the snapshot, or a failure as a `sync`
+	 *  status entry.
+	 */
+	addCalendarEvent: (calendarId: string, eventId: string) => typedError<null, string>(__TAURI_INVOKE("add_calendar_event", { calendarId, eventId })),
+	/**
 	 *  The latest snapshot, read from the engine's `watch` receiver. Sends nothing to
 	 *  the engine (AD-4), so a window that loads after the last event still renders.
 	 */
@@ -70,6 +87,13 @@ export const commands = {
 	 *  nothing.
 	 */
 	queryDay: (date: string) => typedError<DayReportView_Serialize | null, string>(__TAURI_INVOKE("query_day", { date })),
+	/**
+	 *  Today's timed events of calendar `calendar_id`, sorted by start, each with
+	 *  whether today's plan already has it (R4). `date` (`YYYY-MM-DD`) must be
+	 *  today: any other date, or a query superseded by a newer one, fails with
+	 *  `"stale"`. Read-only. A malformed date is an `Err` and sends nothing.
+	 */
+	queryCalendarEvents: (calendarId: string, date: string) => typedError<CalendarEventView[], string>(__TAURI_INVOKE("query_calendar_events", { calendarId, date })),
 	/**
 	 *  The estimate gap of the ISO week (Monday to Sunday, local dates) holding
 	 *  `date` (`YYYY-MM-DD`). Read-only (AD-16). A malformed date, or one in the last
@@ -121,6 +145,21 @@ export type BaselineSlotView_Serialize = {
 	scheduledStart: string | null,
 	/**  RFC 3339 UTC instant; set exactly when `scheduledStart` is. */
 	scheduledEnd: string | null,
+};
+
+/**  One of today's events of a calendar, for the picker. */
+export type CalendarEventView = {
+	/**  Google's calendar id. */
+	calendarId: string,
+	/**  Google's event (instance) id: what [`add_calendar_event`] takes. */
+	eventId: string,
+	title: string,
+	/**  RFC 3339 UTC instant. */
+	start: string,
+	/**  RFC 3339 UTC instant. */
+	end: string,
+	/**  Today's plan already has it, so it cannot be added again. */
+	inPlan: boolean,
 };
 
 /**  One calendar of the account and whether it feeds today's plan. */
@@ -327,6 +366,11 @@ export type ItemView_Deserialize = {
 	tags: string[],
 	/**  The item was imported from a calendar event. */
 	imported: boolean,
+	/**
+	 *  The user left this imported event out of the schedule: shown greyed,
+	 *  with no scheduled times.
+	 */
+	excluded: boolean,
 };
 
 export type ItemView_Serialize = {
@@ -359,6 +403,11 @@ export type ItemView_Serialize = {
 	tags: string[],
 	/**  The item was imported from a calendar event. */
 	imported: boolean,
+	/**
+	 *  The user left this imported event out of the schedule: shown greyed,
+	 *  with no scheduled times.
+	 */
+	excluded: boolean,
 };
 
 /**
@@ -373,7 +422,7 @@ export type LockChoiceArg =
 
 export type LockDecisionView = "none" | "locked" | "noLock";
 
-export type MarkerKindView = "recovered" | "removed" | "switched" | "extended" | "inserted" | "carriedOver" | "calendarChanged";
+export type MarkerKindView = "recovered" | "removed" | "switched" | "extended" | "inserted" | "carriedOver" | "calendarChanged" | "excluded" | "included";
 
 /**  One day-log entry. */
 export type MarkerView = MarkerView_Serialize | MarkerView_Deserialize;
@@ -505,8 +554,9 @@ export type SnapshotEvent_Deserialize = {
 	/**  Today. `null` only before startup finishes (rev 0). */
 	day?: DayView | null,
 	/**
-	 *  Today's non-removed items in schedule order (`Snapshot.schedule`). The view
-	 *  shows them as given and never re-sorts.
+	 *  Today's non-removed items in schedule order (`Snapshot.schedule`), then
+	 *  today's excluded events (which the schedule leaves out) by pinned start,
+	 *  with no scheduled times. The view shows them as given and never re-sorts.
 	 */
 	items: ItemView_Deserialize[],
 	running?: RunningView | null,
@@ -542,8 +592,9 @@ export type SnapshotEvent_Serialize = {
 	/**  Today. `null` only before startup finishes (rev 0). */
 	day: DayView | null,
 	/**
-	 *  Today's non-removed items in schedule order (`Snapshot.schedule`). The view
-	 *  shows them as given and never re-sorts.
+	 *  Today's non-removed items in schedule order (`Snapshot.schedule`), then
+	 *  today's excluded events (which the schedule leaves out) by pinned start,
+	 *  with no scheduled times. The view shows them as given and never re-sorts.
 	 */
 	items: ItemView_Serialize[],
 	running: RunningView | null,

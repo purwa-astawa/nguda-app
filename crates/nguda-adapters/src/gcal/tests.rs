@@ -755,3 +755,186 @@ async fn list_calendars_failures_keep_their_kinds() {
     let err = signed_in(&server).list_calendars().await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::RateLimited);
 }
+
+#[tokio::test]
+async fn list_events_pages_drops_cancelled_and_skipped_events_and_sends_no_sync_options() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let events = "/calendar/v3/calendars/o@example.com/events";
+    Mock::given(method("GET"))
+        .and(path(events))
+        .and(query_param("pageToken", "p2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                timed("c", "Late", "2026-11-21T15:00:00Z", "2026-11-21T15:30:00Z"),
+            ],
+            "nextSyncToken": "s-1",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(events))
+        .and(query_param("timeMin", "2026-11-21T00:00:00Z"))
+        .and(query_param("timeMax", "2026-11-22T00:00:00Z"))
+        .and(query_param("singleEvents", "true"))
+        .and(query_param_is_missing("showDeleted"))
+        .and(query_param_is_missing("syncToken"))
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                timed("a", "Standup", "2026-11-21T09:00:00Z", "2026-11-21T09:15:00Z"),
+                { "id": "x", "status": "cancelled" },
+                { "id": "allday", "status": "confirmed", "summary": "Off",
+                  "start": { "date": "2026-11-21" }, "end": { "date": "2026-11-22" } },
+                timed("tomorrow", "Later", "2026-11-22T09:00:00Z", "2026-11-22T09:15:00Z"),
+            ],
+            "nextPageToken": "p2",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (from, to) = window();
+    let got = signed_in(&server)
+        .list_events("o@example.com".into(), from, to)
+        .await
+        .unwrap();
+    let ids: Vec<(&str, &str, &str)> = got
+        .iter()
+        .map(|e| {
+            (
+                e.calendar_id.as_str(),
+                e.source_id.as_str(),
+                e.title.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            ("o@example.com", "a", "Standup"),
+            ("o@example.com", "c", "Late")
+        ]
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_get_only(&requests);
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.url.query().unwrap_or("").contains("showDeleted")),
+    );
+}
+
+async fn get_one(source: &GcalSource, calendar: &str, event: &str) -> Option<CalendarChange> {
+    let (from, to) = window();
+    source
+        .get_event(calendar.into(), event.into(), from, to)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn get_event_reads_a_timed_event_with_its_original_start() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let mut body = timed(
+        "r1_20261121",
+        "Weekly",
+        "2026-11-21T10:00:00Z",
+        "2026-11-21T10:30:00Z",
+    );
+    body["originalStartTime"] = json!({ "dateTime": "2026-11-21T09:00:00Z" });
+    Mock::given(method("GET"))
+        .and(path(
+            "/calendar/v3/calendars/o@example.com/events/r1_20261121",
+        ))
+        .and(header("authorization", "Bearer at"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let got = get_one(&signed_in(&server), "o@example.com", "r1_20261121").await;
+    match got {
+        Some(CalendarChange::Upsert(e)) => {
+            assert_eq!(e.calendar_id, "o@example.com");
+            assert_eq!(e.source_id, "r1_20261121");
+            assert_eq!(e.title, "Weekly");
+            assert_eq!(e.start, "2026-11-21T10:00:00Z".parse().unwrap());
+            assert_eq!(
+                e.instance_start,
+                Some("2026-11-21T09:00:00Z".parse().unwrap())
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_get_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test]
+async fn get_event_maps_cancelled_skipped_and_missing_events() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let at = |id: &str| format!("/calendar/v3/calendars/o@example.com/events/{id}");
+    Mock::given(method("GET"))
+        .and(path(at("gone")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "id": "gone", "status": "cancelled" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(at("tomorrow")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(timed(
+            "tomorrow",
+            "Later",
+            "2026-11-22T09:00:00Z",
+            "2026-11-22T09:15:00Z",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(at("missing")))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+    let source = signed_in(&server);
+    assert_eq!(
+        get_one(&source, "o@example.com", "gone").await,
+        Some(CalendarChange::Cancelled(EventKey {
+            calendar_id: "o@example.com".into(),
+            source_id: "gone".into(),
+            instance_start: None,
+        }))
+    );
+    assert_eq!(get_one(&source, "o@example.com", "tomorrow").await, None);
+    assert_eq!(get_one(&source, "o@example.com", "missing").await, None);
+    assert_get_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test]
+async fn get_event_percent_encodes_both_ids_and_keeps_error_kinds() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/calendar/v3/calendars/en.usa%23holiday@group.v.calendar.google.com/events/a%2Fb%3Fc",
+        ))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (from, to) = window();
+    let err = signed_in(&server)
+        .get_event(
+            "en.usa#holiday@group.v.calendar.google.com".into(),
+            "a/b?c".into(),
+            from,
+            to,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::RateLimited);
+    assert!(!err.message.contains("holiday"), "{err}");
+    assert_get_only(&server.received_requests().await.unwrap());
+}

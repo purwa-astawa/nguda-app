@@ -267,6 +267,8 @@ test("markerLabel labels every kind", () => {
   assert.equal(m("carriedOver"), "Carried over");
   assert.equal(m("recovered"), "Recovered");
   assert.equal(m("calendarChanged"), "Calendar changed");
+  assert.equal(m("excluded"), "Excluded");
+  assert.equal(m("included"), "Included");
 });
 
 test("hourTicks returns each local whole hour in the span", () => {

@@ -67,6 +67,10 @@ pub enum Action {
     /// Pause the running item, push it onto the interrupt stack, and start a new
     /// item in its place.
     Interrupt,
+    /// Leave an imported event out of the day's schedule (it stays in the plan).
+    Exclude,
+    /// Take an excluded event back into the day's schedule.
+    Include,
 }
 
 impl fmt::Display for Action {
@@ -82,6 +86,8 @@ impl fmt::Display for Action {
             Self::Switch => "switch from",
             Self::Extend => "extend",
             Self::Interrupt => "interrupt",
+            Self::Exclude => "exclude",
+            Self::Include => "include",
         })
     }
 }
@@ -110,6 +116,8 @@ pub struct PlanItem {
     source: Option<Box<CalendarRef>>,
     removed_by_source_at: Option<Timestamp>,
     hidden_at: Option<Timestamp>,
+    excluded: bool,
+    added: bool,
 }
 
 /// Where an imported item came from (AD-9): its merge key
@@ -160,14 +168,21 @@ pub struct PlanItemRecord {
     /// When un-including the item's calendar hid it. Requires `source` and status
     /// Removed.
     pub hidden_at: Option<Timestamp>,
+    /// The user left the imported event out of the day's schedule. Requires
+    /// `source`; never on a running item.
+    pub excluded: bool,
+    /// The user added the event on its own, from a calendar that need not be
+    /// included. Requires `source`.
+    pub added: bool,
 }
 
 impl PlanItem {
     /// Rebuilds a stored item, rejecting a record that breaks an item invariant:
     /// fixed exactly when pinned, removed exactly when tombstoned, no inverted closed
     /// segment, at most one open segment, an open segment exactly when running, and
-    /// `removed_by_source_at` only on an imported item, and `hidden_at` only on a
-    /// removed imported item.
+    /// `removed_by_source_at` only on an imported item, `hidden_at` only on a
+    /// removed imported item, `excluded` and `added` only on an imported item, and
+    /// `excluded` never on a running item.
     pub fn restore(record: PlanItemRecord) -> Result<Self, DomainError> {
         let invalid = |reason| DomainError::InvalidRecord {
             id: record.id,
@@ -201,6 +216,12 @@ impl PlanItem {
         {
             return Err(invalid("hidden_at requires a source and status removed"));
         }
+        if (record.excluded || record.added) && record.source.is_none() {
+            return Err(invalid("excluded and added require a source"));
+        }
+        if record.excluded && (record.status == ItemStatus::Running || open > 0) {
+            return Err(invalid("an excluded item cannot be running"));
+        }
         let PlanItemRecord {
             id,
             title,
@@ -216,6 +237,8 @@ impl PlanItem {
             source,
             removed_by_source_at,
             hidden_at,
+            excluded,
+            added,
         } = record;
         Ok(Self {
             id,
@@ -232,6 +255,8 @@ impl PlanItem {
             source: source.map(Box::new),
             removed_by_source_at,
             hidden_at,
+            excluded,
+            added,
         })
     }
 
@@ -252,6 +277,8 @@ impl PlanItem {
             source: None,
             removed_by_source_at: None,
             hidden_at: None,
+            excluded: false,
+            added: false,
         }
     }
 
@@ -349,6 +376,19 @@ impl PlanItem {
         self.hidden_at
     }
 
+    /// Whether the user left this imported event out of the day's schedule. An
+    /// excluded item stays pending and in the plan, but re-flow skips it.
+    pub fn excluded(&self) -> bool {
+        self.excluded
+    }
+
+    /// Whether the user added this event on its own (not through an included
+    /// calendar), so sync refreshes it with `events.get` and hiding its calendar
+    /// keeps it.
+    pub fn added(&self) -> bool {
+        self.added
+    }
+
     /// Pins the item at `pinned_start`, making it fixed.
     pub(crate) fn set_fixed(&mut self, pinned_start: Timestamp) {
         self.fixed = true;
@@ -430,7 +470,7 @@ impl PlanItem {
             Action::Resume => ItemStatus::Paused,
             _ => return Err(self.reject(action)),
         };
-        if self.status != allowed {
+        if self.status != allowed || self.excluded {
             return Err(self.reject(action));
         }
         let mut next = self.clone();
@@ -837,15 +877,71 @@ impl Day {
     /// Revives the hidden item `id` as pending, clearing `removed_at` and
     /// `hidden_at`. An item that is not hidden rejects it.
     pub(crate) fn revive(&mut self, id: ItemId) -> Result<(), DomainError> {
+        let item = &self.items[self.index(id)?];
+        if item.hidden_at.is_none() {
+            return Err(item.reject(Action::Edit));
+        }
+        self.revive_removed(id)
+    }
+
+    /// Revives the removed imported item `id` as pending, clearing `removed_at`
+    /// and `hidden_at`, for an explicit add: a hidden item or one the user
+    /// removed. An item Google cancelled (`removed_by_source_at`), or one that is
+    /// not removed, rejects it.
+    pub(crate) fn revive_removed(&mut self, id: ItemId) -> Result<(), DomainError> {
         let idx = self.index(id)?;
         let item = &self.items[idx];
-        if item.status != ItemStatus::Removed || item.hidden_at.is_none() {
+        if item.status != ItemStatus::Removed
+            || item.removed_by_source_at.is_some()
+            || item.source.is_none()
+        {
             return Err(item.reject(Action::Edit));
         }
         let next = &mut self.items[idx];
         next.status = ItemStatus::Pending;
         next.removed_at = None;
         next.hidden_at = None;
+        Ok(())
+    }
+
+    /// Excludes the imported item `id` from the day's schedule: only a pending
+    /// imported item with no recorded time, not yet excluded. It stays pending
+    /// and leaves the interrupt stack.
+    pub fn exclude(&mut self, id: ItemId) -> Result<(), DomainError> {
+        let idx = self.index(id)?;
+        let item = &self.items[idx];
+        if item.status != ItemStatus::Pending
+            || !item.segments.is_empty()
+            || item.source.is_none()
+            || item.excluded
+        {
+            return Err(item.reject(Action::Exclude));
+        }
+        self.items[idx].excluded = true;
+        self.unstack(id);
+        Ok(())
+    }
+
+    /// Takes the excluded item `id` back into the schedule. An item that is not
+    /// excluded rejects it.
+    pub fn include(&mut self, id: ItemId) -> Result<(), DomainError> {
+        let idx = self.index(id)?;
+        let item = &self.items[idx];
+        if !item.excluded {
+            return Err(item.reject(Action::Include));
+        }
+        self.items[idx].excluded = false;
+        Ok(())
+    }
+
+    /// Marks the imported item `id` as explicitly added. A local item rejects it.
+    pub(crate) fn mark_added(&mut self, id: ItemId) -> Result<(), DomainError> {
+        let idx = self.index(id)?;
+        let item = &self.items[idx];
+        if item.source.is_none() {
+            return Err(item.reject(Action::Edit));
+        }
+        self.items[idx].added = true;
         Ok(())
     }
 
@@ -972,6 +1068,8 @@ mod tests {
             Action::Switch => d.switch(id, now).map(|_| ()),
             Action::Extend => d.extend(id, 60).map(|_| ()),
             Action::Interrupt => d.interrupt(id, item(50, "z"), now),
+            Action::Exclude => d.exclude(id),
+            Action::Include => d.include(id),
         }
     }
 
@@ -1133,7 +1231,9 @@ mod tests {
                     | Action::Edit
                     | Action::Switch
                     | Action::Extend
-                    | Action::Interrupt => None,
+                    | Action::Interrupt
+                    | Action::Exclude
+                    | Action::Include => None,
                 };
                 if let Some(r) = &item_result {
                     assert_eq!(r, &result, "{s} -> {a}: item and day agree");
@@ -1391,6 +1491,8 @@ mod tests {
             source: None,
             removed_by_source_at: None,
             hidden_at: None,
+            excluded: false,
+            added: false,
         }
     }
 
@@ -1429,6 +1531,8 @@ mod tests {
                 source: i.source().cloned(),
                 removed_by_source_at: i.removed_by_source_at(),
                 hidden_at: i.hidden_at(),
+                excluded: i.excluded(),
+                added: i.added(),
             };
             assert_eq!(PlanItem::restore(r), Ok(i), "{s}");
         }
@@ -1483,6 +1587,118 @@ mod tests {
         })
         .unwrap();
         assert_eq!(i.hidden_at(), Some(ts(10)));
+    }
+
+    fn imported_source() -> CalendarRef {
+        CalendarRef {
+            calendar_id: "cal".into(),
+            source_id: "ev".into(),
+            instance_start: None,
+            source_secs: 1500,
+        }
+    }
+
+    #[test]
+    fn restore_requires_a_source_for_excluded_and_added_and_no_running_excluded() {
+        assert_invalid(PlanItemRecord {
+            excluded: true,
+            ..record(ItemStatus::Pending)
+        });
+        assert_invalid(PlanItemRecord {
+            added: true,
+            ..record(ItemStatus::Pending)
+        });
+        assert_invalid(PlanItemRecord {
+            source: Some(imported_source()),
+            excluded: true,
+            segments: vec![Segment::open(ts(10))],
+            ..record(ItemStatus::Running)
+        });
+        let i = PlanItem::restore(PlanItemRecord {
+            source: Some(imported_source()),
+            excluded: true,
+            added: true,
+            ..record(ItemStatus::Pending)
+        })
+        .unwrap();
+        assert!(i.excluded() && i.added());
+    }
+
+    fn imported_day() -> Day {
+        let item = PlanItem::restore(PlanItemRecord {
+            source: Some(imported_source()),
+            ..record(ItemStatus::Pending)
+        })
+        .unwrap();
+        day(vec![item, PlanItem::new(id(2), "local", 600, key("W"))])
+    }
+
+    #[test]
+    fn exclude_and_include_toggle_the_flag_and_keep_the_item_pending() {
+        let mut d = imported_day();
+        d.exclude(id(1)).unwrap();
+        let i = d.item(id(1)).unwrap();
+        assert!(i.excluded());
+        assert_eq!(i.status(), ItemStatus::Pending);
+        let before = d.clone();
+        assert_eq!(
+            d.exclude(id(1)),
+            Err(DomainError::InvalidTransition {
+                from: ItemStatus::Pending,
+                action: Action::Exclude
+            })
+        );
+        assert_eq!(d, before);
+        d.include(id(1)).unwrap();
+        assert!(!d.item(id(1)).unwrap().excluded());
+        let before = d.clone();
+        assert!(d.include(id(1)).is_err());
+        assert_eq!(d, before);
+    }
+
+    #[test]
+    fn exclude_rejects_local_running_tracked_or_unknown_items_unchanged() {
+        let clock = FakeClock::at(1_000);
+        let mut d = imported_day();
+        let before = d.clone();
+        assert!(d.exclude(id(2)).is_err(), "local");
+        assert_eq!(d.exclude(id(9)), Err(DomainError::UnknownItem(id(9))));
+        assert_eq!(d, before);
+        d.start(id(1), clock.now()).unwrap();
+        let before = d.clone();
+        assert!(d.exclude(id(1)).is_err(), "running");
+        assert_eq!(d, before);
+        d.pause(id(1), clock.now()).unwrap();
+        assert!(d.exclude(id(1)).is_err(), "paused with segments");
+    }
+
+    #[test]
+    fn an_excluded_item_cannot_start_and_is_left_out_of_the_schedule() {
+        let clock = FakeClock::at(1_000);
+        let mut d = imported_day();
+        d.set_fixed(id(1), ts(0)).unwrap();
+        d.exclude(id(1)).unwrap();
+        let before = d.clone();
+        assert!(d.start(id(1), clock.now()).is_err());
+        assert_eq!(d, before);
+        assert!(reflow(&d, clock.now()).slot(id(1)).is_none());
+        assert_eq!(d.next_item(clock.now()).map(PlanItem::id), Some(id(2)));
+        let b = crate::baseline::baseline(&d, clock.now());
+        assert!(b.items.iter().all(|bi| bi.item_id != id(1)));
+    }
+
+    #[test]
+    fn revive_removed_accepts_hidden_or_user_removed_but_not_source_cancelled() {
+        let mut d = imported_day();
+        d.remove(id(1), ts(10)).unwrap();
+        d.revive_removed(id(1)).unwrap();
+        assert_eq!(d.item(id(1)).unwrap().status(), ItemStatus::Pending);
+        assert!(d.revive(id(1)).is_err(), "not hidden");
+        d.remove_by_source(id(1), ts(20)).unwrap();
+        let before = d.clone();
+        assert!(d.revive_removed(id(1)).is_err());
+        assert_eq!(d, before);
+        assert!(d.mark_added(id(2)).is_err(), "local");
     }
 
     #[test]

@@ -226,6 +226,8 @@ mod tests {
             source: None,
             removed_by_source_at: None,
             hidden_at: None,
+            excluded: false,
+            added: false,
         }
     }
 

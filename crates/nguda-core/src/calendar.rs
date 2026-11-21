@@ -231,8 +231,8 @@ pub fn reconcile(stored: &[CalendarEntry], listed: &[CalendarInfo]) -> Vec<Calen
 
 /// Hides `day`'s items imported from `calendar_id` after it was un-included, at
 /// `now`: each pending item with no segments becomes a hidden tombstone (see
-/// [`Day::hide`]); every other item is left as is. Returns the hidden ids in plan
-/// order.
+/// [`Day::hide`]); every other item, and every item the user added on its own,
+/// is left as is. Returns the hidden ids in plan order.
 pub fn hide_calendar(
     day: &mut Day,
     calendar_id: &str,
@@ -241,7 +241,7 @@ pub fn hide_calendar(
     let ids: Vec<ItemId> = day
         .items()
         .iter()
-        .filter(|i| i.source().is_some_and(|s| s.calendar_id == calendar_id))
+        .filter(|i| !i.added() && i.source().is_some_and(|s| s.calendar_id == calendar_id))
         .map(PlanItem::id)
         .collect();
     let mut hidden = Vec::new();
@@ -274,6 +274,100 @@ pub trait CalendarSource: Send + Sync + 'static {
         window_start: Timestamp,
         window_end: Timestamp,
     ) -> CalendarFuture<SyncBatch>;
+
+    /// The timed events of calendar `calendar_id` starting in
+    /// `[window_start, window_end)`, in Google's order: a read-only listing with
+    /// no sync token and no cancellations.
+    fn list_events(
+        &self,
+        calendar_id: String,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> CalendarFuture<Vec<FetchedEvent>>;
+
+    /// The single event `event_id` of calendar `calendar_id`: an upsert when it
+    /// is timed and starts in `[window_start, window_end)`, a cancellation when
+    /// Google cancelled it, and `None` when it is not found, all-day, declined,
+    /// or outside the window.
+    fn get_event(
+        &self,
+        calendar_id: String,
+        event_id: String,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> CalendarFuture<Option<CalendarChange>>;
+}
+
+/// Adds the single `event` the user picked to `day` (R4), minting an id with
+/// `new_id` for a new item:
+///
+/// - an unknown event becomes a fixed, pending imported item marked `added`;
+/// - an event whose item is live (not removed) changes nothing;
+/// - an event whose item is removed but not cancelled by Google (hidden, or
+///   removed by the user) is revived as pending, marked `added`, taken back into
+///   the schedule if it was excluded, and given Google's fields;
+/// - an event Google cancelled, or one with no positive length, changes nothing.
+///
+/// Returns the id of the item added or revived. On an error `day` may be
+/// half-changed: callers add into a copy.
+pub fn add_event(
+    day: &mut Day,
+    event: &FetchedEvent,
+    mut new_id: impl FnMut() -> ItemId,
+) -> Result<Option<ItemId>, DomainError> {
+    let Some(len) = event.length_secs() else {
+        return Ok(None);
+    };
+    let known = known_item(day, &event.key())
+        .map(|i| (i.id(), i.status(), i.removed_by_source_at(), i.excluded()));
+    match known {
+        None => {
+            let id = insert(day, event, len, &mut new_id)?;
+            day.mark_added(id)?;
+            Ok(Some(id))
+        }
+        Some((id, ItemStatus::Removed, None, excluded)) => {
+            day.revive_removed(id)?;
+            day.mark_added(id)?;
+            if excluded {
+                day.include(id)?;
+            }
+            update(day, id, event, len)?;
+            Ok(Some(id))
+        }
+        Some(_) => Ok(None),
+    }
+}
+
+/// Whether `day` already has the event `key` for the picker (R4): an item with
+/// that merge key that is not removed, or that Google cancelled (an explicit
+/// add never revives it). A hidden or user-removed item does not count: adding
+/// it again revives it.
+pub fn in_plan(day: &Day, key: &EventKey) -> bool {
+    known_item(day, key)
+        .is_some_and(|i| i.status() != ItemStatus::Removed || i.removed_by_source_at().is_some())
+}
+
+/// The events to refresh with [`CalendarSource::get_event`] in a sync round:
+/// `(calendar_id, source_id)` of each non-removed item of `day` the user added
+/// on its own whose calendar is not included in `calendars`, once each, in plan
+/// order.
+pub fn added_refs(day: &Day, calendars: &[CalendarEntry]) -> Vec<(String, String)> {
+    let included = |id: &str| calendars.iter().any(|c| c.id == id && c.included);
+    let mut refs: Vec<(String, String)> = Vec::new();
+    for item in day.items() {
+        if !item.added() || item.status() == ItemStatus::Removed {
+            continue;
+        }
+        let Some(source) = item.source() else {
+            continue;
+        };
+        let r = (source.calendar_id.clone(), source.source_id.clone());
+        if !included(&r.0) && !refs.contains(&r) {
+            refs.push(r);
+        }
+    }
+    refs
 }
 
 /// Merges `changes` into `day` under the AD-9 ownership rules at `now`, minting
@@ -347,24 +441,7 @@ fn upsert(
         return Ok(None);
     };
     match known_item(day, &event.key()).map(|i| (i.id(), i.status(), i.hidden_at())) {
-        None => {
-            let order = OrderKey::between(last_order(day), None)?;
-            let id = new_id();
-            let source = CalendarRef {
-                calendar_id: event.calendar_id.clone(),
-                source_id: event.source_id.clone(),
-                instance_start: event.instance_start,
-                source_secs: len,
-            };
-            day.add(PlanItem::imported(
-                id,
-                event.title.clone(),
-                event.start,
-                order,
-                source,
-            ))?;
-            Ok(Some(id))
-        }
+        None => insert(day, event, len, new_id).map(Some),
         Some((id, ItemStatus::Removed, Some(_))) => {
             day.revive(id)?;
             update(day, id, event, len)?;
@@ -373,6 +450,32 @@ fn upsert(
         Some((_, ItemStatus::Removed, None)) => Ok(None),
         Some((id, _, _)) => Ok(update(day, id, event, len)?.then_some(id)),
     }
+}
+
+/// Adds `event` (length `len`) as a new fixed, pending imported item ordered after
+/// every item of the day, returning its id.
+fn insert(
+    day: &mut Day,
+    event: &FetchedEvent,
+    len: u64,
+    new_id: &mut impl FnMut() -> ItemId,
+) -> Result<ItemId, DomainError> {
+    let order = OrderKey::between(last_order(day), None)?;
+    let id = new_id();
+    let source = CalendarRef {
+        calendar_id: event.calendar_id.clone(),
+        source_id: event.source_id.clone(),
+        instance_start: event.instance_start,
+        source_secs: len,
+    };
+    day.add(PlanItem::imported(
+        id,
+        event.title.clone(),
+        event.start,
+        order,
+        source,
+    ))?;
+    Ok(id)
 }
 
 /// Applies Google's fields of `event` (length `len`) to the known item `id`.
@@ -664,6 +767,8 @@ mod tests {
             source: i.source().cloned(),
             removed_by_source_at: i.removed_by_source_at(),
             hidden_at: i.hidden_at(),
+            excluded: i.excluded(),
+            added: i.added(),
         }
     }
 
@@ -1023,6 +1128,190 @@ mod tests {
         let cancel = CalendarChange::Cancelled(other_event("o1", 3_600).key());
         assert!(merge(&mut d, &[cancel], ts(600), ids()).unwrap().is_empty());
         assert_eq!(d, before);
+    }
+
+    #[test]
+    fn merge_keeps_excluded_through_updates_cancellation_hide_and_revive() {
+        let mut d = empty_day();
+        merge_events(&mut d, &[other_event("o1", 3_600)], ids()).unwrap();
+        d.exclude(id(1000)).unwrap();
+        let mut moved = other_event("o1", 5_400);
+        moved.title = "Renamed".into();
+        moved.end = ts(9_000);
+        merge(
+            &mut d,
+            &[CalendarChange::Upsert(moved.clone())],
+            ts(10),
+            ids(),
+        )
+        .unwrap();
+        let i = only(&d);
+        assert!(i.excluded());
+        assert_eq!(i.title(), "Renamed");
+        assert_eq!(i.pinned_start(), Some(ts(5_400)));
+        assert_eq!(i.planned_secs(), 3_600);
+        hide_calendar(&mut d, "other@example.com", ts(20)).unwrap();
+        assert!(only(&d).excluded());
+        assert_eq!(only(&d).status(), ItemStatus::Removed);
+        merge(
+            &mut d,
+            &[CalendarChange::Upsert(moved.clone())],
+            ts(30),
+            ids(),
+        )
+        .unwrap();
+        assert!(only(&d).excluded());
+        assert_eq!(only(&d).status(), ItemStatus::Pending);
+        let cancel = CalendarChange::Cancelled(moved.key());
+        merge(&mut d, &[cancel], ts(40), ids()).unwrap();
+        assert!(only(&d).excluded());
+        assert_eq!(only(&d).removed_by_source_at(), Some(ts(40)));
+    }
+
+    #[test]
+    fn add_event_imports_a_new_event_as_an_added_fixed_item() {
+        let mut d = empty_day();
+        let got = add_event(&mut d, &other_event("o1", 3_600), ids()).unwrap();
+        assert_eq!(got, Some(id(1000)));
+        let i = only(&d);
+        assert!(i.added() && i.fixed() && !i.excluded());
+        assert_eq!(i.pinned_start(), Some(ts(3_600)));
+        assert_eq!(i.status(), ItemStatus::Pending);
+        assert_eq!(i.planned_secs(), 1_800);
+        let mut zero = other_event("o2", 3_600);
+        zero.end = zero.start;
+        assert_eq!(add_event(&mut d, &zero, ids()).unwrap(), None);
+        assert_eq!(d.items().len(), 1);
+    }
+
+    #[test]
+    fn add_event_of_a_live_item_changes_nothing() {
+        let mut d = empty_day();
+        merge_events(&mut d, &[other_event("o1", 3_600)], ids()).unwrap();
+        let before = d.clone();
+        let mut moved = other_event("o1", 5_400);
+        moved.title = "Renamed".into();
+        assert_eq!(add_event(&mut d, &moved, ids()).unwrap(), None);
+        assert_eq!(d, before);
+    }
+
+    #[test]
+    fn add_event_revives_a_hidden_or_user_removed_item_with_googles_fields() {
+        for hidden in [true, false] {
+            let mut d = empty_day();
+            merge_events(&mut d, &[other_event("o1", 3_600)], ids()).unwrap();
+            d.set_tags(id(1000), vec!["meet".into()]).unwrap();
+            if hidden {
+                hide_calendar(&mut d, "other@example.com", ts(500)).unwrap();
+            } else {
+                d.exclude(id(1000)).unwrap();
+                d.remove(id(1000), ts(500)).unwrap();
+            }
+            let mut moved = other_event("o1", 5_400);
+            moved.title = "Renamed".into();
+            assert_eq!(add_event(&mut d, &moved, ids()).unwrap(), Some(id(1000)));
+            let i = only(&d);
+            assert_eq!(i.status(), ItemStatus::Pending, "hidden={hidden}");
+            assert_eq!(i.removed_at(), None);
+            assert_eq!(i.hidden_at(), None);
+            assert!(i.added() && !i.excluded());
+            assert_eq!(i.title(), "Renamed");
+            assert_eq!(i.pinned_start(), Some(ts(5_400)));
+            assert_eq!(i.tags(), ["meet".to_owned()]);
+        }
+    }
+
+    #[test]
+    fn add_event_never_revives_a_source_cancelled_item() {
+        let mut d = empty_day();
+        merge_events(&mut d, &[other_event("o1", 3_600)], ids()).unwrap();
+        merge(
+            &mut d,
+            &[CalendarChange::Cancelled(other_event("o1", 3_600).key())],
+            ts(500),
+            ids(),
+        )
+        .unwrap();
+        let before = d.clone();
+        assert_eq!(
+            add_event(&mut d, &other_event("o1", 3_600), ids()).unwrap(),
+            None
+        );
+        assert_eq!(d, before);
+    }
+
+    #[test]
+    fn in_plan_counts_live_and_source_cancelled_items_only() {
+        let mut d = empty_day();
+        let mut next = ids();
+        merge_events(
+            &mut d,
+            &[
+                other_event("o1", 3_600),
+                other_event("o2", 7_200),
+                other_event("o3", 10_800),
+                other_event("o4", 14_400),
+            ],
+            &mut next,
+        )
+        .unwrap();
+        d.remove(id(1001), ts(10)).unwrap();
+        merge(
+            &mut d,
+            &[CalendarChange::Cancelled(other_event("o3", 10_800).key())],
+            ts(20),
+            &mut next,
+        )
+        .unwrap();
+        d.exclude(id(1003)).unwrap();
+        let has = |d: &Day, s: &str, start| in_plan(d, &other_event(s, start).key());
+        assert!(has(&d, "o1", 3_600), "live");
+        assert!(!has(&d, "o2", 7_200), "removed by the user");
+        assert!(has(&d, "o3", 10_800), "cancelled by Google");
+        assert!(has(&d, "o4", 14_400), "excluded");
+        assert!(!has(&d, "o5", 0), "unknown");
+        hide_calendar(&mut d, "other@example.com", ts(30)).unwrap();
+        assert!(!has(&d, "o1", 3_600), "hidden");
+    }
+
+    #[test]
+    fn hide_calendar_skips_added_items() {
+        let mut d = empty_day();
+        let mut next = ids();
+        add_event(&mut d, &other_event("o1", 3_600), &mut next).unwrap();
+        merge_events(&mut d, &[other_event("o2", 7_200)], &mut next).unwrap();
+        let hidden = hide_calendar(&mut d, "other@example.com", ts(500)).unwrap();
+        assert_eq!(hidden, vec![id(1001)]);
+        assert_eq!(d.item(id(1000)).unwrap().status(), ItemStatus::Pending);
+    }
+
+    #[test]
+    fn added_refs_lists_live_added_items_of_non_included_calendars_once() {
+        let mut d = empty_day();
+        let mut next = ids();
+        add_event(&mut d, &other_event("o1", 3_600), &mut next).unwrap();
+        add_event(&mut d, &other_event("o2", 7_200), &mut next).unwrap();
+        let mut inst = other_event("o1", 90_000);
+        inst.instance_start = Some(ts(90_000));
+        add_event(&mut d, &inst, &mut next).unwrap();
+        add_event(&mut d, &event("e1", "Mine", 3_600, 5_400), &mut next).unwrap();
+        merge_events(&mut d, &[other_event("o3", 10_800)], &mut next).unwrap();
+        d.remove(id(1001), ts(10)).unwrap();
+        let calendars = [
+            entry("other@example.com", false, false),
+            entry("me@example.com", true, true),
+        ];
+        assert_eq!(
+            added_refs(&d, &calendars),
+            vec![("other@example.com".to_owned(), "o1".to_owned())]
+        );
+        assert_eq!(
+            added_refs(&d, &[]),
+            vec![
+                ("other@example.com".to_owned(), "o1".to_owned()),
+                ("me@example.com".to_owned(), "e1".to_owned()),
+            ]
+        );
     }
 
     #[test]

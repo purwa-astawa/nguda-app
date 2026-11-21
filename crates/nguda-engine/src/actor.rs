@@ -10,20 +10,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    CalendarEntry, CalendarError, CalendarErrorKind, CalendarSource, Clock, Date, Day, DayLogKind,
-    ExportRange, FileSink, IdGen, IsoWeek, ItemId, LockDecision, OpenSegmentRef, PlanItem,
-    PromptId, PromptKind, Random, Running, Schedule, Store, StoreBatch, StoreError, StoreOp,
-    SyncBatch, SyncCursor, TimeZone, Timestamp, WorkEnd, export_csv, hide_calendar, merge,
-    merge_tag_names, reconcile, reflow, report, sort_tag_names, week_report,
+    CalendarChange, CalendarEntry, CalendarError, CalendarErrorKind, CalendarSource, Clock, Date,
+    Day, DayLogKind, EventKey, ExportRange, FetchedEvent, FileSink, IdGen, IsoWeek, ItemId,
+    LockDecision, OpenSegmentRef, PlanItem, PromptId, PromptKind, Random, Running, Schedule, Store,
+    StoreBatch, StoreError, StoreOp, SyncBatch, SyncCursor, TimeZone, Timestamp, WorkEnd,
+    add_event, added_refs, export_csv, hide_calendar, in_plan, merge, merge_tag_names, reconcile,
+    reflow, report, sort_tag_names, week_report,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::batch::diff;
 use crate::commands::{self, Reject, domain_kind};
 use crate::{
-    BACKOFF_MAX, CalendarOutcome, DayReply, Effect, EngineDeps, EngineMsg, GoogleAccount,
-    HEARTBEAT_EVERY, Inbox, JITTER, NextItem, POLL_EVERY, Snapshot, StatusEntry, StatusKey,
-    SyncRound, WAKE_LATENESS, WeekReply,
+    AddedOutcome, BACKOFF_MAX, CalendarEvent, CalendarOutcome, DayReply, Effect, EngineDeps,
+    EngineMsg, EventsReply, GoogleAccount, HEARTBEAT_EVERY, Inbox, JITTER, NextItem, POLL_EVERY,
+    QueryError, Snapshot, StatusEntry, StatusKey, SyncRound, WAKE_LATENESS, WeekReply,
 };
 
 pub(crate) async fn run(
@@ -47,6 +48,15 @@ pub(crate) async fn run(
                 Some(Inbox::ImportFinished { id, date, result }) => {
                     actor.import_finished(id, date, result).await;
                 }
+                Some(Inbox::QueryCalendarEvents { calendar_id, date, reply }) => {
+                    actor.query_calendar_events(calendar_id, date, reply);
+                }
+                Some(Inbox::CalendarEventsFetched { id, date, result, reply }) => {
+                    actor.calendar_events_fetched(id, date, result, reply);
+                }
+                Some(Inbox::EventAdded { date, result }) => {
+                    actor.event_added(date, result).await;
+                }
                 None => break,
             },
             () = deadline => actor.on_deadline().await,
@@ -67,6 +77,9 @@ struct Actor {
     sign_in_issued: u64,
     /// The last sync request id handed out; only its result applies.
     import_issued: u64,
+    /// The last calendar-events query id handed out; only its result is
+    /// answered with events, older ones `Stale`.
+    events_query_issued: u64,
     /// Each calendar's sync cursor, by calendar id, as last committed or loaded
     /// (AD-17). Never logged: it holds tokens.
     cursors: BTreeMap<String, SyncCursor>,
@@ -145,6 +158,7 @@ impl Actor {
             random: deps.random,
             sign_in_issued: 0,
             import_issued: 0,
+            events_query_issued: 0,
             cursors: BTreeMap::new(),
             calendars: Vec::new(),
             poll_at: None,
@@ -297,11 +311,14 @@ impl Actor {
             .map(|c| (c.calendar_id.clone(), c.token.clone()))
             .collect();
         let stored = self.calendars.clone();
+        // The added items to refresh are chosen after the listing reconciles the
+        // table, so the task gets today's plan as of now.
+        let day = self.day.clone();
         let calendar = self.calendar.clone();
         let inbox = self.inbox.clone();
         tracing::debug!(id, %date, cursors = tokens.len(), "calendar sync round started");
         self.round_task = Some(tokio::spawn(async move {
-            let result = sync_round(calendar.as_ref(), &stored, &tokens, from, to).await;
+            let result = sync_round(calendar.as_ref(), &stored, &day, &tokens, from, to).await;
             // The engine may have stopped meanwhile; nothing to report to then.
             if let Some(inbox) = inbox.upgrade() {
                 let _ = inbox.send(Inbox::ImportFinished { id, date, result });
@@ -418,6 +435,7 @@ impl Actor {
         let SyncRound {
             calendars,
             outcomes,
+            added,
         } = round;
         let now = self.clock.now();
         let mut failures = RoundFailures::default();
@@ -488,6 +506,44 @@ impl Actor {
                 }
             }
         }
+        // Added events of calendars not included: merged like any change (R4).
+        // `None` (not found, skipped, or not today) never deletes (AD-9).
+        let refreshed = added.len();
+        for AddedOutcome {
+            calendar_id,
+            event_id,
+            result,
+        } in added
+        {
+            match result {
+                // Only the event asked for: anything else is not this item's.
+                Ok(Some(change)) if names(&change, &calendar_id, &event_id) => {
+                    let mut merged = next.clone();
+                    match merge(&mut merged, &[change], now, || ids.new_item_id()) {
+                        Ok(t) => {
+                            next = merged;
+                            for item_id in t {
+                                if !touched.contains(&item_id) {
+                                    touched.push(item_id);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(id, %date, kind = domain_kind(&e), "added event merge rejected");
+                            failures.other.get_or_insert_with(|| e.to_string());
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if e.kind == CalendarErrorKind::RateLimited => {
+                    failures.rate_limited = true;
+                }
+                Err(e) => {
+                    tracing::warn!(id, kind = error_kind(&e), "added event refresh failed");
+                    failures.other.get_or_insert(e.message);
+                }
+            }
+        }
         // A calendar no longer listed keeps no cursor; its items stay (AD-9).
         cursors.retain(|calendar_id, _| calendars.iter().any(|c| &c.id == calendar_id));
         tracing::info!(
@@ -495,6 +551,7 @@ impl Actor {
             %date,
             calendars = calendars.len(),
             fetched,
+            refreshed,
             count = touched.len(),
             "calendar sync round merged"
         );
@@ -676,6 +733,162 @@ impl Actor {
                 self.publish();
             }
         }
+    }
+
+    /// Answers a calendar-events query (R4, AD-16, AD-17) under a fresh request
+    /// id: a `date` other than today is answered `Stale` at once; otherwise the
+    /// listing of today's window is spawned, and its result comes back as
+    /// [`Inbox::CalendarEventsFetched`] with the reply. Read-only. Logs the id
+    /// and date only (AD-14).
+    fn query_calendar_events(
+        &mut self,
+        calendar_id: String,
+        date: Date,
+        reply: oneshot::Sender<EventsReply>,
+    ) {
+        self.events_query_issued += 1;
+        let id = self.events_query_issued;
+        let window = day_window(date, &self.tz);
+        let (true, Some((from, to))) = (date == self.day.date(), window) else {
+            tracing::debug!(id, %date, "calendar events query stale");
+            // The asker may have gone away; nothing to do then.
+            let _ = reply.send(Err(QueryError::Stale));
+            return;
+        };
+        let calendar = self.calendar.clone();
+        let inbox = self.inbox.clone();
+        tracing::debug!(id, %date, "calendar events queried");
+        tokio::spawn(async move {
+            let result = calendar.list_events(calendar_id, from, to).await;
+            match inbox.upgrade() {
+                Some(inbox) => {
+                    let _ = inbox.send(Inbox::CalendarEventsFetched {
+                        id,
+                        date,
+                        result,
+                        reply,
+                    });
+                }
+                // The engine stopped meanwhile: the asker sees it closed.
+                None => drop(reply),
+            }
+        });
+    }
+
+    /// Answers a calendar-events query with its listing: `Stale` when a newer
+    /// query was issued or `date` is no longer today, the failure's kind on an
+    /// error, else the events sorted by start, each marked whether today's plan
+    /// has it ([`in_plan`]). Changes nothing.
+    fn calendar_events_fetched(
+        &self,
+        id: u64,
+        date: Date,
+        result: Result<Vec<FetchedEvent>, CalendarError>,
+        reply: oneshot::Sender<EventsReply>,
+    ) {
+        let answer = if id != self.events_query_issued || date != self.day.date() {
+            tracing::debug!(id, latest = self.events_query_issued, %date, "stale events dropped");
+            Err(QueryError::Stale)
+        } else {
+            match result {
+                Ok(events) => {
+                    tracing::debug!(id, count = events.len(), "calendar events listed");
+                    Ok(calendar_events(&self.day, events))
+                }
+                Err(e) => {
+                    tracing::warn!(id, kind = error_kind(&e), "calendar events query failed");
+                    Err(QueryError::Calendar(e.kind))
+                }
+            }
+        };
+        // The asker may have gone away; nothing to do then.
+        let _ = reply.send(answer);
+    }
+
+    /// Starts adding one event to today (R4) off the actor (AD-17): fetches it
+    /// with `events.get` in today's window and posts the result back as
+    /// [`Inbox::EventAdded`] for today's date. Touches no state here. Logs the
+    /// date only (AD-14).
+    fn add_calendar_event(&mut self, calendar_id: String, event_id: String) {
+        let date = self.day.date();
+        let Some((from, to)) = day_window(date, &self.tz) else {
+            tracing::warn!(%date, "no add window for the day");
+            return;
+        };
+        let calendar = self.calendar.clone();
+        let inbox = self.inbox.clone();
+        tracing::info!(%date, "calendar event add started");
+        tokio::spawn(async move {
+            let result = calendar.get_event(calendar_id, event_id, from, to).await;
+            // The engine may have stopped meanwhile; nothing to report to then.
+            if let Some(inbox) = inbox.upgrade() {
+                let _ = inbox.send(Inbox::EventAdded { date, result });
+            }
+        });
+    }
+
+    /// Applies an added event's fetch (R4), unless `date` is no longer today. A
+    /// timed event of today is added to a copy of today ([`add_event`]) and, when
+    /// that changes the plan, committed with a `CalendarChanged` entry in one
+    /// batch; a key already live changes nothing. A missing, skipped, or
+    /// cancelled event, a fetch failure, or a domain rejection sets `Sync`
+    /// ("Calendar event not added: ...") and changes nothing. Publishes on a
+    /// change. Logs kinds only (AD-14).
+    async fn event_added(
+        &mut self,
+        date: Date,
+        result: Result<Option<CalendarChange>, CalendarError>,
+    ) {
+        if date != self.day.date() {
+            tracing::debug!(%date, "stale event add dropped");
+            return;
+        }
+        let event = match result {
+            Ok(Some(CalendarChange::Upsert(event))) => event,
+            Ok(Some(CalendarChange::Cancelled(_))) => {
+                return self.add_failed("the event is cancelled");
+            }
+            Ok(None) => {
+                return self.add_failed("not found, all-day, declined, or not today");
+            }
+            Err(e) => {
+                tracing::warn!(kind = error_kind(&e), "calendar event fetch failed");
+                return self.add_failed(&e.message);
+            }
+        };
+        let now = self.clock.now();
+        let mut next = self.day.clone();
+        let ids = self.ids.clone();
+        let item_id = match add_event(&mut next, &event, || ids.new_item_id()) {
+            Ok(Some(item_id)) => item_id,
+            Ok(None) => {
+                tracing::debug!("calendar event already in the plan");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(kind = domain_kind(&e), "calendar event add rejected");
+                return self.add_failed(&e.to_string());
+            }
+        };
+        let mut batch = diff(&self.day, &next);
+        batch.push(commands::log_op(
+            date,
+            now,
+            DayLogKind::CalendarChanged { item_id },
+        ));
+        if self.swap_after_commit(next, self.work_end, batch).await {
+            tracing::info!(%item_id, "calendar event added");
+        }
+        self.publish();
+    }
+
+    /// Sets `Sync` for an add that changed nothing, and publishes.
+    fn add_failed(&mut self, reason: &str) {
+        self.status.insert(
+            StatusKey::Sync,
+            format!("Calendar event not added: {reason}"),
+        );
+        self.publish();
     }
 
     async fn find_crash(&self) -> Result<Option<Crash>, StoreError> {
@@ -888,6 +1101,13 @@ impl Actor {
             }
             EngineMsg::SetIncludedCalendars { calendar_ids } => {
                 self.set_included_calendars(&calendar_ids).await;
+                false
+            }
+            EngineMsg::AddCalendarEvent {
+                calendar_id,
+                event_id,
+            } => {
+                self.add_calendar_event(calendar_id, event_id);
                 false
             }
             msg => self.handle_plan(msg).await,
@@ -1315,10 +1535,13 @@ struct RoundFailures {
 
 /// One sync round (AD-17), run off the actor: lists the calendars (a failure
 /// fails the round), reconciles them with `stored`, then syncs each included
-/// calendar in table order, resuming from its token in `tokens` when it has one.
+/// calendar in table order, resuming from its token in `tokens` when it has one,
+/// and then re-fetches each of `day`'s live added events whose calendar is not
+/// included ([`added_refs`]).
 async fn sync_round(
     calendar: &dyn CalendarSource,
     stored: &[CalendarEntry],
+    day: &Day,
     tokens: &BTreeMap<String, String>,
     from: Timestamp,
     to: Timestamp,
@@ -1336,10 +1559,58 @@ async fn sync_round(
             result,
         });
     }
+    let mut added = Vec::new();
+    for (calendar_id, event_id) in added_refs(day, &calendars) {
+        let result = calendar
+            .get_event(calendar_id.clone(), event_id.clone(), from, to)
+            .await;
+        added.push(AddedOutcome {
+            calendar_id,
+            event_id,
+            result,
+        });
+    }
     Ok(SyncRound {
         calendars,
         outcomes,
+        added,
     })
+}
+
+/// Whether `change` is of event `event_id` of calendar `calendar_id`.
+fn names(change: &CalendarChange, calendar_id: &str, event_id: &str) -> bool {
+    let (c, e) = match change {
+        CalendarChange::Upsert(ev) => (&ev.calendar_id, &ev.source_id),
+        CalendarChange::Cancelled(key) => (&key.calendar_id, &key.source_id),
+    };
+    c == calendar_id && e == event_id
+}
+
+/// The picker's view of `events` against `day` (R4): sorted by start (ties
+/// keep Google's order), each marked whether the plan has it.
+fn calendar_events(day: &Day, mut events: Vec<FetchedEvent>) -> Vec<CalendarEvent> {
+    events.sort_by_key(|e| e.start);
+    events
+        .into_iter()
+        .map(|e| {
+            let in_plan = in_plan(
+                day,
+                &EventKey {
+                    calendar_id: e.calendar_id.clone(),
+                    source_id: e.source_id.clone(),
+                    instance_start: e.instance_start,
+                },
+            );
+            CalendarEvent {
+                calendar_id: e.calendar_id,
+                event_id: e.source_id,
+                title: e.title,
+                start: e.start,
+                end: e.end,
+                in_plan,
+            }
+        })
+        .collect()
 }
 
 /// The store ops that turn the cursors `before` into `after`: a put for each new

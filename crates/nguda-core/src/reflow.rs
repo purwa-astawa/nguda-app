@@ -11,7 +11,8 @@
 //!   split: first the flexible items on the interrupt stack, top first (the order
 //!   [`crate::next_task()`] resumes them in), then the others in order-key order;
 //!   stacked fixed items stay at their pin;
-//! - carried-over items have no span and come last; removed items are left out.
+//! - carried-over items have no span and come last; removed items, and pending
+//!   items the user excluded, are left out.
 
 use std::time::Duration;
 
@@ -119,7 +120,10 @@ fn slot(item: &PlanItem, kind: SlotKind, span: Option<Span>) -> Slot {
 /// the same schedule.
 pub fn reflow(day: &Day, now: Timestamp) -> Schedule {
     let live = |s: ItemStatus| day.items().iter().filter(move |i| i.status() == s);
-    let open = |i: &&PlanItem| matches!(i.status(), ItemStatus::Pending | ItemStatus::Paused);
+    // Excluded items stay in the plan but out of the schedule.
+    let open = |i: &&PlanItem| {
+        matches!(i.status(), ItemStatus::Pending | ItemStatus::Paused) && !i.excluded()
+    };
 
     // Build order, which also breaks ties of the sort below: done, running, fixed
     // by pin, flexible by order key.
@@ -488,6 +492,32 @@ mod tests {
         assert_eq!(span(&s, 5), Some((300, 400)));
         assert_eq!(span(&s, 4), Some((5_000, 5_100)), "fixed stays at its pin");
         assert_eq!(order(&s), vec![id(3), id(2), id(1), id(5), id(4)]);
+    }
+
+    #[test]
+    fn excluded_items_are_left_out_of_every_slot_next_and_overflow() {
+        let source = crate::plan::CalendarRef {
+            calendar_id: "cal".into(),
+            source_id: "ev".into(),
+            instance_start: None,
+            source_secs: 600,
+        };
+        let excluded = |r: PlanItemRecord| PlanItemRecord {
+            source: Some(source.clone()),
+            excluded: true,
+            ..r
+        };
+        let d = day(vec![
+            excluded(fixed(1, 0, 600)),
+            excluded(flexible(2, 600, "a")),
+            flexible(3, 600, "b"),
+        ]);
+        let s = reflow(&d, ts(0));
+        assert_eq!(order(&s), vec![id(3)]);
+        assert_eq!(span(&s, 3), Some((0, 600)), "nothing reserved for excluded");
+        assert_eq!(s.next(), Some(id(3)));
+        assert!(s.overflow(ts(0)) == vec![id(3)]);
+        assert_eq!(crate::next_task::next_task(&d, ts(0)), Some(id(3)));
     }
 
     #[test]

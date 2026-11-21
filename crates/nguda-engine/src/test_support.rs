@@ -385,6 +385,8 @@ fn record_of(item: &PlanItem) -> PlanItemRecord {
         source: item.source().cloned(),
         removed_by_source_at: item.removed_by_source_at(),
         hidden_at: item.hidden_at(),
+        excluded: item.excluded(),
+        added: item.added(),
     }
 }
 
@@ -644,6 +646,13 @@ impl FileSink for FakeFileSink {
 pub(crate) const CALENDAR: &str = "me@example.com";
 
 type FetchReply = oneshot::Sender<Result<SyncBatch, CalendarError>>;
+type ListReply = oneshot::Sender<Result<Vec<FetchedEvent>, CalendarError>>;
+type GetReply = oneshot::Sender<Result<Option<CalendarChange>, CalendarError>>;
+/// What one `list_events` call was given: the calendar id and the window.
+pub(crate) type ListCall = (String, (Timestamp, Timestamp));
+/// What one `get_event` call was given: the calendar id, the event id, and the
+/// window.
+pub(crate) type GetCall = (String, String, (Timestamp, Timestamp));
 type SignInReply = oneshot::Sender<Result<(), CalendarError>>;
 /// What one sync call was given: the calendar id, the sync token (`None` for a
 /// full fetch), and the window.
@@ -666,6 +675,8 @@ pub(crate) fn primary_info() -> CalendarInfo {
 /// primary calendar [`CALENDAR`]).
 pub(crate) struct FakeCalendar {
     fetches: Mutex<Vec<PendingFetch>>,
+    lists_of_events: Mutex<Vec<(ListCall, Option<ListReply>)>>,
+    gets: Mutex<Vec<(GetCall, Option<GetReply>)>>,
     sign_ins: Mutex<Vec<Option<SignInReply>>>,
     listing: Mutex<Result<Vec<CalendarInfo>, CalendarError>>,
     lists: AtomicU64,
@@ -675,6 +686,8 @@ impl Default for FakeCalendar {
     fn default() -> Self {
         Self {
             fetches: Mutex::default(),
+            lists_of_events: Mutex::default(),
+            gets: Mutex::default(),
             sign_ins: Mutex::default(),
             listing: Mutex::new(Ok(vec![primary_info()])),
             lists: AtomicU64::new(0),
@@ -749,6 +762,52 @@ impl FakeCalendar {
         );
     }
 
+    /// How many `list_events` calls were made.
+    pub(crate) fn list_events_count(&self) -> usize {
+        self.lists_of_events.lock().unwrap().len()
+    }
+
+    /// What `list_events` call `n` (0-based) was given.
+    pub(crate) fn list_events_call(&self, n: usize) -> ListCall {
+        self.lists_of_events.lock().unwrap()[n].0.clone()
+    }
+
+    /// Answers `list_events` call `n` (0-based) with `result`.
+    pub(crate) fn resolve_list_events(
+        &self,
+        n: usize,
+        result: Result<Vec<FetchedEvent>, CalendarError>,
+    ) {
+        let reply = self.lists_of_events.lock().unwrap()[n]
+            .1
+            .take()
+            .expect("list already resolved");
+        let _ = reply.send(result);
+    }
+
+    /// How many `get_event` calls were made.
+    pub(crate) fn get_count(&self) -> usize {
+        self.gets.lock().unwrap().len()
+    }
+
+    /// What `get_event` call `n` (0-based) was given.
+    pub(crate) fn get_call(&self, n: usize) -> GetCall {
+        self.gets.lock().unwrap()[n].0.clone()
+    }
+
+    /// Answers `get_event` call `n` (0-based) with `result`.
+    pub(crate) fn resolve_get(
+        &self,
+        n: usize,
+        result: Result<Option<CalendarChange>, CalendarError>,
+    ) {
+        let reply = self.gets.lock().unwrap()[n]
+            .1
+            .take()
+            .expect("get already resolved");
+        let _ = reply.send(result);
+    }
+
     /// Answers sign-in `n` (0-based) with `result`.
     pub(crate) fn resolve_sign_in(&self, n: usize, result: Result<(), CalendarError>) {
         let reply = self.sign_ins.lock().unwrap()[n]
@@ -787,6 +846,35 @@ impl CalendarSource for FakeCalendar {
             .lock()
             .unwrap()
             .push(((calendar_id, token, (window_start, window_end)), Some(tx)));
+        Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
+    }
+
+    fn list_events(
+        &self,
+        calendar_id: String,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> CalendarFuture<Vec<FetchedEvent>> {
+        let (tx, rx) = oneshot::channel();
+        self.lists_of_events
+            .lock()
+            .unwrap()
+            .push(((calendar_id, (window_start, window_end)), Some(tx)));
+        Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
+    }
+
+    fn get_event(
+        &self,
+        calendar_id: String,
+        event_id: String,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> CalendarFuture<Option<CalendarChange>> {
+        let (tx, rx) = oneshot::channel();
+        self.gets.lock().unwrap().push((
+            (calendar_id, event_id, (window_start, window_end)),
+            Some(tx),
+        ));
         Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
     }
 }

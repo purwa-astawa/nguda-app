@@ -3717,6 +3717,8 @@ fn imported_item(
         }),
         removed_by_source_at: None,
         hidden_at: None,
+        excluded: false,
+        added: false,
     })
     .unwrap()
 }
@@ -4428,6 +4430,8 @@ fn other_item(
         source: Some(source),
         removed_by_source_at: None,
         hidden_at: None,
+        excluded: false,
+        added: false,
     })
     .unwrap()
 }
@@ -4846,6 +4850,7 @@ fn deliver_round(h: &Harness, id: u64, date: Date, outcomes: Vec<crate::Calendar
     let round = crate::SyncRound {
         calendars: vec![entry(CAL, true, true), entry(OTHER, false, true)],
         outcomes,
+        added: Vec::new(),
     };
     h.engine
         .tx
@@ -4931,4 +4936,621 @@ async fn a_delivered_round_for_a_rolled_over_date_changes_nothing() {
         batches + 1,
         "only the work-end change"
     );
+}
+
+// --- Single events: exclude, include, the picker query, add, and refresh (R4) ---
+
+/// `item` with its `excluded` and `added` flags set as given.
+fn flagged(item: PlanItem, excluded: bool, added: bool) -> PlanItem {
+    PlanItem::restore(PlanItemRecord {
+        id: item.id(),
+        title: item.title().to_owned(),
+        planned_secs: item.planned_secs(),
+        order: item.order().clone(),
+        fixed: item.fixed(),
+        pinned_start: item.pinned_start(),
+        status: item.status(),
+        removed_at: item.removed_at(),
+        segments: item.segments().to_vec(),
+        carried_from: item.carried_from(),
+        tags: item.tags().to_vec(),
+        source: item.source().cloned(),
+        removed_by_source_at: item.removed_by_source_at(),
+        hidden_at: item.hidden_at(),
+        excluded,
+        added,
+    })
+    .unwrap()
+}
+
+fn exclude(n: u128, expected_rev: u64) -> EngineMsg {
+    EngineMsg::ExcludeEvent {
+        item_id: id(n),
+        expected_rev,
+    }
+}
+
+fn include(n: u128, expected_rev: u64) -> EngineMsg {
+    EngineMsg::IncludeEvent {
+        item_id: id(n),
+        expected_rev,
+    }
+}
+
+fn add_msg(calendar_id: &str, event_id: &str) -> EngineMsg {
+    EngineMsg::AddCalendarEvent {
+        calendar_id: calendar_id.into(),
+        event_id: event_id.into(),
+    }
+}
+
+/// An event of [`OTHER`] titled `title`.
+fn other_event(source_id: &str, title: &str, start: i64, end: i64) -> FetchedEvent {
+    FetchedEvent {
+        calendar_id: OTHER.into(),
+        ..event(source_id, title, start, end)
+    }
+}
+
+/// Today, undecided, with imported event "a" (item 1, pending at 9_000) and
+/// local item 2.
+fn excludable_day() -> Day {
+    let mut day = Day::new(day1(), "UTC");
+    day.add(imported_item(
+        1,
+        "a",
+        9_000,
+        900,
+        &[],
+        vec![],
+        ItemStatus::Pending,
+    ))
+    .unwrap();
+    day.add(item(2, "local", "W")).unwrap();
+    day
+}
+
+impl Harness {
+    async fn gets(&self, n: usize) {
+        let calendar = self.calendar.clone();
+        self.until(|| calendar.get_count() >= n).await;
+    }
+
+    async fn event_lists(&self, n: usize) {
+        let calendar = self.calendar.clone();
+        self.until(|| calendar.list_events_count() >= n).await;
+    }
+
+    /// Spawns a picker query of `calendar_id` on `date`.
+    fn query_events(
+        &self,
+        calendar_id: &str,
+        date: Date,
+    ) -> tokio::task::JoinHandle<Result<Vec<crate::CalendarEvent>, QueryError>> {
+        let engine = self.engine.clone();
+        let calendar_id = calendar_id.to_owned();
+        tokio::spawn(async move { engine.query_calendar_events(calendar_id, date).await })
+    }
+}
+
+#[tokio::test]
+async fn exclude_keeps_the_item_pending_but_out_of_the_schedule_and_next_item() {
+    let (mut h, store) = syncing_on(1_000, Some(&excludable_day()), None).await;
+    let before = h.rx.borrow().clone();
+    assert_eq!(before.next_item.as_ref().map(|n| n.item_id), Some(id(2)));
+    assert!(before.schedule.slot(id(1)).is_some());
+    let batches = store.batches().len();
+    h.send(exclude(1, 1));
+    let snap = h.rev(2).await;
+    let e = day_of(&snap).item(id(1)).unwrap();
+    assert!(e.excluded());
+    assert_eq!(e.status(), ItemStatus::Pending);
+    assert!(snap.schedule.slot(id(1)).is_none(), "no slot");
+    assert_eq!(snap.next_item.as_ref().map(|n| n.item_id), Some(id(2)));
+    assert_eq!(store.batches().len(), batches + 1, "one commit");
+    assert!(
+        store
+            .stored_day(day1())
+            .unwrap()
+            .item(id(1))
+            .unwrap()
+            .excluded()
+    );
+    assert_eq!(
+        store.day_log(day1()).last().unwrap().kind,
+        DayLogKind::Excluded { item_id: id(1) }
+    );
+    assert_eq!(rejected(&snap), None);
+}
+
+#[tokio::test]
+async fn a_day_locked_after_an_exclude_has_no_baseline_row_for_it() {
+    let (mut h, store) = syncing_on(1_000, Some(&excludable_day()), None).await;
+    h.send(exclude(1, 1));
+    h.rev(2).await;
+    h.send(EngineMsg::LockDay { expected_rev: 2 });
+    let snap = h.rev(3).await;
+    assert_eq!(day_of(&snap).lock_decision(), LockDecision::Locked);
+    let baseline = store.stored_baseline(day1()).unwrap();
+    let rows: Vec<ItemId> = baseline.items.iter().map(|b| b.item_id).collect();
+    assert_eq!(rows, vec![id(2)]);
+}
+
+#[tokio::test]
+async fn an_excluded_item_keeps_its_flag_through_a_resync_and_a_restart() {
+    let (mut h, store) = syncing_on(1_000, Some(&excludable_day()), None).await;
+    h.send(exclude(1, 1));
+    h.rev(2).await;
+    h.calendar.resolve_fetch(
+        0,
+        sync(vec![upsert("a", "Renamed", 9_000, 9_900)], Some("t1")),
+    );
+    let snap = h.rev(3).await;
+    let e = day_of(&snap).item(id(1)).unwrap();
+    assert!(e.excluded());
+    assert_eq!(e.title(), "Renamed");
+    assert!(snap.schedule.slot(id(1)).is_none());
+    drop(h);
+
+    let clock = FakeClock::at(1_100);
+    let mut h = start(&clock, &store);
+    let snap = h.rev(1).await;
+    let e = day_of(&snap).item(id(1)).unwrap();
+    assert!(e.excluded(), "still excluded after a restart");
+    assert_eq!(e.title(), "Renamed");
+    assert!(snap.schedule.slot(id(1)).is_none());
+}
+
+#[tokio::test]
+async fn include_takes_an_excluded_item_back_into_the_schedule() {
+    let (mut h, store) = syncing_on(1_000, Some(&excludable_day()), None).await;
+    h.send(exclude(1, 1));
+    h.rev(2).await;
+    h.send(include(1, 2));
+    let snap = h.rev(3).await;
+    assert!(!day_of(&snap).item(id(1)).unwrap().excluded());
+    assert!(snap.schedule.slot(id(1)).is_some());
+    assert!(
+        !store
+            .stored_day(day1())
+            .unwrap()
+            .item(id(1))
+            .unwrap()
+            .excluded()
+    );
+    assert_eq!(
+        store.day_log(day1()).last().unwrap().kind,
+        DayLogKind::Included { item_id: id(1) }
+    );
+}
+
+#[tokio::test]
+async fn bad_excludes_and_includes_are_rejected() {
+    let mut day = no_lock(excludable_day());
+    day.add(imported_item(
+        3,
+        "c",
+        12_000,
+        900,
+        &[],
+        vec![],
+        ItemStatus::Pending,
+    ))
+    .unwrap();
+    day.add(imported_item(
+        4,
+        "d",
+        15_000,
+        900,
+        &[],
+        vec![closed(100, 200)],
+        ItemStatus::Pending,
+    ))
+    .unwrap();
+    let (mut h, store) = syncing_on(1_000, Some(&day), None).await;
+    h.send(start_msg(3, 1));
+    h.rev(2).await;
+    let snap = expect_rejected(&mut h, &store, exclude(1, 1), 3).await;
+    assert!(rejected(&snap).unwrap().contains("stale rev"));
+    expect_rejected(&mut h, &store, exclude(2, 3), 4).await;
+    expect_rejected(&mut h, &store, exclude(3, 4), 5).await;
+    expect_rejected(&mut h, &store, exclude(4, 5), 6).await;
+    expect_rejected(&mut h, &store, include(1, 6), 7).await;
+    expect_rejected(&mut h, &store, exclude(99, 7), 8).await;
+}
+
+#[tokio::test]
+async fn the_picker_query_lists_todays_events_sorted_with_in_plan() {
+    let mut day = no_lock(Day::new(day1(), "UTC"));
+    day.add(other_item(100, "o2", 20_000, vec![], ItemStatus::Pending))
+        .unwrap();
+    day.add(other_item(101, "o3", 30_000, vec![], ItemStatus::Pending))
+        .unwrap();
+    day.remove(id(101), ts(500)).unwrap();
+    let (h, store) = syncing_on(1_000, Some(&day), None).await;
+    let (rev, batches) = (h.rx.borrow().rev, store.batches().len());
+    let q = h.query_events(OTHER, day1());
+    h.event_lists(1).await;
+    assert_eq!(
+        h.calendar.list_events_call(0),
+        (OTHER.to_owned(), (ts(0), ts(DAY_SECS)))
+    );
+    h.calendar.resolve_list_events(
+        0,
+        Ok(vec![
+            other_event("o3", "Late", 30_000, 31_800),
+            other_event("o1", "Early", 10_000, 11_800),
+            other_event("o2", "Mid", 20_000, 21_800),
+        ]),
+    );
+    let got = q.await.unwrap().unwrap();
+    let rows: Vec<(&str, &str, i64, bool)> = got
+        .iter()
+        .map(|e| {
+            (
+                e.event_id.as_str(),
+                e.title.as_str(),
+                e.start.as_second(),
+                e.in_plan,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("o1", "Early", 10_000, false),
+            ("o2", "Mid", 20_000, true),
+            ("o3", "Late", 30_000, false),
+        ]
+    );
+    assert!(got.iter().all(|e| e.calendar_id == OTHER));
+    assert_eq!(got[0].end, ts(11_800));
+
+    let q = h.query_events(OTHER, day1());
+    h.event_lists(2).await;
+    h.calendar
+        .resolve_list_events(1, Err(cal_err(CalendarErrorKind::RateLimited, "HTTP 429")));
+    assert_eq!(
+        q.await.unwrap(),
+        Err(QueryError::Calendar(CalendarErrorKind::RateLimited))
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(h.rx.borrow().rev, rev, "read-only: no publish");
+    assert_eq!(store.batches().len(), batches, "read-only: no commit");
+    assert_eq!(sync_status(&h.rx.borrow()), None);
+}
+
+#[tokio::test]
+async fn a_superseded_or_other_day_query_is_answered_stale() {
+    let (h, _store) = syncing_on(1_000, None, None).await;
+    let a = h.query_events(OTHER, day1());
+    h.event_lists(1).await;
+    let b = h.query_events(OTHER, day1());
+    h.event_lists(2).await;
+    h.calendar
+        .resolve_list_events(0, Ok(vec![other_event("o1", "A", 10_000, 11_800)]));
+    assert_eq!(a.await.unwrap(), Err(QueryError::Stale));
+    h.calendar
+        .resolve_list_events(1, Ok(vec![other_event("o1", "B", 10_000, 11_800)]));
+    let got = b.await.unwrap().unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].title, "B");
+
+    let other_day = h.query_events(OTHER, day2());
+    assert_eq!(other_day.await.unwrap(), Err(QueryError::Stale));
+    assert_eq!(
+        h.calendar.list_events_count(),
+        2,
+        "no listing for another day"
+    );
+}
+
+#[tokio::test]
+async fn a_query_whose_day_rolled_over_is_answered_stale() {
+    let (mut h, _store) = syncing_on(MIDNIGHT - 60, None, None).await;
+    let q = h.query_events(OTHER, day1());
+    h.event_lists(1).await;
+    h.clock.set(MIDNIGHT + 10);
+    let snap = h.rev(2).await;
+    assert_eq!(day_of(&snap).date(), day2());
+    h.calendar
+        .resolve_list_events(0, Ok(vec![other_event("o1", "A", 10_000, 11_800)]));
+    assert_eq!(q.await.unwrap(), Err(QueryError::Stale));
+}
+
+#[tokio::test]
+async fn add_imports_the_event_as_a_fixed_added_item_in_one_batch() {
+    let (mut h, store) = syncing_on(1_000, None, None).await;
+    h.send(add_msg(OTHER, "o1"));
+    h.gets(1).await;
+    assert_eq!(
+        h.calendar.get_call(0),
+        (OTHER.to_owned(), "o1".to_owned(), (ts(0), ts(DAY_SECS)))
+    );
+    let batches = store.batches().len();
+    h.calendar.resolve_get(
+        0,
+        Ok(Some(CalendarChange::Upsert(other_event(
+            "o1", "Review", 20_000, 21_800,
+        )))),
+    );
+    let snap = h.rev(2).await;
+    let item = imported(&snap, "o1");
+    assert!(item.added() && item.fixed() && !item.excluded());
+    assert_eq!(item.pinned_start(), Some(ts(20_000)));
+    assert_eq!(item.planned_secs(), 1_800);
+    assert_eq!(item.status(), ItemStatus::Pending);
+    assert_eq!(item.source().unwrap().calendar_id, OTHER);
+    assert_eq!(store.batches().len(), batches + 1, "one batch");
+    assert_eq!(calendar_changed(&store, day1()), vec![item.id()]);
+    assert!(
+        store
+            .stored_day(day1())
+            .unwrap()
+            .item(item.id())
+            .unwrap()
+            .added()
+    );
+}
+
+#[tokio::test]
+async fn an_add_that_finds_nothing_or_fails_sets_sync_and_changes_nothing() {
+    let (mut h, store) = syncing_on(1_000, None, None).await;
+    let batches = store.batches().len();
+    h.send(add_msg(OTHER, "gone"));
+    h.gets(1).await;
+    h.calendar.resolve_get(0, Ok(None));
+    let snap = h.rev(2).await;
+    assert!(day_of(&snap).items().is_empty());
+    assert!(
+        sync_status(&snap)
+            .unwrap()
+            .starts_with("Calendar event not added:")
+    );
+    h.send(add_msg(OTHER, "o1"));
+    h.gets(2).await;
+    h.calendar
+        .resolve_get(1, Err(cal_err(CalendarErrorKind::Other, "HTTP 500")));
+    let snap = h.rev(3).await;
+    assert!(day_of(&snap).items().is_empty());
+    assert_eq!(
+        sync_status(&snap),
+        Some("Calendar event not added: HTTP 500")
+    );
+    assert_eq!(store.batches().len(), batches, "no commit");
+}
+
+#[tokio::test]
+async fn adding_a_live_event_changes_nothing_and_a_removed_one_is_revived() {
+    let mut day = no_lock(Day::new(day1(), "UTC"));
+    day.add(other_item(100, "o1", 20_000, vec![], ItemStatus::Pending))
+        .unwrap();
+    day.add(other_item(101, "o2", 22_000, vec![], ItemStatus::Pending))
+        .unwrap();
+    day.remove(id(101), ts(500)).unwrap();
+    day.add(other_item(102, "o3", 24_000, vec![], ItemStatus::Pending))
+        .unwrap();
+    nguda_core::hide_calendar(&mut day, OTHER, ts(600)).unwrap();
+    // Hiding took 100 too; bring it back as a live item of the plan.
+    let mut live = Day::new(day1(), "UTC");
+    for i in day.items() {
+        let i = if i.id() == id(100) {
+            other_item(100, "o1", 20_000, vec![], ItemStatus::Pending)
+        } else {
+            i.clone()
+        };
+        live.add(i).unwrap();
+    }
+    let day = no_lock(live);
+    let (mut h, store) = syncing_on(1_000, Some(&day), None).await;
+
+    h.send(add_msg(OTHER, "o1"));
+    h.gets(1).await;
+    h.calendar.resolve_get(
+        0,
+        Ok(Some(CalendarChange::Upsert(other_event(
+            "o1", "Moved", 26_000, 26_900,
+        )))),
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    let snap = h.rev(2).await;
+    assert_eq!(day_of(&snap).item(id(100)), day.item(id(100)), "unchanged");
+
+    for (n, (source_id, rev)) in [("o2", 3), ("o3", 4)].into_iter().enumerate() {
+        h.send(add_msg(OTHER, source_id));
+        h.gets(n + 2).await;
+        h.calendar.resolve_get(
+            n + 1,
+            Ok(Some(CalendarChange::Upsert(other_event(
+                source_id, "Back", 28_000, 28_900,
+            )))),
+        );
+        let snap = h.rev(rev).await;
+        let i = imported(&snap, source_id);
+        assert_eq!(i.status(), ItemStatus::Pending, "{source_id}");
+        assert!(i.added());
+        assert_eq!(i.hidden_at(), None);
+        assert_eq!(i.title(), "Back");
+        assert_eq!(i.pinned_start(), Some(ts(28_000)));
+        assert_eq!(i.tags(), ["meet".to_owned()]);
+    }
+    assert_eq!(calendar_changed(&store, day1()), vec![id(101), id(102)]);
+}
+
+#[tokio::test]
+async fn an_add_result_after_a_rollover_is_dropped() {
+    let (mut h, store) = syncing_on(MIDNIGHT - 60, None, None).await;
+    h.send(add_msg(OTHER, "o1"));
+    h.gets(1).await;
+    h.clock.set(MIDNIGHT + 10);
+    let snap = h.rev(2).await;
+    assert_eq!(day_of(&snap).date(), day2());
+    h.calendar.resolve_get(
+        0,
+        Ok(Some(CalendarChange::Upsert(other_event(
+            "o1", "Late", 1_000, 1_900,
+        )))),
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    let snap = h.rev(3).await;
+    assert!(day_of(&snap).items().is_empty());
+    assert!(
+        store
+            .stored_day(day1())
+            .is_none_or(|d| d.items().is_empty())
+    );
+    assert_eq!(sync_status(&snap), None);
+}
+
+/// Today with item 100, event "o1" of the non-included [`OTHER`], added on its
+/// own, with `segments`.
+fn added_day(segments: Vec<Segment>) -> Day {
+    let mut day = no_lock(Day::new(day1(), "UTC"));
+    day.add(flagged(
+        other_item(100, "o1", 20_000, segments, ItemStatus::Pending),
+        false,
+        true,
+    ))
+    .unwrap();
+    day
+}
+
+#[tokio::test]
+async fn a_round_refreshes_an_added_event_with_get_event_and_it_survives_a_restart() {
+    let (mut h, store) = syncing_on(1_000, Some(&added_day(vec![])), None).await;
+    let batches = store.batches().len();
+    h.calendar.resolve_fetch(0, sync(vec![], Some("t1")));
+    h.gets(1).await;
+    assert_eq!(
+        h.calendar.get_call(0),
+        (OTHER.to_owned(), "o1".to_owned(), (ts(0), ts(DAY_SECS)))
+    );
+    h.calendar.resolve_get(
+        0,
+        Ok(Some(CalendarChange::Upsert(other_event(
+            "o1", "Moved", 25_000, 25_900,
+        )))),
+    );
+    let snap = h.rev(2).await;
+    let i = day_of(&snap).item(id(100)).unwrap();
+    assert_eq!(i.title(), "Moved");
+    assert_eq!(i.pinned_start(), Some(ts(25_000)));
+    assert!(i.added());
+    assert_eq!(store.batches().len(), batches + 1, "one round batch");
+    assert_eq!(calendar_changed(&store, day1()), vec![id(100)]);
+    assert_eq!(store.stored_cursors(), vec![cursor("t1", day1())]);
+    assert_eq!(sync_status(&snap), None);
+    drop(h);
+
+    let clock = FakeClock::at(1_100);
+    let mut h = start(&clock, &store);
+    let snap = h.rev(1).await;
+    let i = day_of(&snap).item(id(100)).unwrap();
+    assert_eq!(i.title(), "Moved");
+    assert!(i.added());
+    h.fetches(1).await;
+    h.calendar.resolve_fetch(0, sync(vec![], Some("t2")));
+    h.gets(1).await;
+    assert_eq!(h.calendar.get_call(0).1, "o1", "refreshed again");
+}
+
+#[tokio::test]
+async fn an_added_event_of_an_included_calendar_is_not_fetched_on_its_own() {
+    let (h, _store) = selecting_on(
+        1_000,
+        Some(&added_day(vec![])),
+        vec![entry(CAL, true, true), entry(OTHER, false, true)],
+        vec![],
+        both_listed(),
+    )
+    .await;
+    h.calendar.resolve_fetch(0, sync(vec![], None));
+    h.fetches(2).await;
+    h.calendar.resolve_fetch(1, sync_of(OTHER, vec![], None));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(h.calendar.get_count(), 0);
+}
+
+#[tokio::test]
+async fn a_rate_limited_refresh_backs_off_and_another_failure_sets_sync() {
+    let (mut h, store) = syncing_on(1_000, Some(&added_day(vec![])), None).await;
+    h.calendar.resolve_fetch(0, sync(vec![], Some("t1")));
+    h.gets(1).await;
+    h.calendar
+        .resolve_get(0, Err(cal_err(CalendarErrorKind::RateLimited, "HTTP 429")));
+    let snap = h.rev(2).await;
+    assert_eq!(
+        sync_status(&snap),
+        Some("Google is limiting requests; syncing again later")
+    );
+    // Still applied: the primary's cursor.
+    assert_eq!(store.stored_cursors(), vec![cursor("t1", day1())]);
+    assert_eq!(day_of(&snap).item(id(100)), added_day(vec![]).item(id(100)));
+    // The backed-off poll: 2 × 300 s.
+    h.tick_to(1_000 + 599).await;
+    assert_eq!(h.calendar.fetch_count(), 1, "not before the backoff");
+    h.tick_to(1_000 + 600).await;
+    h.fetches(2).await;
+    h.calendar.resolve_fetch(1, sync(vec![], Some("t1")));
+    h.gets(2).await;
+    h.calendar
+        .resolve_get(1, Err(cal_err(CalendarErrorKind::Other, "HTTP 500")));
+    let snap = h.rev(3).await;
+    assert_eq!(sync_status(&snap), Some("Calendar import failed: HTTP 500"));
+}
+
+#[tokio::test]
+async fn a_cancelled_added_event_is_tombstoned_by_source_keeping_its_segments() {
+    let (mut h, _store) = syncing_on(1_000, Some(&added_day(vec![closed(100, 200)])), None).await;
+    h.calendar.resolve_fetch(0, sync(vec![], Some("t1")));
+    h.gets(1).await;
+    h.calendar.resolve_get(
+        0,
+        Ok(Some(CalendarChange::Cancelled(EventKey {
+            calendar_id: OTHER.into(),
+            source_id: "o1".into(),
+            instance_start: None,
+        }))),
+    );
+    let snap = h.rev(2).await;
+    let i = day_of(&snap).item(id(100)).unwrap();
+    assert_eq!(i.status(), ItemStatus::Removed);
+    assert!(i.removed_by_source_at().is_some());
+    assert_eq!(i.segments(), &[closed(100, 200)]);
+    assert!(i.added());
+}
+
+#[tokio::test]
+async fn a_refresh_that_finds_nothing_changes_nothing() {
+    let (mut h, store) = syncing_on(1_000, Some(&added_day(vec![])), None).await;
+    h.calendar.resolve_fetch(0, sync(vec![], Some("t1")));
+    h.gets(1).await;
+    h.calendar.resolve_get(0, Ok(None));
+    let snap = h.rev(2).await;
+    assert_eq!(day_of(&snap).item(id(100)), added_day(vec![]).item(id(100)));
+    assert!(calendar_changed(&store, day1()).is_empty());
+    assert_eq!(sync_status(&snap), None);
+}
+
+#[tokio::test]
+async fn unticking_a_calendar_never_hides_an_added_event() {
+    let mut day = added_day(vec![]);
+    day.add(other_item(101, "o2", 22_000, vec![], ItemStatus::Pending))
+        .unwrap();
+    let (mut h, _store) = selecting_on(
+        1_000,
+        Some(&day),
+        vec![entry(CAL, true, true), entry(OTHER, false, true)],
+        vec![],
+        both_listed(),
+    )
+    .await;
+    h.send(select(&[CAL]));
+    let snap = h.rev(2).await;
+    let today = day_of(&snap);
+    assert_eq!(today.item(id(100)).unwrap().status(), ItemStatus::Pending);
+    assert_eq!(today.item(id(101)).unwrap().status(), ItemStatus::Removed);
+    assert!(today.item(id(101)).unwrap().hidden_at().is_some());
 }

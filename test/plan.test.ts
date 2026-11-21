@@ -2,6 +2,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  addCalendarEventCommand,
+  excludeEventCommand,
+  includeEventCommand,
+  pickerCalendars,
   googleSection,
   includeCalendarCommand,
   signInCommand,
@@ -49,6 +53,7 @@ function item(id: string, extra: Partial<Item> = {}): Item {
     interrupted: false,
     tags: [],
     imported: false,
+    excluded: false,
     ...extra,
   };
 }
@@ -453,4 +458,46 @@ test("toggling a calendar sends the full new included set in snapshot order", ()
     name: "setIncludedCalendars",
     args: [[]],
   });
+});
+
+test("the picker offers the non-included calendars only while signed in", () => {
+  const at = (google: Snapshot["google"]) => pickerCalendars({ ...snap(1), google, calendars });
+  assert.deepEqual(at("signedIn"), [calendars[1]]);
+  assert.deepEqual(at("signedOut"), []);
+  assert.deepEqual(at("unknown"), []);
+  assert.deepEqual(at("signingIn"), []);
+  assert.deepEqual(addCalendarEventCommand("team@group", "ev_1"), {
+    name: "addCalendarEvent",
+    args: ["team@group", "ev_1"],
+  });
+});
+
+test("exclude on imported pending rows without time; include on excluded rows", () => {
+  const E = item("E", { imported: true, fixed: true, pinnedStart: "2026-11-11T08:00:00Z" });
+  const X = item("X", { imported: true, excluded: true });
+  const s = snap(4, [E, A, X]);
+  assert.deepEqual(rowActions(s, E).exclude, { name: "excludeEvent", args: ["E", 4] });
+  assert.equal(rowActions(s, E).include, null);
+  assert.deepEqual(rowActions(s, X).include, { name: "includeEvent", args: ["X", 4] });
+  assert.equal(rowActions(s, X).exclude, null);
+  assert.equal(rowActions(s, X).start, null, "an excluded row cannot start");
+  assert.equal(rowActions(s, A).exclude, null, "a local item");
+  for (const extra of [
+    { status: "paused" as const },
+    { status: "running" as const },
+    { status: "done" as const },
+    { actualSecs: 60 },
+  ]) {
+    const i = { ...E, ...extra };
+    assert.equal(excludeEventCommand(snap(4, [i]), i), null, JSON.stringify(extra));
+  }
+  assert.equal(includeEventCommand(s, E), null);
+});
+
+test("excluded flexible items are never reorder or insert anchors", () => {
+  const X = item("X", { imported: true, excluded: true });
+  const s = snap(2, [A, X, B]);
+  assert.deepEqual(flexibleNeighbours(s.items, "A"), { prev: null, next: B });
+  assert.deepEqual(flexibleNeighbours(s.items, "X"), { prev: null, next: null });
+  assert.ok(!insertPositions(s).some((p) => p.anchor.itemId === "X"));
 });

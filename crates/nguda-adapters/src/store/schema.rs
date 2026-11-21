@@ -206,8 +206,19 @@ ALTER TABLE plan_item ADD COLUMN hidden_at INTEGER
     CHECK (hidden_at IS NULL OR (calendar_id IS NOT NULL AND status = 'removed'));
 "#;
 
+/// v13: two user-owned flags of an imported item (R4): `excluded`, the user left
+/// the event out of the day's schedule, and `added`, the user added the event on
+/// its own from a calendar that need not be included. Both require a source.
+const V13: &str = r#"
+ALTER TABLE plan_item ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0
+    CHECK (excluded IN (0, 1) AND (excluded = 0 OR calendar_id IS NOT NULL));
+
+ALTER TABLE plan_item ADD COLUMN added INTEGER NOT NULL DEFAULT 0
+    CHECK (added IN (0, 1) AND (added = 0 OR calendar_id IS NOT NULL));
+"#;
+
 /// Every migration's SQL, oldest first.
-const ALL: [&str; 12] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+const ALL: [&str; 13] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
 
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {

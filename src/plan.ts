@@ -48,7 +48,10 @@ export type Command =
   | { name: "setWorkEnd"; args: [minutes: number] }
   | { name: "carryOverToTomorrow"; args: [expectedRev: number] }
   | { name: "signIn"; args: [] }
-  | { name: "setIncludedCalendars"; args: [calendarIds: string[]] };
+  | { name: "setIncludedCalendars"; args: [calendarIds: string[]] }
+  | { name: "excludeEvent"; args: [itemId: string, expectedRev: number] }
+  | { name: "includeEvent"; args: [itemId: string, expectedRev: number] }
+  | { name: "addCalendarEvent"; args: [calendarId: string, eventId: string] };
 
 /** Where an inserted task goes, as `insertTask` takes it. Never a numeric index. */
 export type InsertAnchor = InsertAnchorArg_Serialize;
@@ -82,10 +85,12 @@ export function pinInstant(date: string, time: string): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-/** A pending or paused flexible item that is not interrupted: the only kind a
- * reorder or an insert can be placed next to. */
+/** A pending or paused flexible item that is neither interrupted nor excluded:
+ * the only kind a reorder or an insert can be placed next to. */
 function isFlexibleAnchor(i: Item): boolean {
-  return !i.fixed && !i.interrupted && (i.status === "pending" || i.status === "paused");
+  return (
+    !i.fixed && !i.interrupted && !i.excluded && (i.status === "pending" || i.status === "paused")
+  );
 }
 
 /** The pending or paused flexible items just before and after `id`, in the order
@@ -277,12 +282,16 @@ export type RowActions = {
   /** Finish this running item and move on to the next (rev-checked). */
   switch: Command | null;
   remove: Command | null;
+  /** Leave this imported event out of today's schedule (rev-checked). */
+  exclude: Command | null;
+  /** Take this excluded event back into the schedule (rev-checked). */
+  include: Command | null;
 };
 
 export function rowActions(snap: Snapshot, item: Item): RowActions {
   const { prev, next } = flexibleNeighbours(snap.items, item.id);
   const running = item.status === "running";
-  const startable = item.status === "pending" || item.status === "paused";
+  const startable = !item.excluded && (item.status === "pending" || item.status === "paused");
   return {
     up: prev && {
       name: "reorderTask",
@@ -299,7 +308,36 @@ export function rowActions(snap: Snapshot, item: Item): RowActions {
     pause: running ? { name: "pauseTask", args: [item.id] } : null,
     switch: running ? { name: "switchTask", args: [item.id, snap.rev] } : null,
     remove: running ? null : { name: "removeTask", args: [item.id] },
+    exclude: excludeEventCommand(snap, item),
+    include: includeEventCommand(snap, item),
   };
+}
+
+/** Leaves the imported `item` out of today's schedule at the rendered rev: only
+ * a pending imported item with no time recorded that is not excluded yet, else
+ * `null`. The engine checks again. */
+export function excludeEventCommand(snap: Snapshot, item: Item): Command | null {
+  const excludable =
+    item.imported && !item.excluded && item.status === "pending" && item.actualSecs === 0;
+  return excludable ? { name: "excludeEvent", args: [item.id, snap.rev] } : null;
+}
+
+/** Takes the excluded `item` back into the schedule at the rendered rev; `null`
+ * unless it is excluded. */
+export function includeEventCommand(snap: Snapshot, item: Item): Command | null {
+  return item.excluded ? { name: "includeEvent", args: [item.id, snap.rev] } : null;
+}
+
+/** Adds the single event `eventId` of calendar `calendarId` to today's plan. */
+export function addCalendarEventCommand(calendarId: string, eventId: string): Command {
+  return { name: "addCalendarEvent", args: [calendarId, eventId] };
+}
+
+/** The calendars the picker offers single events from: signed in only, those
+ * not included in the plan (an included one's events are imported already), in
+ * the snapshot's order. */
+export function pickerCalendars(snap: Snapshot): CalendarView[] {
+  return snap.google === "signedIn" ? snap.calendars.filter((c) => !c.included) : [];
 }
 
 /** A row's time: ticking elapsed for the running item, banked time otherwise. */
@@ -324,7 +362,10 @@ function zonedTime(iso: string, tz: string): string {
 
 /** A row's scheduled `HH:MM–HH:MM` in the day's zone, or `null` when the schedule
  * gives it no span. Only formats the engine's times; never computes them. */
-export function scheduleLabel(item: Item, tz: string): string | null {
+export function scheduleLabel(
+  item: Pick<Item, "scheduledStart" | "scheduledEnd">,
+  tz: string,
+): string | null {
   if (!item.scheduledStart || !item.scheduledEnd) return null;
   return `${zonedTime(item.scheduledStart, tz)}\u2013${zonedTime(item.scheduledEnd, tz)}`;
 }
