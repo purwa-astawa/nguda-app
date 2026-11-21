@@ -11,7 +11,11 @@
 //! (AD-15). CSV exports (AD-16) ask for a path through `tauri-plugin-dialog`
 //! from the `export_csv` command, the engine writes through the adapters'
 //! `FsFileSink`, and its `ExportDone` effect reaches the view as an
-//! `ExportDoneEvent`. On macOS the app runs as an accessory (no Dock icon) and the tray
+//! `ExportDoneEvent`. Google Calendar import (CAP-2) runs through the adapters'
+//! `GcalSource`, which keeps its refresh token in the OS keyring
+//! (`KeyringSecretStore`) and opens the system browser for sign-in through
+//! `tauri-plugin-opener`, called from Rust, so the webview needs no new
+//! capability. On macOS the app runs as an accessory (no Dock icon) and the tray
 //! title gets monospaced digits once, from `macos`.
 
 mod effects;
@@ -23,15 +27,20 @@ mod tray;
 use std::sync::Arc;
 
 use nguda_adapters::{
-    ActionCallback, FsFileSink, SqliteStore, SystemClock, SystemNotifier, UuidV7Ids,
+    ActionCallback, FsFileSink, GcalConfig, GcalSource, KeyringSecretStore, OpenUrl, SqliteStore,
+    SystemClock, SystemNotifier, UuidV7Ids,
 };
-use nguda_core::{Clock, Notifier, Store, TimeZone};
+use nguda_core::{CalendarSource, Clock, Notifier, SecretStore, Store, TimeZone};
 use nguda_engine::{EngineDeps, EngineHandle};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_opener::OpenerExt;
 use tauri_specta::Event;
 
 /// The database file, in the app data directory.
 const DB_FILE: &str = "nguda.sqlite3";
+
+/// The keyring service the app's secrets are stored under (AD-13).
+const KEYRING_SERVICE: &str = "nguda";
 
 pub use ipc::specta_builder;
 
@@ -46,6 +55,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             // A tray app: no Dock icon or app menu.
@@ -63,11 +73,18 @@ pub fn run() {
 
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let store: Arc<dyn Store> = Arc::new(open_store(app));
+            let secrets: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new(KEYRING_SERVICE));
+            let calendar: Arc<dyn CalendarSource> = Arc::new(GcalSource::new(
+                GcalConfig::google(),
+                secrets,
+                open_url(app.handle().clone()),
+            ));
             let deps = EngineDeps {
                 clock: clock.clone(),
                 store,
                 ids: Arc::new(UuidV7Ids),
                 files: Arc::new(FsFileSink),
+                calendar,
                 tz: system_time_zone(),
             };
             // `nguda_engine::spawn` uses `tokio::spawn`, so enter Tauri's runtime first.
@@ -120,6 +137,36 @@ pub fn run() {
             eprintln!("nguda: failed to start: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Opens a URL in the system browser, for the Google sign-in (AD-1: the gcal
+/// adapter only sees this callback). The error never echoes the URL.
+fn open_url(app: AppHandle) -> OpenUrl {
+    Arc::new(move |url: &str| {
+        app.opener()
+            .open_url(url, None::<&str>)
+            .map_err(|_| "could not open the browser".to_owned())
+    })
+}
+
+/// A calendar source that never answers, for shell tests that start a real
+/// engine: no import result ever bumps the rev under a test's feet.
+#[cfg(test)]
+pub(crate) struct IdleCalendar;
+
+#[cfg(test)]
+impl CalendarSource for IdleCalendar {
+    fn sign_in(&self) -> nguda_core::CalendarFuture<()> {
+        Box::pin(std::future::pending())
+    }
+
+    fn fetch_primary(
+        &self,
+        _window_start: nguda_core::Timestamp,
+        _window_end: nguda_core::Timestamp,
+    ) -> nguda_core::CalendarFuture<Vec<nguda_core::FetchedEvent>> {
+        Box::pin(std::future::pending())
     }
 }
 

@@ -3,8 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use nguda_core::{
-    Baseline, BaselineItem, Day, DayLogEntry, DayLogKind, ItemId, LockDecision, OpenSegmentRef,
-    OrderKey, PlanItem, Settings, Span, Store, StoreBatch, StoreOp, Timestamp, Uuid, WorkEnd,
+    Baseline, BaselineItem, CalendarRef, Day, DayLogEntry, DayLogKind, ItemId, LockDecision,
+    OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Settings, Span, Store, StoreBatch, StoreOp,
+    Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
@@ -191,7 +192,7 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 9);
+    assert_eq!(user_version(&path), 10);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
@@ -280,7 +281,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     // connection: a read-write open closing it would checkpoint them.
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-    raw.pragma_update(None, "user_version", 10).unwrap();
+    raw.pragma_update(None, "user_version", 11).unwrap();
     let copy = dir.path().join("newer.db");
     let wal = |p: &Path| PathBuf::from(format!("{}-wal", p.display()));
     std::fs::copy(&path, &copy).unwrap();
@@ -295,14 +296,14 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     assert_eq!(
         err,
         OpenError::NewerSchema {
-            found: 10,
-            supported: 9
+            found: 11,
+            supported: 10
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read(wal(&path)).unwrap(), wal_before);
     assert!(backups(&dir).is_empty());
-    assert_eq!(user_version(&path), 10);
+    assert_eq!(user_version(&path), 11);
 }
 
 #[tokio::test]
@@ -504,7 +505,7 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 9);
+    assert_eq!(user_version(&path), 10);
     assert!(has_table(&path, "engine_meta"));
 }
 
@@ -1175,7 +1176,10 @@ async fn v8_decides_days_with_time_no_lock_and_leaves_the_rest_undecided() {
         .unwrap();
     conn.execute_batch(
         "INSERT INTO day SELECT date, tz FROM src.day ORDER BY rowid;
-         INSERT INTO plan_item SELECT * FROM src.plan_item ORDER BY rowid;
+         INSERT INTO plan_item
+             SELECT id, day_date, title, planned_secs, \"order\", fixed, pinned_start,
+                    status, removed_at, carried_from
+             FROM src.plan_item ORDER BY rowid;
          INSERT INTO time_segment SELECT * FROM src.time_segment ORDER BY id;
          DETACH DATABASE src;",
     )
@@ -1191,7 +1195,7 @@ async fn v8_decides_days_with_time_no_lock_and_leaves_the_rest_undecided() {
     assert_eq!(untouched.lock_decision(), LockDecision::None);
     assert_eq!(store.load_baseline(date()).await.unwrap(), None);
     drop(store);
-    assert_eq!(user_version(&path), 9);
+    assert_eq!(user_version(&path), 10);
     assert_eq!(backups(&dir), vec![backup_path(&path, 7)]);
 }
 
@@ -1335,4 +1339,109 @@ async fn stored_dates_lists_every_day_ascending() {
         store.stored_dates().await.unwrap(),
         vec![earlier, date(), other_date()]
     );
+}
+
+/// An imported fixed item `n` from event `source_id`, pinned at 3_600 s.
+fn imported(n: u128, source_id: &str, instance_start: Option<Timestamp>) -> PlanItem {
+    let base = item(n, "V");
+    PlanItem::restore(PlanItemRecord {
+        id: base.id(),
+        title: base.title().to_owned(),
+        planned_secs: 2_400,
+        order: base.order().clone(),
+        fixed: true,
+        pinned_start: Some(ts(3_600)),
+        status: nguda_core::ItemStatus::Pending,
+        removed_at: None,
+        segments: Vec::new(),
+        carried_from: None,
+        tags: vec!["meet".into()],
+        source: Some(CalendarRef {
+            calendar_id: "me@example.com".into(),
+            source_id: source_id.into(),
+            instance_start,
+            source_secs: 1_800,
+        }),
+        removed_by_source_at: None,
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_imported_item_round_trips_its_source_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let mut day = Day::new(other_date(), "UTC");
+    day.add(imported(30, "ev1", None)).unwrap();
+    day.add(imported(31, "ev2", Some(ts(7_200)))).unwrap();
+    store.commit(batch_for(&day)).await.unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let loaded = store.load_day(other_date()).await.unwrap().unwrap();
+    assert_eq!(loaded, day);
+    let source = loaded.item(id(31)).unwrap().source().unwrap();
+    assert_eq!(source.instance_start, Some(ts(7_200)));
+    assert_eq!(source.source_secs, 1_800);
+    // Local items keep no source.
+    let today = store.load_day(date()).await.unwrap().unwrap();
+    assert!(today.items().iter().all(|i| i.source().is_none()));
+}
+
+#[tokio::test]
+async fn a_second_item_with_the_same_source_key_on_a_day_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let mut day = Day::new(other_date(), "UTC");
+    day.add(imported(30, "ev1", None)).unwrap();
+    store.commit(batch_for(&day)).await.unwrap();
+    let mut dup = Day::new(other_date(), "UTC");
+    dup.add(imported(32, "ev1", None)).unwrap();
+    assert!(store.commit(batch_for(&dup)).await.is_err());
+    // A different instance of the same event is a different key.
+    let mut other = Day::new(other_date(), "UTC");
+    other.add(imported(33, "ev1", Some(ts(9_000)))).unwrap();
+    store.commit(batch_for(&other)).await.unwrap();
+}
+
+#[tokio::test]
+async fn v10_leaves_existing_items_local() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    drop(SqliteStore::open_with(&path, &migrations_through(9)).unwrap());
+    // The adapter writes columns v9 lacks, so the rows go through a current-schema
+    // scratch database and are copied over with v9's columns only.
+    let scratch = dir.path().join("scratch.sqlite");
+    drop(seeded(&scratch).await);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute("ATTACH DATABASE ?1 AS src", [scratch.to_str().unwrap()])
+        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO day SELECT date, tz, lock_decision FROM src.day ORDER BY rowid;
+         INSERT INTO plan_item
+             SELECT id, day_date, title, planned_secs, \"order\", fixed, pinned_start,
+                    status, removed_at, carried_from
+             FROM src.plan_item ORDER BY rowid;
+         INSERT INTO time_segment SELECT * FROM src.time_segment ORDER BY id;
+         DETACH DATABASE src;",
+    )
+    .unwrap();
+    drop(conn);
+    std::fs::remove_file(&scratch).unwrap();
+    assert_eq!(user_version(&path), 9);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let loaded = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(loaded.items().len(), sample_day().items().len());
+    assert!(loaded.items().iter().all(|i| i.source().is_none()));
+    assert!(
+        loaded
+            .items()
+            .iter()
+            .all(|i| i.removed_by_source_at().is_none())
+    );
+    drop(store);
+    assert_eq!(user_version(&path), 10);
+    assert_eq!(backups(&dir), vec![backup_path(&path, 9)]);
 }

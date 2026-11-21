@@ -10,18 +10,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Date, Day, DayLogKind, ExportRange, FileSink, IdGen, IsoWeek, ItemId, LockDecision,
-    OpenSegmentRef, PlanItem, PromptId, PromptKind, Running, Schedule, Store, StoreBatch,
-    StoreError, StoreOp, TimeZone, Timestamp, WorkEnd, export_csv, merge_tag_names, reflow, report,
-    sort_tag_names, week_report,
+    CalendarError, CalendarErrorKind, CalendarSource, Clock, Date, Day, DayLogKind, ExportRange,
+    FetchedEvent, FileSink, IdGen, IsoWeek, ItemId, LockDecision, OpenSegmentRef, PlanItem,
+    PromptId, PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone,
+    Timestamp, WorkEnd, export_csv, merge, merge_tag_names, reflow, report, sort_tag_names,
+    week_report,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::batch::diff;
 use crate::commands::{self, Reject, domain_kind};
 use crate::{
-    DayReply, Effect, EngineDeps, EngineMsg, HEARTBEAT_EVERY, Inbox, NextItem, Snapshot,
-    StatusEntry, StatusKey, WeekReply,
+    DayReply, Effect, EngineDeps, EngineMsg, GoogleAccount, HEARTBEAT_EVERY, Inbox, NextItem,
+    Snapshot, StatusEntry, StatusKey, WeekReply,
 };
 
 pub(crate) async fn run(
@@ -41,6 +42,10 @@ pub(crate) async fn run(
                 Some(Inbox::QueryDay { date, reply }) => actor.query_day(date, reply),
                 Some(Inbox::QueryWeek { week, reply }) => actor.query_week(week, reply),
                 Some(Inbox::ExportFinished { id, result }) => actor.export_finished(id, result),
+                Some(Inbox::SignInFinished { id, result }) => actor.sign_in_finished(id, result),
+                Some(Inbox::ImportFinished { id, date, result }) => {
+                    actor.import_finished(id, date, result).await;
+                }
                 None => break,
             },
             () = deadline => actor.on_deadline().await,
@@ -55,6 +60,13 @@ struct Actor {
     store: Arc<dyn Store>,
     ids: Arc<dyn IdGen>,
     files: Arc<dyn FileSink>,
+    calendar: Arc<dyn CalendarSource>,
+    /// The last sign-in request id handed out; only its outcome applies.
+    sign_in_issued: u64,
+    /// The last import request id handed out; only its result applies.
+    import_issued: u64,
+    /// The Google account state, as last learned from the calendar source.
+    google: GoogleAccount,
     /// The actor's own inbox, weakly held: export tasks post their outcome here
     /// without keeping the engine alive.
     inbox: mpsc::WeakUnboundedSender<Inbox>,
@@ -111,6 +123,10 @@ impl Actor {
             store: deps.store,
             ids: deps.ids,
             files: deps.files,
+            calendar: deps.calendar,
+            sign_in_issued: 0,
+            import_issued: 0,
+            google: GoogleAccount::Unknown,
             inbox,
             export_issued: 0,
             export_applied: 0,
@@ -131,7 +147,8 @@ impl Actor {
     }
 
     /// Recovers a crash-left open segment, loads today, the settings and the known
-    /// tag names, and publishes rev 1. Runs before any message is handled.
+    /// tag names, publishes rev 1, and starts importing today's calendar events.
+    /// Runs before any message is handled.
     async fn startup(&mut self) {
         let now = self.clock.now();
         let today = today(now, &self.tz);
@@ -173,6 +190,7 @@ impl Actor {
         };
         self.heartbeat_at = deadline_after(now);
         self.publish();
+        self.start_import();
     }
 
     /// The stored day `date`, or a new one in the engine's zone when it is missing
@@ -189,8 +207,9 @@ impl Actor {
     }
 
     /// Makes the local date of `now` current when it is past today and nothing runs
-    /// (AD-8): loads that day (or starts a new one) and publishes it. Only moves
-    /// forward, possibly over several days. A running item keeps its day current.
+    /// (AD-8): loads that day (or starts a new one), publishes it, and starts
+    /// importing its calendar events. Only moves forward, possibly over several
+    /// days. A running item keeps its day current.
     async fn roll_over_if_due(&mut self, now: Timestamp) {
         if running_of(&self.day).is_some() {
             return;
@@ -203,6 +222,152 @@ impl Actor {
         tracing::info!(from = %self.day.date(), to = %date, "rolled over to a new day");
         self.day = day;
         self.publish();
+        self.start_import();
+    }
+
+    /// Starts importing today's primary-calendar events off the actor (AD-17):
+    /// the task fetches the events of today's local day and posts them back as
+    /// [`Inbox::ImportFinished`] under a fresh request id and today's date, which
+    /// supersedes any import still running.
+    fn start_import(&mut self) {
+        self.import_issued += 1;
+        let id = self.import_issued;
+        let date = self.day.date();
+        let Some((from, to)) = day_window(date, &self.tz) else {
+            tracing::warn!(%date, "no import window for the day");
+            return;
+        };
+        let calendar = self.calendar.clone();
+        let inbox = self.inbox.clone();
+        tracing::debug!(id, %date, "calendar import started");
+        tokio::spawn(async move {
+            let result = calendar.fetch_primary(from, to).await;
+            // The engine may have stopped meanwhile; nothing to report to then.
+            if let Some(inbox) = inbox.upgrade() {
+                let _ = inbox.send(Inbox::ImportFinished { id, date, result });
+            }
+        });
+    }
+
+    /// Applies an import's result (AD-9, AD-17), unless it is stale: an id other
+    /// than the latest issued, or a date that is no longer today. Events are merged
+    /// into a copy of today and the diff committed like any plan change; nothing
+    /// changed commits nothing. Success clears `Sync` and marks the account signed
+    /// in; "not signed in" marks it signed out with no status; any other failure
+    /// sets `Sync` and leaves the plan as is. Publishes only on a visible change.
+    /// Logs ids, dates, kinds and counts only (AD-14).
+    async fn import_finished(
+        &mut self,
+        id: u64,
+        date: Date,
+        result: Result<Vec<FetchedEvent>, CalendarError>,
+    ) {
+        if id != self.import_issued || date != self.day.date() {
+            tracing::debug!(id, latest = self.import_issued, %date, "stale import dropped");
+            return;
+        }
+        let status_before = self.status.clone();
+        let google_before = self.google;
+        let mut changed = false;
+        match result {
+            Ok(events) => {
+                self.set_google(GoogleAccount::SignedIn);
+                self.status.remove(&StatusKey::Sync);
+                let mut next = self.day.clone();
+                let ids = self.ids.clone();
+                match merge(&mut next, &events, || ids.new_item_id()) {
+                    Ok(count) => {
+                        tracing::info!(id, %date, fetched = events.len(), count, "calendar import merged");
+                        if next != self.day {
+                            let batch = diff(&self.day, &next);
+                            changed = self.swap_after_commit(next, self.work_end, batch).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(id, %date, kind = domain_kind(&e), "calendar merge rejected");
+                        self.status
+                            .insert(StatusKey::Sync, format!("Calendar import failed: {e}"));
+                    }
+                }
+            }
+            Err(e) if e.kind == CalendarErrorKind::NotSignedIn => {
+                tracing::debug!(id, "calendar import: not signed in");
+                self.set_google(GoogleAccount::SignedOut);
+            }
+            Err(e) => {
+                tracing::warn!(id, kind = error_kind(&e), "calendar import failed");
+                if e.kind == CalendarErrorKind::NoClient {
+                    self.set_google(GoogleAccount::SignedOut);
+                } else if self.google == GoogleAccount::Unknown {
+                    // A stored session exists; only this fetch failed.
+                    self.set_google(GoogleAccount::SignedIn);
+                }
+                self.status.insert(
+                    StatusKey::Sync,
+                    format!("Calendar import failed: {}", e.message),
+                );
+            }
+        }
+        if changed || self.status != status_before || self.google != google_before {
+            self.publish();
+        }
+    }
+
+    /// Sets the account state, except that a sign-in in progress stays shown until
+    /// its own outcome arrives.
+    fn set_google(&mut self, state: GoogleAccount) {
+        if self.google != GoogleAccount::SigningIn {
+            self.google = state;
+        }
+    }
+
+    /// Starts an interactive sign-in off the actor (AD-17): marks the account
+    /// signing in, publishes, and spawns the sign-in, whose outcome comes back as
+    /// [`Inbox::SignInFinished`] under a fresh request id.
+    fn sign_in(&mut self) {
+        self.sign_in_issued += 1;
+        let id = self.sign_in_issued;
+        self.google = GoogleAccount::SigningIn;
+        self.publish();
+        let calendar = self.calendar.clone();
+        let inbox = self.inbox.clone();
+        tracing::info!(id, "google sign-in started");
+        tokio::spawn(async move {
+            let result = calendar.sign_in().await;
+            // The engine may have stopped meanwhile; nothing to report to then.
+            if let Some(inbox) = inbox.upgrade() {
+                let _ = inbox.send(Inbox::SignInFinished { id, result });
+            }
+        });
+    }
+
+    /// Applies the latest sign-in's outcome; an older one is dropped (AD-17).
+    /// Success marks the account signed in, clears `Sync`, and imports today's
+    /// events; failure marks it signed out and sets `Sync` with the message only.
+    fn sign_in_finished(&mut self, id: u64, result: Result<(), CalendarError>) {
+        if id != self.sign_in_issued {
+            tracing::debug!(id, latest = self.sign_in_issued, "stale sign-in dropped");
+            return;
+        }
+        match result {
+            Ok(()) => {
+                tracing::info!(id, "google sign-in succeeded");
+                self.google = GoogleAccount::SignedIn;
+                self.status.remove(&StatusKey::Sync);
+                self.publish();
+                self.start_import();
+            }
+            Err(e) => {
+                tracing::warn!(id, kind = error_kind(&e), "google sign-in failed");
+                self.google = GoogleAccount::SignedOut;
+                let message = match e.kind {
+                    CalendarErrorKind::NoClient => e.message,
+                    _ => format!("Google sign-in failed: {}", e.message),
+                };
+                self.status.insert(StatusKey::Sync, message);
+                self.publish();
+            }
+        }
     }
 
     async fn find_crash(&self) -> Result<Option<Crash>, StoreError> {
@@ -407,6 +572,10 @@ impl Actor {
             EngineMsg::CarryOverToTomorrow { expected_rev } => self.carry_over(expected_rev).await,
             EngineMsg::ExportCsv { path, range } => {
                 self.export_csv(path, range);
+                false
+            }
+            EngineMsg::SignIn => {
+                self.sign_in();
                 false
             }
             msg => self.handle_plan(msg).await,
@@ -781,6 +950,7 @@ impl Actor {
             work_end: self.work_end,
             overflow: self.overflow.clone(),
             known_tags: self.known_tags.clone(),
+            google: self.google,
             status: self
                 .status
                 .iter()
@@ -882,6 +1052,28 @@ fn next_midnight(date: Date, tz: &TimeZone) -> Timestamp {
         .and_then(|d| d.to_zoned(tz.clone()))
         .and_then(|z| z.start_of_day())
         .map_or(Timestamp::MAX, |z| z.timestamp())
+}
+
+/// The local day `date` in `tz` as `[start, next midnight)`, or `None` at the
+/// edge of the calendar.
+fn day_window(date: Date, tz: &TimeZone) -> Option<(Timestamp, Timestamp)> {
+    let start = date
+        .to_zoned(tz.clone())
+        .ok()?
+        .start_of_day()
+        .ok()?
+        .timestamp();
+    Some((start, next_midnight(date, tz)))
+}
+
+/// A calendar error's kind, for logs: never its message's details.
+fn error_kind(e: &CalendarError) -> &'static str {
+    match e.kind {
+        CalendarErrorKind::NotSignedIn => "not_signed_in",
+        CalendarErrorKind::NoClient => "no_client",
+        CalendarErrorKind::Auth => "auth",
+        CalendarErrorKind::Other => "other",
+    }
 }
 
 fn deadline_after(now: Timestamp) -> Timestamp {

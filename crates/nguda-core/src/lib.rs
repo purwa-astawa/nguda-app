@@ -4,6 +4,7 @@
 //! the [`Clock`] port (AD-1, AD-8).
 
 mod baseline;
+mod calendar;
 mod clock;
 mod day_log;
 mod elapsed;
@@ -17,6 +18,7 @@ mod order;
 mod plan;
 mod reflow;
 mod report;
+mod secrets;
 mod segment;
 mod settings;
 mod store;
@@ -25,6 +27,9 @@ mod tags;
 mod test_support;
 
 pub use baseline::{Baseline, BaselineItem, LockChoice, LockDecision, baseline};
+pub use calendar::{
+    CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource, FetchedEvent, merge,
+};
 pub use clock::{Clock, SleepFuture};
 pub use day_log::{DayLogEntry, DayLogKind};
 pub use elapsed::{Running, elapsed_secs, format_elapsed, until_next_second};
@@ -38,9 +43,10 @@ pub use jiff::tz::TimeZone;
 pub use next_task::next_task;
 pub use notifier::{Notification, Notifier, NotifierError, PromptAction, PromptKind};
 pub use order::OrderKey;
-pub use plan::{Action, Day, ItemId, ItemStatus, PlanItem, PlanItemRecord};
+pub use plan::{Action, CalendarRef, Day, ItemId, ItemStatus, PlanItem, PlanItemRecord};
 pub use reflow::{Schedule, Slot, SlotKind, Span, reflow};
 pub use report::{ActualSegment, DayReport, PlannedSource, ReportRow, report};
+pub use secrets::{SecretStore, SecretStoreError};
 pub use segment::{Segment, actual_secs, closed_secs};
 pub use settings::{ParseWorkEndError, Settings, WorkEnd};
 pub use store::{OpenSegmentRef, Store, StoreBatch, StoreError, StoreFuture, StoreOp};

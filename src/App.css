@@ -192,6 +192,22 @@ body {
   color: #6b4500;
 }
 
+.google {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.imported {
+  font-size: 0.7em;
+  margin-left: 0.4rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  color: #1a73e8;
+}
+
 .tags {
   display: flex;
   flex-wrap: wrap;

@@ -157,8 +157,30 @@ CREATE TABLE plan_item_tag (
 ) STRICT;
 "#;
 
+/// v10: where an imported plan item came from (CAP-2, AD-9). An imported item has
+/// its calendar id, event id, and the event length at the last import
+/// (`source_secs`), plus a recurring instance's original start; a local item has
+/// all of them NULL. `removed_by_source_at` is when Google cancelled the event.
+/// The merge key `(calendar_id, source_id, instance_start)` is unique per day.
+const V10: &str = r#"
+ALTER TABLE plan_item ADD COLUMN calendar_id TEXT;
+ALTER TABLE plan_item ADD COLUMN source_id TEXT
+    CHECK ((source_id IS NULL) = (calendar_id IS NULL));
+ALTER TABLE plan_item ADD COLUMN instance_start INTEGER
+    CHECK (instance_start IS NULL OR calendar_id IS NOT NULL);
+ALTER TABLE plan_item ADD COLUMN source_secs INTEGER
+    CHECK ((source_secs IS NULL) = (calendar_id IS NULL) AND
+           (source_secs IS NULL OR source_secs >= 0));
+ALTER TABLE plan_item ADD COLUMN removed_by_source_at INTEGER
+    CHECK (removed_by_source_at IS NULL OR calendar_id IS NOT NULL);
+
+CREATE UNIQUE INDEX plan_item_source_key
+    ON plan_item (day_date, calendar_id, source_id, IFNULL(instance_start, -1))
+    WHERE calendar_id IS NOT NULL;
+"#;
+
 /// Every migration's SQL, oldest first.
-const ALL: [&str; 9] = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
+const ALL: [&str; 10] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {

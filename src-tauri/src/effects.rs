@@ -600,6 +600,7 @@ mod tests {
             store: Arc::new(store),
             ids: Arc::new(UuidV7Ids),
             files: Arc::new(FsFileSink),
+            calendar: Arc::new(crate::IdleCalendar),
             tz: TimeZone::UTC,
         });
         let wait = Duration::from_secs(10);

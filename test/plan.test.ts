@@ -2,6 +2,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  googleSection,
+  signInCommand,
   addCommand,
   asksLockChoice,
   carryOverCommand,
@@ -45,6 +47,7 @@ function item(id: string, extra: Partial<Item> = {}): Item {
     scheduledEnd: null,
     interrupted: false,
     tags: [],
+    imported: false,
     ...extra,
   };
 }
@@ -67,6 +70,7 @@ function snap(rev: number, items: Item[] = [F, A, B], running: Snapshot["running
     overflow: [],
     status: [],
     knownTags: [],
+    google: "signedOut",
   };
 }
 
@@ -398,4 +402,13 @@ test("tag suggestions are the known tags the item lacks, case-insensitively", ()
   assert.deepEqual(tagSuggestions(known, []), known);
   assert.deepEqual(tagSuggestions(known, ["deep", "WORK"]), ["admin"]);
   assert.deepEqual(tagSuggestions([], ["x"]), []);
+});
+
+test("the Google section follows the account state", () => {
+  const at = (google: Snapshot["google"]) => googleSection({ ...snap(1), google });
+  assert.deepEqual(at("unknown"), { label: "Checking…", signIn: false, busy: false });
+  assert.deepEqual(at("signedOut"), { label: "Not signed in", signIn: true, busy: false });
+  assert.deepEqual(at("signingIn"), { label: "Waiting for browser…", signIn: true, busy: true });
+  assert.deepEqual(at("signedIn"), { label: "Signed in", signIn: false, busy: false });
+  assert.deepEqual(signInCommand(), { name: "signIn", args: [] });
 });

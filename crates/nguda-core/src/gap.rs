@@ -223,6 +223,8 @@ mod tests {
             segments: Vec::new(),
             carried_from: None,
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+            source: None,
+            removed_by_source_at: None,
         }
     }
 

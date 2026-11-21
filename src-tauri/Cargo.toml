@@ -20,6 +20,7 @@ nguda-engine.workspace = true
 nguda-adapters.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true
+tauri-plugin-opener.workspace = true
 tauri-specta.workspace = true
 specta.workspace = true
 specta-typescript.workspace = true
