@@ -75,6 +75,19 @@
 //! only if it was set) and emits [`Effect::ExportDone`]; a store or sink failure
 //! sets [`StatusKey::Export`] and publishes. Logs carry the range kind, week, and
 //! row count only, never the path, titles, or contents (AD-14).
+//!
+//! Calendar import (CAP-2, AD-9, AD-17): the engine never awaits the calendar in
+//! a handler. [`EngineMsg::SignIn`] marks the account
+//! [`GoogleAccount::SigningIn`], publishes, and spawns the interactive sign-in;
+//! imports of today's primary-calendar events are spawned at startup, after a
+//! successful sign-in, and at rollover. Each spawned task posts its result back
+//! through a weak inbox sender under a request id, and the actor drops any result
+//! whose id is not the latest it issued for that kind, and an import result whose
+//! date is no longer today. An applied import merges the events into a copy of
+//! today with [`nguda_core::merge`] and commits the diff like any plan change (an
+//! unchanged plan commits nothing). Failures set [`StatusKey::Sync`], which the
+//! next successful import or sign-in clears; "not signed in" sets no status, only
+//! [`GoogleAccount::SignedOut`]. Tokens and event titles are never logged.
 
 mod actor;
 mod batch;
@@ -90,9 +103,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Clock, Date, Day, DayReport, ExportRange, FileSink, IdGen, IsoWeek, ItemId, LockChoice,
-    PromptId, PromptKind, Running, Schedule, Store, StoreError, TimeZone, Timestamp, WeekReport,
-    WorkEnd,
+    CalendarError, CalendarSource, Clock, Date, Day, DayReport, ExportRange, FetchedEvent,
+    FileSink, IdGen, IsoWeek, ItemId, LockChoice, PromptId, PromptKind, Running, Schedule, Store,
+    StoreError, TimeZone, Timestamp, WeekReport, WorkEnd,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -199,6 +212,11 @@ pub enum EngineMsg {
     /// read-only on plan state. The outcome comes back as [`Effect::ExportDone`]
     /// or the [`StatusKey::Export`] status.
     ExportCsv { path: PathBuf, range: ExportRange },
+    /// Signs in to Google interactively, off the actor (AD-17). The account shows
+    /// [`GoogleAccount::SigningIn`] until it finishes; success imports today's
+    /// events, failure sets [`StatusKey::Sync`]. A newer `SignIn` supersedes an
+    /// older one still waiting. Not rev-checked.
+    SignIn,
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -235,6 +253,24 @@ pub enum StatusKey {
     Overflow,
     /// The last CSV export failed. Cleared by the next successful export.
     Export,
+    /// The last Google sign-in or calendar import failed. Cleared by the next
+    /// successful sign-in or import.
+    Sync,
+}
+
+/// What the engine knows about the Google account. Never carries an address or a
+/// token (AD-13).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GoogleAccount {
+    /// Not known yet: the startup import has not answered.
+    #[default]
+    Unknown,
+    /// No account is signed in.
+    SignedOut,
+    /// An interactive sign-in is waiting for the browser.
+    SigningIn,
+    /// An account is signed in.
+    SignedIn,
 }
 
 /// One problem the user should see. At most one entry per key.
@@ -267,6 +303,8 @@ pub struct Snapshot {
     pub status: Vec<StatusEntry>,
     /// Every tag name ever stored, sorted case-insensitively. Never shrinks.
     pub known_tags: Vec<String>,
+    /// The Google account state.
+    pub google: GoogleAccount,
 }
 
 /// The item the tray shows while nothing runs.
@@ -306,6 +344,8 @@ pub struct EngineDeps {
     pub ids: Arc<dyn IdGen>,
     /// Where CSV exports are written (AD-16).
     pub files: Arc<dyn FileSink>,
+    /// The calendar account events are imported from (CAP-2).
+    pub calendar: Arc<dyn CalendarSource>,
     /// The zone that decides "today" and is fixed on each new day (AD-8).
     pub tz: TimeZone,
 }
@@ -367,6 +407,20 @@ pub(crate) enum Inbox {
     ExportFinished {
         id: u64,
         result: Result<usize, String>,
+    },
+    /// A sign-in task's outcome, tagged with its request id. Only the latest
+    /// sign-in's outcome applies (AD-17).
+    SignInFinished {
+        id: u64,
+        result: Result<(), CalendarError>,
+    },
+    /// An import task's fetched events for `date`, tagged with its request id.
+    /// Only the latest import's result applies, and only while `date` is still
+    /// today (AD-17).
+    ImportFinished {
+        id: u64,
+        date: Date,
+        result: Result<Vec<FetchedEvent>, CalendarError>,
     },
 }
 

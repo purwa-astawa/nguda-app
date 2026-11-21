@@ -45,7 +45,8 @@ export type Command =
       ];
     }
   | { name: "setWorkEnd"; args: [minutes: number] }
-  | { name: "carryOverToTomorrow"; args: [expectedRev: number] };
+  | { name: "carryOverToTomorrow"; args: [expectedRev: number] }
+  | { name: "signIn"; args: [] };
 
 /** Where an inserted task goes, as `insertTask` takes it. Never a numeric index. */
 export type InsertAnchor = InsertAnchorArg_Serialize;
@@ -324,4 +325,26 @@ function zonedTime(iso: string, tz: string): string {
 export function scheduleLabel(item: Item, tz: string): string | null {
   if (!item.scheduledStart || !item.scheduledEnd) return null;
   return `${zonedTime(item.scheduledStart, tz)}\u2013${zonedTime(item.scheduledEnd, tz)}`;
+}
+
+/** What the Google section shows for the snapshot's account state: its label,
+ * whether a Sign in button shows, and whether that button is disabled. */
+export type GoogleSection = { label: string; signIn: boolean; busy: boolean };
+
+export function googleSection(snap: Snapshot): GoogleSection {
+  switch (snap.google) {
+    case "unknown":
+      return { label: "Checking…", signIn: false, busy: false };
+    case "signedOut":
+      return { label: "Not signed in", signIn: true, busy: false };
+    case "signingIn":
+      return { label: "Waiting for browser…", signIn: true, busy: true };
+    case "signedIn":
+      return { label: "Signed in", signIn: false, busy: false };
+  }
+}
+
+/** Signs in to Google; progress comes back in `snapshot.google`. */
+export function signInCommand(): Command {
+  return { name: "signIn", args: [] };
 }

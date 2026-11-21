@@ -5,12 +5,14 @@ import {
   addCommand,
   asksLockChoice,
   carryOverCommand,
+  googleSection,
   insertCommand,
   insertPositions,
   lockBadge,
   lockDayCommand,
   mergeSnapshot,
   overflowItems,
+  signInCommand,
   withLock,
   workEndCommand,
   type Command,
@@ -67,6 +69,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
       break;
     case "carryOverToTomorrow":
       res = await commands.carryOverToTomorrow(...cmd.args);
+      break;
+    case "signIn":
+      res = await commands.signIn();
       break;
   }
   return res.status === "error" ? res.error : null;
@@ -229,9 +234,20 @@ function App() {
     </>
   );
 
+  const google = googleSection(snap);
+
   // The Plan tab: the day plan and its forms.
   const planView = (
     <>
+      <section className="google" aria-label="Google Calendar">
+        <span>Google Calendar: {google.label}</span>
+        {google.signIn && (
+          <button type="button" disabled={google.busy} onClick={() => send(signInCommand())}>
+            Sign in
+          </button>
+        )}
+      </section>
+
       {lockDay && (
         <button type="button" className="lock-day" onClick={() => send(lockDay)}>
           Lock day

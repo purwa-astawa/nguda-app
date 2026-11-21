@@ -1,13 +1,17 @@
 //! nguda adapters: implementations of the `nguda-core` ports. Never depends on Tauri.
 
 mod file_sink;
+mod gcal;
 mod notifier;
+mod secrets;
 mod store;
 
 use nguda_core::{Clock, IdGen, ItemId, PromptId, SleepFuture, Timestamp, Uuid};
 
 pub use file_sink::FsFileSink;
+pub use gcal::{GcalConfig, GcalSource, OpenUrl, REFRESH_TOKEN_KEY, SCOPES};
 pub use notifier::{ActionCallback, SystemNotifier};
+pub use secrets::KeyringSecretStore;
 pub use store::{OpenError, SqliteStore};
 
 /// The real wall clock behind the [`Clock`] port.

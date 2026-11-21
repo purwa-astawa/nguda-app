@@ -103,6 +103,7 @@ const SET_WORK_END: &str = "SetWorkEnd";
 const LOCK_DAY: &str = "LockDay";
 pub(crate) const CARRY_OVER: &str = "CarryOverToTomorrow";
 const EXPORT_CSV: &str = "ExportCsv";
+const SIGN_IN: &str = "SignIn";
 
 /// Why a carry-over with no leftovers is rejected.
 pub(crate) const NOTHING_TO_CARRY_OVER: &str = "nothing to carry over";
@@ -125,6 +126,7 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::LockDay { .. } => LOCK_DAY,
         EngineMsg::CarryOverToTomorrow { .. } => CARRY_OVER,
         EngineMsg::ExportCsv { .. } => EXPORT_CSV,
+        EngineMsg::SignIn => SIGN_IN,
     }
 }
 
@@ -135,7 +137,8 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
         | EngineMsg::SetWorkEnd { .. }
         | EngineMsg::LockDay { .. }
         | EngineMsg::CarryOverToTomorrow { .. }
-        | EngineMsg::ExportCsv { .. } => None,
+        | EngineMsg::ExportCsv { .. }
+        | EngineMsg::SignIn => None,
         EngineMsg::InsertTask { anchor, .. } => match anchor {
             InsertAnchor::After(id) | InsertAnchor::Before(id) => Some(*id),
             InsertAnchor::Now | InsertAnchor::End => None,
@@ -268,6 +271,8 @@ pub(crate) fn apply(
         }
         // The actor routes it to `export_csv`, off the plan path; never reached.
         EngineMsg::ExportCsv { .. } => Err(Reject::invalid(EXPORT_CSV, "not a plan command")),
+        // The actor routes it to `sign_in`, off the plan path; never reached.
+        EngineMsg::SignIn => Err(Reject::invalid(SIGN_IN, "not a plan command")),
     }
 }
 

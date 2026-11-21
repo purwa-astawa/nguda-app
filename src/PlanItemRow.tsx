@@ -105,6 +105,11 @@ export function PlanItemRow({ snap, item, now, send, start, focusExtend }: Props
         <div className="facts">
           {scheduled && <span className="when">{scheduled}</span>}
           <span className="title">{item.title}</span>
+          {item.imported && (
+            <span className="imported" title="Imported from Google Calendar">
+              Google
+            </span>
+          )}
           <span className="meta">
             {STATUS_LABEL[item.status]} · {rowTime(snap, item, now)} /{" "}
             {secsToMinutes(item.plannedSecs)} min

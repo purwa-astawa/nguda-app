@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nguda_core::{
-    Baseline, Clock, Date, Day, DayLogEntry, FileSink, FileSinkError, IdGen, ItemId, LockChoice,
-    LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, PromptId, Segment, Settings,
-    SleepFuture, Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
+    Baseline, CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource, Clock, Date, Day,
+    DayLogEntry, FetchedEvent, FileSink, FileSinkError, IdGen, ItemId, LockChoice, LockDecision,
+    OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, PromptId, Segment, Settings, SleepFuture,
+    Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
 };
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 pub(crate) fn ts(secs: i64) -> Timestamp {
     Timestamp::from_second(secs).unwrap()
@@ -362,6 +363,8 @@ fn record_of(item: &PlanItem) -> PlanItemRecord {
         segments: Vec::new(),
         carried_from: item.carried_from(),
         tags: item.tags().to_vec(),
+        source: item.source().cloned(),
+        removed_by_source_at: item.removed_by_source_at(),
     }
 }
 
@@ -576,5 +579,79 @@ impl FileSink for FakeFileSink {
             .unwrap()
             .push((path.to_owned(), contents.to_vec()));
         Ok(())
+    }
+}
+
+type FetchReply = oneshot::Sender<Result<Vec<FetchedEvent>, CalendarError>>;
+type SignInReply = oneshot::Sender<Result<(), CalendarError>>;
+/// A fetch's window and its pending reply (taken once resolved).
+type PendingFetch = ((Timestamp, Timestamp), Option<FetchReply>);
+
+/// A [`CalendarSource`] whose calls the test answers explicitly, one by one and
+/// in any order: each call waits on its own oneshot until resolved.
+#[derive(Default)]
+pub(crate) struct FakeCalendar {
+    fetches: Mutex<Vec<PendingFetch>>,
+    sign_ins: Mutex<Vec<Option<SignInReply>>>,
+}
+
+impl FakeCalendar {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub(crate) fn fetch_count(&self) -> usize {
+        self.fetches.lock().unwrap().len()
+    }
+
+    pub(crate) fn sign_in_count(&self) -> usize {
+        self.sign_ins.lock().unwrap().len()
+    }
+
+    /// The window of fetch `n` (0-based).
+    pub(crate) fn fetch_window(&self, n: usize) -> (Timestamp, Timestamp) {
+        self.fetches.lock().unwrap()[n].0
+    }
+
+    /// Answers fetch `n` (0-based) with `result`.
+    pub(crate) fn resolve_fetch(&self, n: usize, result: Result<Vec<FetchedEvent>, CalendarError>) {
+        let reply = self.fetches.lock().unwrap()[n]
+            .1
+            .take()
+            .expect("fetch already resolved");
+        let _ = reply.send(result);
+    }
+
+    /// Answers sign-in `n` (0-based) with `result`.
+    pub(crate) fn resolve_sign_in(&self, n: usize, result: Result<(), CalendarError>) {
+        let reply = self.sign_ins.lock().unwrap()[n]
+            .take()
+            .expect("sign-in already resolved");
+        let _ = reply.send(result);
+    }
+}
+
+fn dropped() -> CalendarError {
+    CalendarError::new(CalendarErrorKind::Other, "fake call dropped")
+}
+
+impl CalendarSource for FakeCalendar {
+    fn sign_in(&self) -> CalendarFuture<()> {
+        let (tx, rx) = oneshot::channel();
+        self.sign_ins.lock().unwrap().push(Some(tx));
+        Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
+    }
+
+    fn fetch_primary(
+        &self,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> CalendarFuture<Vec<FetchedEvent>> {
+        let (tx, rx) = oneshot::channel();
+        self.fetches
+            .lock()
+            .unwrap()
+            .push(((window_start, window_end), Some(tx)));
+        Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
     }
 }

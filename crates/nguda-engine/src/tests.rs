@@ -7,20 +7,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    ActualSegment, Baseline, BaselineItem, Date, Day, DayLogEntry, DayLogKind, ExportRange,
-    GapFigure, IsoWeek, ItemId, ItemStatus, LockChoice, LockDecision, OrderKey, PlanItem,
-    PlannedSource, PromptKind, ReportRow, Segment, SlotKind, Span, StoreError, StoreOp, TagGap,
-    TimeZone, WorkEnd, export_csv,
+    ActualSegment, Baseline, BaselineItem, CalendarError, CalendarErrorKind, Date, Day,
+    DayLogEntry, DayLogKind, ExportRange, FetchedEvent, GapFigure, IsoWeek, ItemId, ItemStatus,
+    LockChoice, LockDecision, OrderKey, PlanItem, PlannedSource, PromptKind, ReportRow, Segment,
+    SlotKind, Span, StoreError, StoreOp, TagGap, TimeZone, WorkEnd, export_csv,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::test_support::{
-    FakeClock, FakeFileSink, INJECTED, MemoryStore, SINK_FAILURE, SeqIds, day_running_other, day1,
-    day2, id, item, key, locked, no_lock, prompt, ts,
+    FakeCalendar, FakeClock, FakeFileSink, INJECTED, MemoryStore, SINK_FAILURE, SeqIds,
+    day_running_other, day1, day2, id, item, key, locked, no_lock, prompt, ts,
 };
 use crate::{
-    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, InsertAnchor, NextItem, QueryError,
-    ReorderAnchor, Snapshot, StatusEntry, StatusKey, spawn,
+    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, GoogleAccount, InsertAnchor,
+    NextItem, QueryError, ReorderAnchor, Snapshot, StatusEntry, StatusKey, spawn,
 };
 
 const DAY_SECS: i64 = 86_400;
@@ -45,15 +45,18 @@ struct Harness {
     rx: watch::Receiver<Snapshot>,
     clock: Arc<FakeClock>,
     files: Arc<FakeFileSink>,
+    calendar: Arc<FakeCalendar>,
 }
 
 fn start(clock: &Arc<FakeClock>, store: &Arc<MemoryStore>) -> Harness {
     let files = FakeFileSink::new();
+    let calendar = FakeCalendar::new();
     let (engine, effects) = spawn(EngineDeps {
         clock: clock.clone(),
         store: store.clone(),
         ids: Arc::new(SeqIds::default()),
         files: files.clone(),
+        calendar: calendar.clone(),
         tz: TimeZone::UTC,
     });
     let rx = engine.subscribe();
@@ -63,6 +66,7 @@ fn start(clock: &Arc<FakeClock>, store: &Arc<MemoryStore>) -> Harness {
         rx,
         clock: clock.clone(),
         files,
+        calendar,
     }
 }
 
@@ -3296,4 +3300,319 @@ async fn a_failed_set_tags_commit_keeps_the_day_and_the_known_names() {
     assert_eq!(snap.known_tags, tags(&["a"]));
     assert_eq!(snap.status, store_status());
     assert_eq!(store.tag_names(), tags(&["a"]));
+}
+
+// --- Calendar import and Google sign-in (AD-9, AD-17) ---
+
+fn event(source_id: &str, title: &str, start: i64, end: i64) -> FetchedEvent {
+    FetchedEvent {
+        calendar_id: "me@example.com".into(),
+        source_id: source_id.into(),
+        instance_start: None,
+        title: title.into(),
+        start: ts(start),
+        end: ts(end),
+    }
+}
+
+fn cal_err(kind: CalendarErrorKind, message: &str) -> CalendarError {
+    CalendarError::new(kind, message)
+}
+
+fn sync_status(snap: &Snapshot) -> Option<&str> {
+    snap.status
+        .iter()
+        .find(|e| e.key == StatusKey::Sync)
+        .map(|e| e.message.as_str())
+}
+
+/// The imported item of `snap` with event `source_id`.
+fn imported<'s>(snap: &'s Snapshot, source_id: &str) -> &'s PlanItem {
+    day_of(snap)
+        .items()
+        .iter()
+        .find(|i| i.source().is_some_and(|s| s.source_id == source_id))
+        .unwrap_or_else(|| panic!("no item for event {source_id}"))
+}
+
+impl Harness {
+    /// Waits until the calendar has seen `n` fetches.
+    async fn fetches(&self, n: usize) {
+        let calendar = self.calendar.clone();
+        self.until(|| calendar.fetch_count() >= n).await;
+    }
+
+    async fn sign_ins(&self, n: usize) {
+        let calendar = self.calendar.clone();
+        self.until(|| calendar.sign_in_count() >= n).await;
+    }
+}
+
+#[tokio::test]
+async fn startup_imports_today_and_shows_the_account_unknown_until_it_answers() {
+    let (h, _store) = running_on(1_000, None).await;
+    assert_eq!(h.rx.borrow().google, GoogleAccount::Unknown);
+    h.fetches(1).await;
+    assert_eq!(h.calendar.fetch_window(0), (ts(0), ts(DAY_SECS)));
+}
+
+#[tokio::test]
+async fn not_signed_in_at_startup_shows_signed_out_with_no_status() {
+    let (mut h, store) = running_on(1_000, None).await;
+    h.fetches(1).await;
+    let batches = store.batches().len();
+    h.calendar.resolve_fetch(
+        0,
+        Err(cal_err(CalendarErrorKind::NotSignedIn, "not signed in")),
+    );
+    let snap = h.rev(2).await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    assert!(snap.status.is_empty());
+    assert_eq!(store.batches().len(), batches, "nothing committed");
+}
+
+#[tokio::test]
+async fn imported_events_appear_as_fixed_items_and_are_persisted() {
+    let (mut h, store) = running_on(1_000, None).await;
+    h.fetches(1).await;
+    h.calendar.resolve_fetch(
+        0,
+        Ok(vec![
+            event("a", "Standup", 9_000, 9_900),
+            event("b", "Review", 30_000, 33_600),
+        ]),
+    );
+    let snap = h.rev(2).await;
+    assert_eq!(snap.google, GoogleAccount::SignedIn);
+    assert!(snap.status.is_empty());
+    let a = imported(&snap, "a");
+    assert!(a.fixed());
+    assert_eq!(a.pinned_start(), Some(ts(9_000)));
+    assert_eq!(a.planned_secs(), 900);
+    assert_eq!(a.status(), ItemStatus::Pending);
+    assert_eq!(a.title(), "Standup");
+    assert_eq!(imported(&snap, "b").pinned_start(), Some(ts(30_000)));
+    assert_eq!(day_of(&snap), &store.stored_day(day1()).unwrap());
+}
+
+#[tokio::test]
+async fn re_import_after_a_restart_keeps_user_fields_and_adds_no_duplicate() {
+    let (clock, store) = (FakeClock::at(1_000), MemoryStore::new());
+    let mut h = start(&clock, &store);
+    h.rev(1).await;
+    h.fetches(1).await;
+    h.calendar
+        .resolve_fetch(0, Ok(vec![event("a", "Standup", 9_000, 9_900)]));
+    let snap = h.rev(2).await;
+    let item_id = imported(&snap, "a").id();
+    h.send(EngineMsg::SetTags {
+        item_id,
+        tags: vec!["meet".into()],
+        expected_rev: 2,
+    });
+    h.rev(3).await;
+    h.send(EngineMsg::ToggleFixed {
+        item_id,
+        pinned_start: None,
+        expected_rev: 3,
+    });
+    h.rev(4).await;
+    drop(h);
+
+    let mut h = start(&clock, &store);
+    h.rev(1).await;
+    h.fetches(1).await;
+    h.calendar
+        .resolve_fetch(0, Ok(vec![event("a", "Daily", 12_000, 12_900)]));
+    let snap = h.rev(2).await;
+    let today = day_of(&snap);
+    assert_eq!(today.items().len(), 1, "no duplicate");
+    let item = today.item(item_id).unwrap();
+    assert_eq!(item.title(), "Daily");
+    assert!(!item.fixed(), "the user's flexibility stays");
+    assert_eq!(item.tags(), ["meet".to_owned()]);
+    assert_eq!(today, &store.stored_day(day1()).unwrap());
+}
+
+#[tokio::test]
+async fn an_unchanged_re_import_commits_and_publishes_nothing() {
+    let (mut h, store) = running_on(1_000, None).await;
+    h.fetches(1).await;
+    let events = vec![event("a", "Standup", 9_000, 9_900)];
+    h.calendar.resolve_fetch(0, Ok(events.clone()));
+    h.rev(2).await;
+    h.send(EngineMsg::SignIn);
+    h.rev(3).await;
+    h.sign_ins(1).await;
+    h.calendar.resolve_sign_in(0, Ok(()));
+    h.rev(4).await;
+    h.fetches(2).await;
+    let batches = store.batches().len();
+    h.calendar.resolve_fetch(1, Ok(events));
+    // A later command's rev proves the import published nothing.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    let snap = h.rev(5).await;
+    assert_eq!(day_of(&snap).items().len(), 1);
+    assert_eq!(
+        store.batches().len(),
+        batches + 1,
+        "only the work-end change"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_import_is_dropped() {
+    let (mut h, _store) = running_on(1_000, None).await;
+    h.fetches(1).await;
+    h.send(EngineMsg::SignIn);
+    let snap = h.rev(2).await;
+    assert_eq!(snap.google, GoogleAccount::SigningIn);
+    h.sign_ins(1).await;
+    h.calendar.resolve_sign_in(0, Ok(()));
+    let snap = h.rev(3).await;
+    assert_eq!(snap.google, GoogleAccount::SignedIn);
+    h.fetches(2).await;
+    // The startup import (id 1) is superseded by the post-sign-in one (id 2).
+    h.calendar
+        .resolve_fetch(0, Ok(vec![event("old", "Stale", 9_000, 9_900)]));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.calendar
+        .resolve_fetch(1, Ok(vec![event("new", "Fresh", 12_000, 12_900)]));
+    let snap = h.rev(4).await;
+    let today = day_of(&snap);
+    assert_eq!(today.items().len(), 1);
+    assert_eq!(imported(&snap, "new").title(), "Fresh");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(h.rx.borrow().rev, 4, "the stale result published nothing");
+}
+
+#[tokio::test]
+async fn an_import_from_before_a_rollover_is_dropped_and_the_new_day_is_imported() {
+    let (mut h, store) = running_on(MIDNIGHT - 60, None).await;
+    h.fetches(1).await;
+    h.clock.set(MIDNIGHT + 10);
+    let snap = h.rev(2).await;
+    assert_eq!(day_of(&snap).date(), day2());
+    h.fetches(2).await;
+    assert_eq!(
+        h.calendar.fetch_window(1),
+        (ts(MIDNIGHT), ts(MIDNIGHT + DAY_SECS))
+    );
+    // Day 1's import answers late: dropped.
+    h.calendar
+        .resolve_fetch(0, Ok(vec![event("d1", "Yesterday", 3_600, 4_500)]));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.calendar.resolve_fetch(
+        1,
+        Ok(vec![event(
+            "d2",
+            "Tomorrow",
+            MIDNIGHT + 3_600,
+            MIDNIGHT + 4_500,
+        )]),
+    );
+    let snap = h.rev(3).await;
+    assert_eq!(day_of(&snap).items().len(), 1);
+    assert_eq!(
+        imported(&snap, "d2").pinned_start(),
+        Some(ts(MIDNIGHT + 3_600))
+    );
+    assert!(
+        store
+            .stored_day(day1())
+            .is_none_or(|d| d.items().is_empty())
+    );
+}
+
+#[tokio::test]
+async fn a_sign_in_failure_signs_out_and_sets_the_sync_status() {
+    let (mut h, _store) = running_on(1_000, None).await;
+    h.fetches(1).await;
+    h.send(EngineMsg::SignIn);
+    assert_eq!(h.rev(2).await.google, GoogleAccount::SigningIn);
+    h.sign_ins(1).await;
+    h.calendar.resolve_sign_in(
+        0,
+        Err(cal_err(CalendarErrorKind::Auth, "sign-in timed out")),
+    );
+    let snap = h.rev(3).await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    assert_eq!(
+        sync_status(&snap),
+        Some("Google sign-in failed: sign-in timed out")
+    );
+    // The startup import answering "not signed in" now changes nothing visible.
+    h.calendar.resolve_fetch(
+        0,
+        Err(cal_err(CalendarErrorKind::NotSignedIn, "not signed in")),
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(h.rx.borrow().rev, 3);
+}
+
+#[tokio::test]
+async fn sign_in_with_no_built_in_client_says_so() {
+    let (mut h, _store) = running_on(1_000, None).await;
+    h.send(EngineMsg::SignIn);
+    h.rev(2).await;
+    h.sign_ins(1).await;
+    h.calendar.resolve_sign_in(
+        0,
+        Err(cal_err(
+            CalendarErrorKind::NoClient,
+            "no Google OAuth client built in",
+        )),
+    );
+    let snap = h.rev(3).await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    assert_eq!(sync_status(&snap), Some("no Google OAuth client built in"));
+}
+
+#[tokio::test]
+async fn a_stale_sign_in_outcome_is_dropped() {
+    let (mut h, _store) = running_on(1_000, None).await;
+    h.send(EngineMsg::SignIn);
+    h.rev(2).await;
+    h.send(EngineMsg::SignIn);
+    h.rev(3).await;
+    h.sign_ins(2).await;
+    h.calendar
+        .resolve_sign_in(0, Err(cal_err(CalendarErrorKind::Auth, "old attempt")));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(h.rx.borrow().rev, 3);
+    assert_eq!(h.rx.borrow().google, GoogleAccount::SigningIn);
+    h.calendar.resolve_sign_in(1, Ok(()));
+    let snap = h.rev(4).await;
+    assert_eq!(snap.google, GoogleAccount::SignedIn);
+    assert_eq!(sync_status(&snap), None);
+}
+
+#[tokio::test]
+async fn an_import_failure_keeps_the_plan_and_the_next_success_clears_sync() {
+    let (mut h, store) = running_on(1_000, None).await;
+    h.fetches(1).await;
+    let batches = store.batches().len();
+    h.calendar.resolve_fetch(
+        0,
+        Err(cal_err(CalendarErrorKind::Other, "Calendar API HTTP 503")),
+    );
+    let snap = h.rev(2).await;
+    assert_eq!(
+        sync_status(&snap),
+        Some("Calendar import failed: Calendar API HTTP 503")
+    );
+    assert!(day_of(&snap).items().is_empty());
+    assert_eq!(store.batches().len(), batches);
+    h.send(EngineMsg::SignIn);
+    h.rev(3).await;
+    h.sign_ins(1).await;
+    h.calendar.resolve_sign_in(0, Ok(()));
+    h.rev(4).await;
+    h.fetches(2).await;
+    h.calendar
+        .resolve_fetch(1, Ok(vec![event("a", "Standup", 9_000, 9_900)]));
+    let snap = h.rev(5).await;
+    assert_eq!(sync_status(&snap), None);
+    assert_eq!(day_of(&snap).items().len(), 1);
 }

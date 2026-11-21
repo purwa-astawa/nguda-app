@@ -24,13 +24,19 @@
 //! the fire-and-forget `ExportCsv`. Its `bool` only says whether a path was
 //! chosen (`false`: cancelled, nothing sent). The outcome arrives later as an
 //! [`ExportDoneEvent`] or an `export` status entry.
+//!
+//! [`sign_in`] is fire-and-forget like the plan commands: the engine runs the
+//! Google sign-in off its actor, and the snapshot's `google` field shows its
+//! progress (AD-17).
 
 use nguda_core::{
     BaselineItem, Date, Day, DayLogEntry, DayLogKind, DayReport, ExportRange, GapFigure, IsoWeek,
     ItemId, ItemStatus, LockChoice, LockDecision, PlanItem, PlannedSource, ReportRow, Slot,
     Timestamp, Uuid, WeekReport, closed_secs,
 };
-use nguda_engine::{EngineHandle, EngineMsg, InsertAnchor, ReorderAnchor, Snapshot, StatusKey};
+use nguda_engine::{
+    EngineHandle, EngineMsg, GoogleAccount, InsertAnchor, ReorderAnchor, Snapshot, StatusKey,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(any(debug_assertions, test))]
 use specta_typescript::Typescript;
@@ -259,6 +265,14 @@ pub fn carry_over_to_tomorrow(
     expected_rev: u32,
 ) -> Result<(), String> {
     send(&engine, Ok(carry_over_to_tomorrow_msg(expected_rev)))
+}
+
+/// Signs in to Google in the system browser (CAP-2). Fire-and-forget: progress
+/// shows in the snapshot's `google` field, and a failure as a `sync` status entry.
+#[tauri::command]
+#[specta::specta]
+pub fn sign_in(engine: State<'_, EngineHandle>) -> Result<(), String> {
+    send(&engine, Ok(sign_in_msg()))
 }
 
 /// The planned-versus-actual report of `date` (`YYYY-MM-DD`), or `null` when no
@@ -511,6 +525,10 @@ fn set_work_end_msg(minutes: u32) -> EngineMsg {
     EngineMsg::SetWorkEnd { minutes }
 }
 
+fn sign_in_msg() -> EngineMsg {
+    EngineMsg::SignIn
+}
+
 fn carry_over_to_tomorrow_msg(expected_rev: u32) -> EngineMsg {
     EngineMsg::CarryOverToTomorrow {
         expected_rev: expected_rev.into(),
@@ -585,6 +603,31 @@ pub struct SnapshotEvent {
     /// Every tag name ever stored, sorted case-insensitively: the suggestions for
     /// an item's tag editor.
     pub known_tags: Vec<String>,
+    /// The Google account state. Never an address or a token.
+    pub google: GoogleAccountView,
+}
+
+/// What the app knows about the Google account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum GoogleAccountView {
+    /// Still checking at startup.
+    Unknown,
+    SignedOut,
+    /// Waiting for the browser sign-in.
+    SigningIn,
+    SignedIn,
+}
+
+impl From<GoogleAccount> for GoogleAccountView {
+    fn from(g: GoogleAccount) -> Self {
+        match g {
+            GoogleAccount::Unknown => Self::Unknown,
+            GoogleAccount::SignedOut => Self::SignedOut,
+            GoogleAccount::SigningIn => Self::SigningIn,
+            GoogleAccount::SignedIn => Self::SignedIn,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
@@ -641,6 +684,8 @@ pub struct ItemView {
     pub interrupted: bool,
     /// The item's tags, in order.
     pub tags: Vec<String>,
+    /// The item was imported from a calendar event.
+    pub imported: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, specta::Type)]
@@ -682,6 +727,9 @@ pub enum StatusKeyView {
     Overflow,
     /// The last CSV export failed; cleared by the next successful one.
     Export,
+    /// The last Google sign-in or calendar import failed; cleared by the next
+    /// successful one.
+    Sync,
 }
 
 impl From<StatusKey> for StatusKeyView {
@@ -691,6 +739,7 @@ impl From<StatusKey> for StatusKeyView {
             StatusKey::CommandRejected => Self::CommandRejected,
             StatusKey::Overflow => Self::Overflow,
             StatusKey::Export => Self::Export,
+            StatusKey::Sync => Self::Sync,
         }
     }
 }
@@ -1001,6 +1050,7 @@ impl From<&Snapshot> for SnapshotEvent {
             work_end: s.work_end.to_string(),
             overflow: s.overflow.iter().map(ToString::to_string).collect(),
             known_tags: s.known_tags.clone(),
+            google: s.google.into(),
             status: s
                 .status
                 .iter()
@@ -1026,6 +1076,7 @@ fn item_view(day: &Day, i: &PlanItem, slot: &Slot) -> ItemView {
         scheduled_end: slot.span.map(|sp| sp.end.to_string()),
         interrupted: day.interrupt_stack().contains(&i.id()),
         tags: i.tags().to_vec(),
+        imported: i.source().is_some(),
     }
 }
 
@@ -1062,6 +1113,7 @@ pub fn specta_builder() -> Builder<Wry> {
             insert_task,
             set_work_end,
             carry_over_to_tomorrow,
+            sign_in,
             current_snapshot,
             query_day,
             query_week,
@@ -1086,7 +1138,7 @@ mod tests {
     use std::time::Duration;
 
     use nguda_adapters::{FsFileSink, SqliteStore, SystemClock, UuidV7Ids};
-    use nguda_core::{OrderKey, PlanItemRecord, Running, Segment, TimeZone, WorkEnd};
+    use nguda_core::{CalendarRef, OrderKey, PlanItemRecord, Running, Segment, TimeZone, WorkEnd};
     use nguda_engine::{EngineDeps, StatusEntry};
     use tokio::time::timeout;
 
@@ -1284,6 +1336,7 @@ mod tests {
             carry_over_to_tomorrow_msg(7),
             EngineMsg::CarryOverToTomorrow { expected_rev: 7 }
         );
+        assert_eq!(sign_in_msg(), EngineMsg::SignIn);
         let anchor = |place, id: Option<&str>| InsertAnchorArg {
             place,
             item_id: id.map(Into::into),
@@ -1392,6 +1445,8 @@ mod tests {
             segments: Vec::new(),
             carried_from: None,
             tags: Vec::new(),
+            source: None,
+            removed_by_source_at: None,
         }
     }
 
@@ -1404,6 +1459,12 @@ mod tests {
             fixed: true,
             pinned_start: Some(ts("2026-11-11T08:00:00Z")),
             tags: vec!["meeting".into(), "Team".into()],
+            source: Some(CalendarRef {
+                calendar_id: "me@example.com".into(),
+                source_id: "standup".into(),
+                instance_start: None,
+                source_secs: 1500,
+            }),
             ..record(F, "Standup", "V")
         };
         let a = PlanItemRecord {
@@ -1445,9 +1506,11 @@ mod tests {
                 message: "stale revision".into(),
             }],
             known_tags: vec!["meeting".into(), "old".into(), "Team".into()],
+            google: GoogleAccount::SignedIn,
         };
         let ev = SnapshotEvent::from(&snap);
         assert_eq!(ev.rev, 5);
+        assert_eq!(ev.google, GoogleAccountView::SignedIn);
         assert_eq!(ev.known_tags, ["meeting", "old", "Team"]);
         assert_eq!(ev.work_end, "18:05");
         assert_eq!(ev.overflow, [B]);
@@ -1475,9 +1538,11 @@ mod tests {
                 scheduled_end: Some("2026-11-11T08:25:00Z".into()),
                 interrupted: false,
                 tags: vec!["meeting".into(), "Team".into()],
+                imported: true,
             }
         );
         assert!(ev.items[1].tags.is_empty());
+        assert!(!ev.items[1].imported, "a local item");
         // A ends at its planned end (1500 s less 60 banked); B flows after it.
         let times = |n: usize| {
             let i = &ev.items[n];
@@ -1550,6 +1615,12 @@ mod tests {
         assert_eq!(key(StatusKey::CommandRejected), "\"commandRejected\"");
         assert_eq!(key(StatusKey::Overflow), "\"overflow\"");
         assert_eq!(key(StatusKey::Export), "\"export\"");
+        assert_eq!(key(StatusKey::Sync), "\"sync\"");
+        let google = |g| serde_json::to_string(&GoogleAccountView::from(g)).unwrap();
+        assert_eq!(google(GoogleAccount::Unknown), "\"unknown\"");
+        assert_eq!(google(GoogleAccount::SignedOut), "\"signedOut\"");
+        assert_eq!(google(GoogleAccount::SigningIn), "\"signingIn\"");
+        assert_eq!(google(GoogleAccount::SignedIn), "\"signedIn\"");
         let status = |s| serde_json::to_string(&ItemStatusView::from(s)).unwrap();
         assert_eq!(status(ItemStatus::CarriedOver), "\"carriedOver\"");
         assert_eq!(status(ItemStatus::Paused), "\"paused\"");
@@ -1585,6 +1656,7 @@ mod tests {
                 overflow: vec![],
                 status: vec![],
                 known_tags: vec![],
+                google: GoogleAccountView::Unknown,
             }
         );
     }
@@ -1959,6 +2031,7 @@ mod tests {
                 store: Arc::new(store),
                 ids: Arc::new(UuidV7Ids),
                 files: Arc::new(FsFileSink),
+                calendar: Arc::new(crate::IdleCalendar),
                 tz: TimeZone::UTC,
             })
             .0

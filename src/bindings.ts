@@ -49,6 +49,11 @@ export const commands = {
 	 */
 	carryOverToTomorrow: (expectedRev: number) => typedError<null, string>(__TAURI_INVOKE("carry_over_to_tomorrow", { expectedRev })),
 	/**
+	 *  Signs in to Google in the system browser (CAP-2). Fire-and-forget: progress
+	 *  shows in the snapshot's `google` field, and a failure as a `sync` status entry.
+	 */
+	signIn: () => typedError<null, string>(__TAURI_INVOKE("sign_in")),
+	/**
 	 *  The latest snapshot, read from the engine's `watch` receiver. Sends nothing to
 	 *  the engine (AD-4), so a window that loads after the last event still renders.
 	 */
@@ -232,6 +237,13 @@ export type GapView_Serialize = {
 	plannedSecs: number,
 };
 
+/**  What the app knows about the Google account. */
+export type GoogleAccountView = 
+/**  Still checking at startup. */
+"unknown" | "signedOut" | 
+/**  Waiting for the browser sign-in. */
+"signingIn" | "signedIn";
+
 /**
  *  An insert target, never a numeric index (AD-15). `before` and `after` need
  *  `itemId`; `now` and `end` ignore it.
@@ -295,6 +307,8 @@ export type ItemView_Deserialize = {
 	interrupted: boolean,
 	/**  The item's tags, in order. */
 	tags: string[],
+	/**  The item was imported from a calendar event. */
+	imported: boolean,
 };
 
 export type ItemView_Serialize = {
@@ -325,6 +339,8 @@ export type ItemView_Serialize = {
 	interrupted: boolean,
 	/**  The item's tags, in order. */
 	tags: string[],
+	/**  The item was imported from a calendar event. */
+	imported: boolean,
 };
 
 /**
@@ -490,6 +506,8 @@ export type SnapshotEvent_Deserialize = {
 	 *  an item's tag editor.
 	 */
 	knownTags: string[],
+	/**  The Google account state. Never an address or a token. */
+	google: GoogleAccountView,
 };
 
 /**
@@ -520,11 +538,18 @@ export type SnapshotEvent_Serialize = {
 	 *  an item's tag editor.
 	 */
 	knownTags: string[],
+	/**  The Google account state. Never an address or a token. */
+	google: GoogleAccountView,
 };
 
 export type StatusKeyView = "store" | "commandRejected" | "overflow" | 
 /**  The last CSV export failed; cleared by the next successful one. */
-"export";
+"export" | 
+/**
+ *  The last Google sign-in or calendar import failed; cleared by the next
+ *  successful one.
+ */
+"sync";
 
 export type StatusView = {
 	key: StatusKeyView,

@@ -14,9 +14,9 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use nguda_core::{
-    Baseline, BaselineItem, Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, LockDecision,
-    OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Segment, Settings, Span, Store, StoreBatch,
-    StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
+    Baseline, BaselineItem, CalendarRef, Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus,
+    LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Segment, Settings, Span,
+    Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Params, Row, Transaction, params};
 use rusqlite_migration::{Migrations, SchemaVersion};
@@ -338,12 +338,15 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
         StoreOp::PutItem { date, item } => {
             let id = item.id();
             let ctx = format!("put item {id}");
+            let source = item.source();
             let changed = tx
                 .execute(
                     r#"INSERT INTO plan_item
                          (id, day_date, title, planned_secs, "order", fixed, pinned_start,
-                          status, removed_at, carried_from)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                          status, removed_at, carried_from, calendar_id, source_id,
+                          instance_start, source_secs, removed_by_source_at)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                               ?15)
                        ON CONFLICT (id) DO UPDATE SET
                          title = excluded.title,
                          planned_secs = excluded.planned_secs,
@@ -352,7 +355,12 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                          pinned_start = excluded.pinned_start,
                          status = excluded.status,
                          removed_at = excluded.removed_at,
-                         carried_from = excluded.carried_from
+                         carried_from = excluded.carried_from,
+                         calendar_id = excluded.calendar_id,
+                         source_id = excluded.source_id,
+                         instance_start = excluded.instance_start,
+                         source_secs = excluded.source_secs,
+                         removed_by_source_at = excluded.removed_by_source_at
                        WHERE day_date = excluded.day_date"#,
                     params![
                         id.to_string(),
@@ -367,6 +375,21 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                         status_str(item.status()),
                         item.removed_at().map(|t| to_nanos(t, &ctx)).transpose()?,
                         item.carried_from().map(|id| id.to_string()),
+                        source.map(|s| s.calendar_id.as_str()),
+                        source.map(|s| s.source_id.as_str()),
+                        source
+                            .and_then(|s| s.instance_start)
+                            .map(|t| to_nanos(t, &ctx))
+                            .transpose()?,
+                        source
+                            .map(|s| i64::try_from(s.source_secs))
+                            .transpose()
+                            .map_err(|_| StoreError::new(format!(
+                                "{ctx}: source_secs out of range"
+                            )))?,
+                        item.removed_by_source_at()
+                            .map(|t| to_nanos(t, &ctx))
+                            .transpose()?,
                     ],
                 )
                 .map_err(sql_err(&ctx))?;
@@ -843,6 +866,11 @@ struct ItemRow {
     status: String,
     removed_at: Option<i64>,
     carried_from: Option<String>,
+    calendar_id: Option<String>,
+    source_id: Option<String>,
+    instance_start: Option<i64>,
+    source_secs: Option<i64>,
+    removed_by_source_at: Option<i64>,
 }
 
 fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
@@ -865,7 +893,8 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
     let rows = query_all(
         conn,
         r#"SELECT id, title, planned_secs, "order", fixed, pinned_start, status, removed_at,
-                  carried_from
+                  carried_from, calendar_id, source_id, instance_start, source_secs,
+                  removed_by_source_at
            FROM plan_item WHERE day_date = ?1 ORDER BY rowid"#,
         [&date_text],
         &ctx,
@@ -880,6 +909,11 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
                 status: r.get(6)?,
                 removed_at: r.get(7)?,
                 carried_from: r.get(8)?,
+                calendar_id: r.get(9)?,
+                source_id: r.get(10)?,
+                instance_start: r.get(11)?,
+                source_secs: r.get(12)?,
+                removed_by_source_at: r.get(13)?,
             })
         },
     )?;
@@ -961,6 +995,19 @@ fn restore_item(
 ) -> Result<PlanItem, StoreError> {
     let bad = |what: &str| StoreError::new(format!("item {id}: invalid {what}"));
     let ctx = format!("item {id}");
+    let source = match (row.calendar_id, row.source_id, row.source_secs) {
+        (None, None, None) => None,
+        (Some(calendar_id), Some(source_id), Some(secs)) => Some(CalendarRef {
+            calendar_id,
+            source_id,
+            instance_start: row
+                .instance_start
+                .map(|n| from_nanos(n, &ctx))
+                .transpose()?,
+            source_secs: u64::try_from(secs).map_err(|_| bad("source_secs"))?,
+        }),
+        _ => return Err(bad("source")),
+    };
     let record = PlanItemRecord {
         id,
         title: row.title,
@@ -973,6 +1020,11 @@ fn restore_item(
         segments,
         carried_from: row.carried_from.as_deref().map(parse_id).transpose()?,
         tags,
+        source,
+        removed_by_source_at: row
+            .removed_by_source_at
+            .map(|n| from_nanos(n, &ctx))
+            .transpose()?,
     };
     PlanItem::restore(record).map_err(|e| StoreError::new(e.to_string()))
 }

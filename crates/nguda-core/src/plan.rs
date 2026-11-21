@@ -106,6 +106,33 @@ pub struct PlanItem {
     segments: Vec<Segment>,
     carried_from: Option<ItemId>,
     tags: Vec<String>,
+    /// Boxed: most items are local, and an item travels inside store ops.
+    source: Option<Box<CalendarRef>>,
+    removed_by_source_at: Option<Timestamp>,
+}
+
+/// Where an imported item came from (AD-9): its merge key
+/// `(calendar_id, source_id, instance_start)` and the event length Google last
+/// reported, so a re-import can keep the user's local extensions.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CalendarRef {
+    /// The calendar's id, as Google reports it (never the alias `primary`).
+    pub calendar_id: String,
+    /// The event's id within the calendar.
+    pub source_id: String,
+    /// A recurring instance's original start; `None` for a single event.
+    pub instance_start: Option<Timestamp>,
+    /// The event's length in whole seconds at the last import.
+    pub source_secs: u64,
+}
+
+impl CalendarRef {
+    /// Whether `other` names the same event instance (the merge key, AD-9).
+    pub fn same_key(&self, other: &CalendarRef) -> bool {
+        self.calendar_id == other.calendar_id
+            && self.source_id == other.source_id
+            && self.instance_start == other.instance_start
+    }
 }
 
 /// Every field of a [`PlanItem`], public, for rehydrating stored rows. Turn it into
@@ -125,12 +152,17 @@ pub struct PlanItemRecord {
     pub carried_from: Option<ItemId>,
     /// The item's tags, already normalised (see [`crate::normalize_tags`]), in order.
     pub tags: Vec<String>,
+    /// The calendar event this item was imported from, `None` for a local item.
+    pub source: Option<CalendarRef>,
+    /// When Google cancelled the event (AD-9). Requires `source`.
+    pub removed_by_source_at: Option<Timestamp>,
 }
 
 impl PlanItem {
     /// Rebuilds a stored item, rejecting a record that breaks an item invariant:
     /// fixed exactly when pinned, removed exactly when tombstoned, no inverted closed
-    /// segment, at most one open segment, and an open segment exactly when running.
+    /// segment, at most one open segment, an open segment exactly when running, and
+    /// `removed_by_source_at` only on an imported item.
     pub fn restore(record: PlanItemRecord) -> Result<Self, DomainError> {
         let invalid = |reason| DomainError::InvalidRecord {
             id: record.id,
@@ -156,6 +188,9 @@ impl PlanItem {
         if (record.status == ItemStatus::Running) != (open == 1) {
             return Err(invalid("open segment must match running status"));
         }
+        if record.removed_by_source_at.is_some() && record.source.is_none() {
+            return Err(invalid("removed_by_source_at requires a source"));
+        }
         let PlanItemRecord {
             id,
             title,
@@ -168,6 +203,8 @@ impl PlanItem {
             segments,
             carried_from,
             tags,
+            source,
+            removed_by_source_at,
         } = record;
         Ok(Self {
             id,
@@ -181,6 +218,8 @@ impl PlanItem {
             segments,
             carried_from,
             tags,
+            source: source.map(Box::new),
+            removed_by_source_at,
         })
     }
 
@@ -198,7 +237,24 @@ impl PlanItem {
             segments: Vec::new(),
             carried_from: None,
             tags: Vec::new(),
+            source: None,
+            removed_by_source_at: None,
         }
+    }
+
+    /// A new fixed, pending item imported from a calendar event (AD-9), pinned at
+    /// `start` and planned for the event's length.
+    pub(crate) fn imported(
+        id: ItemId,
+        title: impl Into<String>,
+        start: Timestamp,
+        order: OrderKey,
+        source: CalendarRef,
+    ) -> Self {
+        let mut item = Self::new(id, title, source.source_secs, order);
+        item.set_fixed(start);
+        item.source = Some(Box::new(source));
+        item
     }
 
     /// A new flexible, pending item carried over from item `from` of an earlier day
@@ -264,6 +320,16 @@ impl PlanItem {
         &self.tags
     }
 
+    /// The calendar event this item was imported from, if any (AD-9).
+    pub fn source(&self) -> Option<&CalendarRef> {
+        self.source.as_deref()
+    }
+
+    /// When Google cancelled the imported event, if it did (AD-9).
+    pub fn removed_by_source_at(&self) -> Option<Timestamp> {
+        self.removed_by_source_at
+    }
+
     /// Pins the item at `pinned_start`, making it fixed.
     pub(crate) fn set_fixed(&mut self, pinned_start: Timestamp) {
         self.fixed = true;
@@ -290,6 +356,12 @@ impl PlanItem {
 
     pub(crate) fn set_tags(&mut self, tags: Vec<String>) {
         self.tags = tags;
+    }
+
+    pub(crate) fn set_source_secs(&mut self, secs: u64) {
+        if let Some(source) = &mut self.source {
+            source.source_secs = secs;
+        }
     }
 
     /// Returns a copy with `f` applied. Every state except Removed allows plan edits.
@@ -681,6 +753,12 @@ impl Day {
     /// normalised (see [`crate::normalize_tags`]). A removed item rejects it.
     pub fn set_tags(&mut self, id: ItemId, tags: Vec<String>) -> Result<(), DomainError> {
         self.apply(id, |i| i.edit(|n| n.set_tags(tags)))
+    }
+
+    /// Records `secs` as the event length Google last reported for the imported
+    /// item `id` (AD-9). A local item is left as is; a removed one rejects it.
+    pub(crate) fn set_source_secs(&mut self, id: ItemId, secs: u64) -> Result<(), DomainError> {
+        self.apply(id, |i| i.edit(|n| n.set_source_secs(secs)))
     }
 
     /// Adds `secs` to the running item `id`'s planned length (AD-6: the plan grows,
@@ -1222,6 +1300,8 @@ mod tests {
             segments: Vec::new(),
             carried_from: None,
             tags: Vec::new(),
+            source: None,
+            removed_by_source_at: None,
         }
     }
 
@@ -1257,9 +1337,33 @@ mod tests {
                 segments: i.segments().to_vec(),
                 carried_from: i.carried_from(),
                 tags: i.tags().to_vec(),
+                source: i.source().cloned(),
+                removed_by_source_at: i.removed_by_source_at(),
             };
             assert_eq!(PlanItem::restore(r), Ok(i), "{s}");
         }
+    }
+
+    #[test]
+    fn restore_requires_a_source_for_removed_by_source_at() {
+        assert_invalid(PlanItemRecord {
+            removed_by_source_at: Some(ts(10)),
+            ..record(ItemStatus::Pending)
+        });
+        let source = CalendarRef {
+            calendar_id: "cal".into(),
+            source_id: "ev".into(),
+            instance_start: Some(ts(5)),
+            source_secs: 1500,
+        };
+        let r = PlanItemRecord {
+            source: Some(source.clone()),
+            removed_by_source_at: Some(ts(10)),
+            ..record(ItemStatus::Pending)
+        };
+        let i = PlanItem::restore(r).unwrap();
+        assert_eq!(i.source(), Some(&source));
+        assert_eq!(i.removed_by_source_at(), Some(ts(10)));
     }
 
     #[test]
