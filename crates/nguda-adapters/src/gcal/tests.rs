@@ -215,7 +215,10 @@ async fn sign_in_exchanges_the_code_and_stores_the_refresh_token() {
 
     // The access token from the exchange is reused: no refresh happens.
     let (from, to) = window();
-    assert_eq!(source.fetch_primary(from, to).await.unwrap(), vec![]);
+    assert_eq!(
+        source.sync_primary(None, from, to).await.unwrap().changes,
+        vec![]
+    );
     assert_get_only(&server.received_requests().await.unwrap());
 }
 
@@ -267,7 +270,7 @@ async fn a_token_error_carries_the_oauth_code_only() {
         no_browser(),
     );
     let (from, to) = window();
-    let err = source.fetch_primary(from, to).await.unwrap_err();
+    let err = source.sync_primary(None, from, to).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::Auth);
     assert!(err.message.contains("invalid_grant"), "{err}");
     assert!(!err.message.contains("rt-9"), "{err}");
@@ -299,7 +302,7 @@ async fn fetch_without_a_refresh_token_is_not_signed_in() {
         no_browser(),
     );
     let (from, to) = window();
-    let err = source.fetch_primary(from, to).await.unwrap_err();
+    let err = source.sync_primary(None, from, to).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
     assert!(server.received_requests().await.unwrap().is_empty());
 }
@@ -336,8 +339,10 @@ async fn fetch_refreshes_then_parses_and_pages_the_primary_events() {
             { "id": "gone", "status": "cancelled" },
             timed("empty", "Zero", "2026-11-21T13:00:00Z", "2026-11-21T13:00:00Z"),
             timed("overnight", "Late", "2026-11-20T23:00:00Z", "2026-11-21T01:00:00Z"),
+            timed("tomorrow", "Next", "2026-11-22T00:00:00Z", "2026-11-22T01:00:00Z"),
         ],
         "nextPageToken": "p2",
+        "nextSyncToken": "not-the-last-page",
     });
     let page2 = json!({
         "items": [
@@ -351,13 +356,17 @@ async fn fetch_refreshes_then_parses_and_pages_the_primary_events() {
                 ],
             },
         ],
+        "nextSyncToken": "sync-1",
     });
     Mock::given(method("GET"))
         .and(path(events))
         .and(query_param("timeMin", "2026-11-21T00:00:00Z"))
         .and(query_param("timeMax", "2026-11-22T00:00:00Z"))
         .and(query_param("singleEvents", "true"))
-        .and(query_param("orderBy", "startTime"))
+        .and(query_param("showDeleted", "true"))
+        .and(query_param("maxResults", "250"))
+        .and(query_param_is_missing("orderBy"))
+        .and(query_param_is_missing("syncToken"))
         .and(query_param_is_missing("pageToken"))
         .and(header("authorization", "Bearer at-2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(page1))
@@ -376,31 +385,38 @@ async fn fetch_refreshes_then_parses_and_pages_the_primary_events() {
         no_browser(),
     );
     let (from, to) = window();
-    let got = source.fetch_primary(from, to).await.unwrap();
+    let got = source.sync_primary(None, from, to).await.unwrap();
     let ts = |s: &str| s.parse::<Timestamp>().unwrap();
+    assert_eq!(got.calendar_id, "me@example.com");
+    assert_eq!(got.next_token.as_deref(), Some("sync-1"));
     assert_eq!(
-        got,
+        got.changes,
         vec![
-            FetchedEvent {
+            CalendarChange::Upsert(FetchedEvent {
                 calendar_id: "me@example.com".into(),
                 source_id: "a".into(),
                 instance_start: None,
                 title: "Standup".into(),
                 start: ts("2026-11-21T08:00:00Z"),
                 end: ts("2026-11-21T08:15:00Z"),
-            },
-            FetchedEvent {
+            }),
+            CalendarChange::Cancelled(EventKey {
+                calendar_id: "me@example.com".into(),
+                source_id: "gone".into(),
+                instance_start: None,
+            }),
+            CalendarChange::Upsert(FetchedEvent {
                 calendar_id: "me@example.com".into(),
                 source_id: "weekly_20261121T140000Z".into(),
                 instance_start: Some(ts("2026-11-21T14:00:00Z")),
                 title: "(no title)".into(),
                 start: ts("2026-11-21T15:00:00Z"),
                 end: ts("2026-11-21T15:30:00Z"),
-            },
+            }),
         ]
     );
     // A second fetch reuses the refreshed access token (the token mock expects 1).
-    source.fetch_primary(from, to).await.unwrap();
+    source.sync_primary(None, from, to).await.unwrap();
     assert_get_only(&server.received_requests().await.unwrap());
 }
 
@@ -422,7 +438,7 @@ async fn an_http_failure_is_an_other_error_without_details() {
         no_browser(),
     );
     let (from, to) = window();
-    let err = source.fetch_primary(from, to).await.unwrap_err();
+    let err = source.sync_primary(None, from, to).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::Other);
     assert_eq!(err.message, "Calendar API HTTP 503");
 }
@@ -457,7 +473,7 @@ async fn an_unreadable_keyring_is_not_signed_in() {
     let server = MockServer::start().await;
     let source = GcalSource::new(config(&server), Arc::new(BrokenSecrets), no_browser());
     let (from, to) = window();
-    let err = source.fetch_primary(from, to).await.unwrap_err();
+    let err = source.sync_primary(None, from, to).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
     assert!(server.received_requests().await.unwrap().is_empty());
 }
@@ -481,6 +497,162 @@ async fn a_sign_in_that_cannot_be_stored_leaves_no_session() {
     assert_eq!(err.kind, CalendarErrorKind::Other);
     // The exchanged access token was not kept: a fetch is not signed in.
     let (from, to) = window();
-    let err = source.fetch_primary(from, to).await.unwrap_err();
+    let err = source.sync_primary(None, from, to).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
+}
+
+/// A token mock answering any refresh with access token `at`.
+async fn mount_token(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(None, "at")))
+        .mount(server)
+        .await;
+}
+
+fn signed_in(server: &MockServer) -> GcalSource {
+    GcalSource::new(
+        config(server),
+        MemorySecrets::with_refresh("rt"),
+        no_browser(),
+    )
+}
+
+#[tokio::test]
+async fn an_incremental_sync_sends_only_the_token_and_parses_cancellations() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    // The cursor names the calendar: no primary lookup.
+    Mock::given(method("GET"))
+        .and(path("/calendar/v3/users/me/calendarList/primary"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "x" })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let events = "/calendar/v3/calendars/me@example.com/events";
+    let page1 = json!({
+        "items": [
+            timed("moved", "Moved away", "2026-11-23T09:00:00Z", "2026-11-23T10:00:00Z"),
+            { "id": "single", "status": "cancelled" },
+            {
+                "id": "weekly_20261121T140000Z", "status": "cancelled",
+                "recurringEventId": "weekly",
+                "originalStartTime": { "dateTime": "2026-11-21T14:00:00Z" },
+            },
+        ],
+        "nextPageToken": "p2",
+    });
+    let page2 = json!({
+        "items": [
+            timed("today", "Retitled", "2026-11-21T10:00:00Z", "2026-11-21T10:30:00Z"),
+        ],
+        "nextSyncToken": "sync-2",
+    });
+    Mock::given(method("GET"))
+        .and(path(events))
+        .and(query_param("syncToken", "sync-1"))
+        .and(query_param("singleEvents", "true"))
+        .and(query_param("showDeleted", "true"))
+        .and(query_param("maxResults", "250"))
+        .and(query_param_is_missing("timeMin"))
+        .and(query_param_is_missing("timeMax"))
+        .and(query_param_is_missing("orderBy"))
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page1))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(events))
+        .and(query_param("syncToken", "sync-1"))
+        .and(query_param("pageToken", "p2"))
+        .and(query_param_is_missing("timeMin"))
+        .and(query_param_is_missing("timeMax"))
+        .and(query_param_is_missing("orderBy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page2))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let source = signed_in(&server);
+    let (from, to) = window();
+    let cursor = Some(("me@example.com".to_owned(), "sync-1".to_owned()));
+    let got = source.sync_primary(cursor, from, to).await.unwrap();
+    let ts = |s: &str| s.parse::<Timestamp>().unwrap();
+    assert_eq!(got.calendar_id, "me@example.com");
+    assert_eq!(got.next_token.as_deref(), Some("sync-2"));
+    assert_eq!(
+        got.changes,
+        vec![
+            CalendarChange::Cancelled(EventKey {
+                calendar_id: "me@example.com".into(),
+                source_id: "single".into(),
+                instance_start: None,
+            }),
+            CalendarChange::Cancelled(EventKey {
+                calendar_id: "me@example.com".into(),
+                source_id: "weekly_20261121T140000Z".into(),
+                instance_start: Some(ts("2026-11-21T14:00:00Z")),
+            }),
+            CalendarChange::Upsert(FetchedEvent {
+                calendar_id: "me@example.com".into(),
+                source_id: "today".into(),
+                instance_start: None,
+                title: "Retitled".into(),
+                start: ts("2026-11-21T10:00:00Z"),
+                end: ts("2026-11-21T10:30:00Z"),
+            }),
+        ]
+    );
+    assert_get_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test]
+async fn a_last_page_without_a_sync_token_yields_none() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_primary(&server, "me@example.com").await;
+    Mock::given(method("GET"))
+        .and(path("/calendar/v3/calendars/me@example.com/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                timed("a", "Standup", "2026-11-21T09:00:00Z", "2026-11-21T09:15:00Z"),
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let (from, to) = window();
+    let got = signed_in(&server)
+        .sync_primary(None, from, to)
+        .await
+        .unwrap();
+    assert_eq!(got.changes.len(), 1);
+    assert_eq!(got.next_token, None);
+}
+
+#[tokio::test]
+async fn limits_and_an_expired_sync_token_have_their_own_kinds() {
+    for (code, kind) in [
+        (403, CalendarErrorKind::RateLimited),
+        (429, CalendarErrorKind::RateLimited),
+        (410, CalendarErrorKind::Gone),
+    ] {
+        let server = MockServer::start().await;
+        mount_token(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(code).set_body_string("Standup sync-1"))
+            .mount(&server)
+            .await;
+        let (from, to) = window();
+        let cursor = Some(("me@example.com".to_owned(), "sync-1".to_owned()));
+        let err = signed_in(&server)
+            .sync_primary(cursor, from, to)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, kind, "{code}");
+        assert!(err.message.contains(&code.to_string()), "{err}");
+        assert!(!err.message.contains("sync-1"), "{err}");
+        assert!(!err.message.contains("Standup"), "{err}");
+        assert_get_only(&server.received_requests().await.unwrap());
+    }
 }

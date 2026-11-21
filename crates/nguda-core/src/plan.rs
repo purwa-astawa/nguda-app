@@ -761,6 +761,40 @@ impl Day {
         self.apply(id, |i| i.edit(|n| n.set_source_secs(secs)))
     }
 
+    /// Applies Google's explicit cancellation of the imported item `id` at `now`
+    /// (AD-9). A pending or paused item becomes a removed tombstone
+    /// (`removed_at` and `removed_by_source_at` both `now`) and leaves the
+    /// interrupt stack; a running, done or carried-over item only gets
+    /// `removed_by_source_at`, keeping its status. Segments, `fixed`, `tags` and
+    /// `order` are always kept. An item already removed, already cancelled by its
+    /// source, or local is left as is. Returns whether the item changed.
+    pub(crate) fn remove_by_source(
+        &mut self,
+        id: ItemId,
+        now: Timestamp,
+    ) -> Result<bool, DomainError> {
+        let idx = self.index(id)?;
+        let item = &self.items[idx];
+        if item.status == ItemStatus::Removed
+            || item.removed_by_source_at.is_some()
+            || item.source.is_none()
+        {
+            return Ok(false);
+        }
+        let mut next = item.clone();
+        if matches!(next.status, ItemStatus::Pending | ItemStatus::Paused) {
+            next.status = ItemStatus::Removed;
+            next.removed_at = Some(now);
+        }
+        next.removed_by_source_at = Some(now);
+        let removed = next.status == ItemStatus::Removed;
+        self.items[idx] = next;
+        if removed {
+            self.unstack(id);
+        }
+        Ok(true)
+    }
+
     /// Adds `secs` to the running item `id`'s planned length (AD-6: the plan grows,
     /// not "now"), returning the new planned length. Only a running item can be
     /// extended (AD-15). An extension that would overflow `u64` is rejected as an

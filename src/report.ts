@@ -113,6 +113,8 @@ export function markerLabel(marker: Pick<MarkerView_Serialize, "kind" | "secs">)
       return "Carried over";
     case "recovered":
       return "Recovered";
+    case "calendarChanged":
+      return "Calendar changed";
   }
 }
 

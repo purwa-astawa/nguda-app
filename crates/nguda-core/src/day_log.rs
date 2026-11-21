@@ -27,4 +27,7 @@ pub enum DayLogKind {
     Inserted { item_id: ItemId },
     /// The leftover `item_id` was carried over to tomorrow as the new item `to`.
     CarriedOver { item_id: ItemId, to: ItemId },
+    /// A calendar sync added, changed, or cancelled the imported item `item_id`
+    /// (AD-9).
+    CalendarChanged { item_id: ItemId },
 }

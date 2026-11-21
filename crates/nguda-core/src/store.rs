@@ -11,6 +11,7 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 
 use crate::baseline::{Baseline, LockDecision};
+use crate::calendar::SyncCursor;
 use crate::day_log::DayLogEntry;
 use crate::plan::{Day, ItemId, PlanItem};
 use crate::settings::{Settings, WorkEnd};
@@ -50,6 +51,11 @@ pub enum StoreOp {
     /// Writes the stored day's baseline (AD-6). Insert-only: a second baseline for
     /// the same date fails, rolling back the whole batch. Its items must exist.
     PutBaseline { baseline: Baseline },
+    /// Stores `cursor` as its calendar's sync cursor, replacing any earlier one
+    /// (AD-17).
+    PutSyncCursor { cursor: SyncCursor },
+    /// Deletes the calendar's sync cursor. Deleting a missing one is not an error.
+    ClearSyncCursor { calendar_id: String },
 }
 
 /// Where the one open segment is: its item's day, the item, and its start.
@@ -151,4 +157,7 @@ pub trait Store: Send + Sync + 'static {
 
     /// The date of every stored day, ascending.
     fn stored_dates(&self) -> StoreFuture<Vec<Date>>;
+
+    /// Every stored calendar sync cursor, in any order.
+    fn load_sync_cursors(&self) -> StoreFuture<Vec<SyncCursor>>;
 }

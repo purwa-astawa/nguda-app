@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use nguda_core::{
     Baseline, BaselineItem, CalendarRef, Day, DayLogEntry, DayLogKind, ItemId, LockDecision,
     OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Settings, Span, Store, StoreBatch, StoreOp,
-    Timestamp, Uuid, WorkEnd,
+    SyncCursor, Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
@@ -192,7 +192,7 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 10);
+    assert_eq!(user_version(&path), 11);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
@@ -281,7 +281,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     // connection: a read-write open closing it would checkpoint them.
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-    raw.pragma_update(None, "user_version", 11).unwrap();
+    raw.pragma_update(None, "user_version", 12).unwrap();
     let copy = dir.path().join("newer.db");
     let wal = |p: &Path| PathBuf::from(format!("{}-wal", p.display()));
     std::fs::copy(&path, &copy).unwrap();
@@ -296,14 +296,14 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     assert_eq!(
         err,
         OpenError::NewerSchema {
-            found: 11,
-            supported: 10
+            found: 12,
+            supported: 11
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read(wal(&path)).unwrap(), wal_before);
     assert!(backups(&dir).is_empty());
-    assert_eq!(user_version(&path), 11);
+    assert_eq!(user_version(&path), 12);
 }
 
 #[tokio::test]
@@ -505,7 +505,7 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 10);
+    assert_eq!(user_version(&path), 11);
     assert!(has_table(&path, "engine_meta"));
 }
 
@@ -1195,7 +1195,7 @@ async fn v8_decides_days_with_time_no_lock_and_leaves_the_rest_undecided() {
     assert_eq!(untouched.lock_decision(), LockDecision::None);
     assert_eq!(store.load_baseline(date()).await.unwrap(), None);
     drop(store);
-    assert_eq!(user_version(&path), 10);
+    assert_eq!(user_version(&path), 11);
     assert_eq!(backups(&dir), vec![backup_path(&path, 7)]);
 }
 
@@ -1442,6 +1442,148 @@ async fn v10_leaves_existing_items_local() {
             .all(|i| i.removed_by_source_at().is_none())
     );
     drop(store);
-    assert_eq!(user_version(&path), 10);
+    assert_eq!(user_version(&path), 11);
     assert_eq!(backups(&dir), vec![backup_path(&path, 9)]);
+}
+
+#[tokio::test]
+async fn calendar_changed_day_log_entries_round_trip_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let entry = DayLogEntry {
+        at: ts(1_700),
+        kind: DayLogKind::CalendarChanged { item_id: id(2) },
+    };
+    store
+        .commit(batch([StoreOp::AppendDayLog {
+            date: date(),
+            entry: entry.clone(),
+        }]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.load_day_log(date()).await.unwrap(), vec![entry]);
+}
+
+#[tokio::test]
+async fn a_calendar_changed_entry_without_an_item_fails_the_load() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    drop(seeded(&path).await);
+    let raw = Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO day_log (day_date, at, kind) VALUES (?1, 0, 'calendar_changed')",
+        [date().to_string()],
+    )
+    .unwrap();
+    drop(raw);
+    let store = SqliteStore::open(&path).unwrap();
+    let err = store.load_day_log(date()).await.unwrap_err();
+    assert!(err.message.contains("missing item id"), "{err}");
+}
+
+fn cursor(calendar_id: &str, token: &str, date: nguda_core::Date) -> SyncCursor {
+    SyncCursor {
+        calendar_id: calendar_id.into(),
+        token: token.into(),
+        date,
+    }
+}
+
+#[tokio::test]
+async fn sync_cursors_are_upserted_cleared_and_survive_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = SqliteStore::open(&path).unwrap();
+    assert!(store.load_sync_cursors().await.unwrap().is_empty());
+    store
+        .commit(batch([
+            StoreOp::PutSyncCursor {
+                cursor: cursor("a@example.com", "tok-1", date()),
+            },
+            StoreOp::PutSyncCursor {
+                cursor: cursor("b@example.com", "tok-b", date()),
+            },
+            // Replaces the first cursor: one per calendar.
+            StoreOp::PutSyncCursor {
+                cursor: cursor("a@example.com", "tok-2", other_date()),
+            },
+        ]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let mut loaded = store.load_sync_cursors().await.unwrap();
+    loaded.sort_by(|x, y| x.calendar_id.cmp(&y.calendar_id));
+    assert_eq!(
+        loaded,
+        vec![
+            cursor("a@example.com", "tok-2", other_date()),
+            cursor("b@example.com", "tok-b", date()),
+        ]
+    );
+    store
+        .commit(batch([
+            StoreOp::ClearSyncCursor {
+                calendar_id: "a@example.com".into(),
+            },
+            // Clearing a missing cursor is not an error.
+            StoreOp::ClearSyncCursor {
+                calendar_id: "nobody@example.com".into(),
+            },
+        ]))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store.load_sync_cursors().await.unwrap(),
+        vec![cursor("b@example.com", "tok-b", date())]
+    );
+}
+
+#[tokio::test]
+async fn a_failing_batch_rolls_back_its_cursor_op() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = SqliteStore::open(&path).unwrap();
+    let failing = batch([
+        StoreOp::PutSyncCursor {
+            cursor: cursor("a@example.com", "tok-1", date()),
+        },
+        // No such day: the log append fails, and the cursor must not stay.
+        StoreOp::AppendDayLog {
+            date: other_date(),
+            entry: DayLogEntry {
+                at: ts(1),
+                kind: DayLogKind::CalendarChanged { item_id: id(1) },
+            },
+        },
+    ]);
+    assert!(store.commit(failing).await.is_err());
+    assert!(store.load_sync_cursors().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn v11_adds_an_empty_cursor_table_and_keeps_the_plan() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    drop(SqliteStore::open_with(&path, &migrations_through(10)).unwrap());
+    assert!(!has_table(&path, "calendar_sync"));
+    // A v10 database holds everything the current adapter writes for a day.
+    {
+        let store = SqliteStore::open_with(&path, &migrations_through(10)).unwrap();
+        store.commit(batch_for(&sample_day())).await.unwrap();
+    }
+    assert_eq!(user_version(&path), 10);
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(user_version(&path), 11);
+    assert!(has_table(&path, "calendar_sync"));
+    assert_eq!(store.load_day(date()).await.unwrap().unwrap(), sample_day());
+    assert!(store.load_sync_cursors().await.unwrap().is_empty());
+    drop(store);
+    assert_eq!(backups(&dir), vec![backup_path(&path, 10)]);
 }

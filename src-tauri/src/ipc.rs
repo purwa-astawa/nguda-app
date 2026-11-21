@@ -869,6 +869,7 @@ pub enum MarkerKindView {
     Extended,
     Inserted,
     CarriedOver,
+    CalendarChanged,
 }
 
 /// A week's estimate gap (AD-6, AD-16), the reply of [`query_week`].
@@ -1010,6 +1011,9 @@ fn marker_view(e: &DayLogEntry) -> MarkerView {
         DayLogKind::CarriedOver { item_id, to } => {
             (MarkerKindView::CarriedOver, item_id, Some(*to), None)
         }
+        DayLogKind::CalendarChanged { item_id } => {
+            (MarkerKindView::CalendarChanged, item_id, None, None)
+        }
     };
     MarkerView {
         at: e.at.to_string(),
@@ -1137,7 +1141,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use nguda_adapters::{FsFileSink, SqliteStore, SystemClock, UuidV7Ids};
+    use nguda_adapters::{FsFileSink, SqliteStore, StdRandom, SystemClock, UuidV7Ids};
     use nguda_core::{CalendarRef, OrderKey, PlanItemRecord, Running, Segment, TimeZone, WorkEnd};
     use nguda_engine::{EngineDeps, StatusEntry};
     use tokio::time::timeout;
@@ -1919,6 +1923,7 @@ mod tests {
                     item_id: item(A),
                     to: item(B),
                 },
+                DayLogKind::CalendarChanged { item_id: item(B) },
             ]
             .into_iter()
             .map(|kind| DayLogEntry {
@@ -1997,6 +2002,7 @@ mod tests {
                 (MarkerKindView::Extended, A, None, Some(300)),
                 (MarkerKindView::Inserted, B, None, None),
                 (MarkerKindView::CarriedOver, A, Some(B), None),
+                (MarkerKindView::CalendarChanged, B, None, None),
             ]
         );
         let json = serde_json::to_value(&v).unwrap();
@@ -2006,6 +2012,7 @@ mod tests {
         assert_eq!(json["rows"][0]["carriedFrom"], B);
         assert_eq!(json["markers"][6]["kind"], "carriedOver");
         assert_eq!(json["markers"][6]["toItemId"], B);
+        assert_eq!(json["markers"][7]["kind"], "calendarChanged");
     }
 
     /// The item without its scheduled times, which follow the system clock.
@@ -2032,6 +2039,7 @@ mod tests {
                 ids: Arc::new(UuidV7Ids),
                 files: Arc::new(FsFileSink),
                 calendar: Arc::new(crate::IdleCalendar),
+                random: Arc::new(StdRandom::default()),
                 tz: TimeZone::UTC,
             })
             .0

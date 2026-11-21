@@ -179,8 +179,18 @@ CREATE UNIQUE INDEX plan_item_source_key
     WHERE calendar_id IS NOT NULL;
 "#;
 
+/// v11: each calendar's sync cursor (AD-17): Google's sync token and the local
+/// day it was issued for. At most one per calendar.
+const V11: &str = r#"
+CREATE TABLE calendar_sync (
+    calendar_id TEXT PRIMARY KEY NOT NULL,
+    sync_token  TEXT NOT NULL,
+    day_date    TEXT NOT NULL CHECK (length(day_date) = 10)
+) STRICT;
+"#;
+
 /// Every migration's SQL, oldest first.
-const ALL: [&str; 10] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+const ALL: [&str; 11] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {

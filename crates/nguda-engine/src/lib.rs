@@ -6,7 +6,8 @@
 //! `rev` and publishes a [`Snapshot`] on a `watch` channel, and one-time outputs go
 //! out as [`Effect`]s. It holds no `Mutex` and runs no per-second tick: it waits on
 //! one deadline through [`Clock::sleep_until`] (the earliest of the heartbeat, the
-//! running item's planned end, and, while nothing runs, the next local midnight),
+//! running item's planned end, the calendar poll, and, while nothing runs, the
+//! next local midnight),
 //! and rendering the ticking elapsed time is the subscriber's job (AD-11).
 //!
 //! Overflow: every publish re-flows the day and lists the flexible items that end
@@ -76,18 +77,33 @@
 //! sets [`StatusKey::Export`] and publishes. Logs carry the range kind, week, and
 //! row count only, never the path, titles, or contents (AD-14).
 //!
-//! Calendar import (CAP-2, AD-9, AD-17): the engine never awaits the calendar in
+//! Calendar sync (CAP-2, AD-9, AD-17): the engine never awaits the calendar in
 //! a handler. [`EngineMsg::SignIn`] marks the account
-//! [`GoogleAccount::SigningIn`], publishes, and spawns the interactive sign-in;
-//! imports of today's primary-calendar events are spawned at startup, after a
-//! successful sign-in, and at rollover. Each spawned task posts its result back
-//! through a weak inbox sender under a request id, and the actor drops any result
-//! whose id is not the latest it issued for that kind, and an import result whose
-//! date is no longer today. An applied import merges the events into a copy of
-//! today with [`nguda_core::merge`] and commits the diff like any plan change (an
-//! unchanged plan commits nothing). Failures set [`StatusKey::Sync`], which the
-//! next successful import or sign-in clears; "not signed in" sets no status, only
-//! [`GoogleAccount::SignedOut`]. Tokens and event titles are never logged.
+//! [`GoogleAccount::SigningIn`], publishes, and spawns the interactive sign-in.
+//! Syncs of the primary calendar are spawned at startup, after a successful
+//! sign-in, at rollover, when the poll deadline is due, and on wake. Each spawned
+//! task posts its result back through a weak inbox sender under a request id, and
+//! the actor drops any result whose id is not the latest it issued for that kind,
+//! and a sync result whose date is no longer today.
+//!
+//! The engine keeps one persisted [`nguda_core::SyncCursor`] per calendar (a
+//! Google sync token and the day it was issued for). A sync with a cursor from
+//! today is incremental; with none, or one from another day, it is a full fetch
+//! of today's window. An applied sync merges its changes into a copy of today
+//! with [`nguda_core::merge`] and commits, in one batch, the plan diff, one
+//! `CalendarChanged` day-log entry per touched item, and the new cursor (or its
+//! removal when Google sent no token). An unchanged plan and cursor commit and
+//! publish nothing. A `410` clears that calendar's cursor and re-fetches at once.
+//!
+//! Polling: while signed in and no sync is in flight, the next poll is a
+//! deadline [`POLL_EVERY`] ±[`JITTER`] after the last result, drawn from the
+//! [`Random`] port. After `n` consecutive 403/429 answers the base becomes
+//! `min(POLL_EVERY·2^n, BACKOFF_MAX)` and [`StatusKey::Sync`] says Google is
+//! limiting requests. A heartbeat firing [`WAKE_LATENESS`] or more late means
+//! the machine slept, and a poll starts at once. Failures set
+//! [`StatusKey::Sync`], which the next successful sync or sign-in clears; "not
+//! signed in" sets no status, only [`GoogleAccount::SignedOut`], and schedules
+//! no poll. Tokens and event titles are never logged.
 
 mod actor;
 mod batch;
@@ -103,14 +119,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    CalendarError, CalendarSource, Clock, Date, Day, DayReport, ExportRange, FetchedEvent,
-    FileSink, IdGen, IsoWeek, ItemId, LockChoice, PromptId, PromptKind, Running, Schedule, Store,
-    StoreError, TimeZone, Timestamp, WeekReport, WorkEnd,
+    CalendarError, CalendarSource, Clock, Date, Day, DayReport, ExportRange, FileSink, IdGen,
+    IsoWeek, ItemId, LockChoice, PromptId, PromptKind, Random, Running, Schedule, Store,
+    StoreError, SyncBatch, TimeZone, Timestamp, WeekReport, WorkEnd,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// How often the engine records `last_alive_at` for crash recovery (AD-6).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
+
+/// The base interval between calendar polls (AD-17).
+pub const POLL_EVERY: Duration = Duration::from_secs(300);
+
+/// The jitter applied to every poll delay: ±25% of its base.
+pub const JITTER: f64 = 0.25;
+
+/// The longest base a rate-limit backoff grows to.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(3_600);
+
+/// How late a heartbeat must fire to count as a wake from sleep.
+pub const WAKE_LATENESS: Duration = Duration::from_secs(120);
 
 /// Every input to the engine.
 ///
@@ -346,6 +374,8 @@ pub struct EngineDeps {
     pub files: Arc<dyn FileSink>,
     /// The calendar account events are imported from (CAP-2).
     pub calendar: Arc<dyn CalendarSource>,
+    /// Randomness for the poll jitter (AD-17).
+    pub random: Arc<dyn Random>,
     /// The zone that decides "today" and is fixed on each new day (AD-8).
     pub tz: TimeZone,
 }
@@ -414,13 +444,15 @@ pub(crate) enum Inbox {
         id: u64,
         result: Result<(), CalendarError>,
     },
-    /// An import task's fetched events for `date`, tagged with its request id.
-    /// Only the latest import's result applies, and only while `date` is still
-    /// today (AD-17).
+    /// A sync task's result for `date`, tagged with its request id.
+    /// `incremental` names the calendar whose cursor the request used (`None`
+    /// for a full fetch). Only the latest sync's result applies, and only while
+    /// `date` is still today (AD-17).
     ImportFinished {
         id: u64,
         date: Date,
-        result: Result<Vec<FetchedEvent>, CalendarError>,
+        incremental: Option<String>,
+        result: Result<SyncBatch, CalendarError>,
     },
 }
 

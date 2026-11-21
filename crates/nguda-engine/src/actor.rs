@@ -11,18 +11,18 @@ use std::time::Duration;
 
 use nguda_core::{
     CalendarError, CalendarErrorKind, CalendarSource, Clock, Date, Day, DayLogKind, ExportRange,
-    FetchedEvent, FileSink, IdGen, IsoWeek, ItemId, LockDecision, OpenSegmentRef, PlanItem,
-    PromptId, PromptKind, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, TimeZone,
-    Timestamp, WorkEnd, export_csv, merge, merge_tag_names, reflow, report, sort_tag_names,
-    week_report,
+    FileSink, IdGen, IsoWeek, ItemId, LockDecision, OpenSegmentRef, PlanItem, PromptId, PromptKind,
+    Random, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, SyncBatch, SyncCursor,
+    TimeZone, Timestamp, WorkEnd, export_csv, merge, merge_tag_names, reflow, report,
+    sort_tag_names, week_report,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::batch::diff;
 use crate::commands::{self, Reject, domain_kind};
 use crate::{
-    DayReply, Effect, EngineDeps, EngineMsg, GoogleAccount, HEARTBEAT_EVERY, Inbox, NextItem,
-    Snapshot, StatusEntry, StatusKey, WeekReply,
+    BACKOFF_MAX, DayReply, Effect, EngineDeps, EngineMsg, GoogleAccount, HEARTBEAT_EVERY, Inbox,
+    JITTER, NextItem, POLL_EVERY, Snapshot, StatusEntry, StatusKey, WAKE_LATENESS, WeekReply,
 };
 
 pub(crate) async fn run(
@@ -43,8 +43,13 @@ pub(crate) async fn run(
                 Some(Inbox::QueryWeek { week, reply }) => actor.query_week(week, reply),
                 Some(Inbox::ExportFinished { id, result }) => actor.export_finished(id, result),
                 Some(Inbox::SignInFinished { id, result }) => actor.sign_in_finished(id, result),
-                Some(Inbox::ImportFinished { id, date, result }) => {
-                    actor.import_finished(id, date, result).await;
+                Some(Inbox::ImportFinished {
+                    id,
+                    date,
+                    incremental,
+                    result,
+                }) => {
+                    actor.import_finished(id, date, incremental, result).await;
                 }
                 None => break,
             },
@@ -61,10 +66,21 @@ struct Actor {
     ids: Arc<dyn IdGen>,
     files: Arc<dyn FileSink>,
     calendar: Arc<dyn CalendarSource>,
+    random: Arc<dyn Random>,
     /// The last sign-in request id handed out; only its outcome applies.
     sign_in_issued: u64,
-    /// The last import request id handed out; only its result applies.
+    /// The last sync request id handed out; only its result applies.
     import_issued: u64,
+    /// Each calendar's sync cursor, by calendar id, as last committed or loaded
+    /// (AD-17). Never logged: it holds tokens.
+    cursors: BTreeMap<String, SyncCursor>,
+    /// When the next calendar poll is due: `None` while a sync is in flight or
+    /// while signed out.
+    poll_at: Option<Timestamp>,
+    /// Whether the latest sync issued has not answered yet.
+    in_flight: bool,
+    /// How many syncs in a row Google answered with 403 or 429.
+    rate_limits: u32,
     /// The Google account state, as last learned from the calendar source.
     google: GoogleAccount,
     /// The actor's own inbox, weakly held: export tasks post their outcome here
@@ -124,8 +140,13 @@ impl Actor {
             ids: deps.ids,
             files: deps.files,
             calendar: deps.calendar,
+            random: deps.random,
             sign_in_issued: 0,
             import_issued: 0,
+            cursors: BTreeMap::new(),
+            poll_at: None,
+            in_flight: false,
+            rate_limits: 0,
             google: GoogleAccount::Unknown,
             inbox,
             export_issued: 0,
@@ -146,8 +167,9 @@ impl Actor {
         }
     }
 
-    /// Recovers a crash-left open segment, loads today, the settings and the known
-    /// tag names, publishes rev 1, and starts importing today's calendar events.
+    /// Recovers a crash-left open segment, loads today, the settings, the known
+    /// tag names and the sync cursors, publishes rev 1, and starts syncing today's
+    /// calendar events.
     /// Runs before any message is handled.
     async fn startup(&mut self) {
         let now = self.clock.now();
@@ -188,6 +210,16 @@ impl Actor {
                 Vec::new()
             }
         };
+        self.cursors = match self.store.load_sync_cursors().await {
+            Ok(cursors) => cursors
+                .into_iter()
+                .map(|c| (c.calendar_id.clone(), c))
+                .collect(),
+            Err(e) => {
+                self.store_failed("load sync cursors", &e);
+                BTreeMap::new()
+            }
+        };
         self.heartbeat_at = deadline_after(now);
         self.publish();
         self.start_import();
@@ -225,92 +257,229 @@ impl Actor {
         self.start_import();
     }
 
-    /// Starts importing today's primary-calendar events off the actor (AD-17):
-    /// the task fetches the events of today's local day and posts them back as
-    /// [`Inbox::ImportFinished`] under a fresh request id and today's date, which
-    /// supersedes any import still running.
+    /// Starts a sync of the primary calendar off the actor (AD-17): incremental
+    /// from a cursor issued for today, else a full fetch of today's local day.
+    /// The task posts its result back as [`Inbox::ImportFinished`] under a fresh
+    /// request id and today's date, which supersedes any sync still running. No
+    /// poll is due while it is in flight.
     fn start_import(&mut self) {
         self.import_issued += 1;
         let id = self.import_issued;
         let date = self.day.date();
+        self.poll_at = None;
         let Some((from, to)) = day_window(date, &self.tz) else {
+            self.in_flight = false;
             tracing::warn!(%date, "no import window for the day");
             return;
         };
+        self.in_flight = true;
+        // A cursor from another day never resumes: a new day starts with a full fetch.
+        let cursor = self
+            .cursors
+            .values()
+            .find(|c| c.date == date)
+            .map(|c| (c.calendar_id.clone(), c.token.clone()));
+        let incremental = cursor.as_ref().map(|(calendar_id, _)| calendar_id.clone());
         let calendar = self.calendar.clone();
         let inbox = self.inbox.clone();
-        tracing::debug!(id, %date, "calendar import started");
+        tracing::debug!(
+            id,
+            %date,
+            incremental = incremental.is_some(),
+            "calendar sync started"
+        );
         tokio::spawn(async move {
-            let result = calendar.fetch_primary(from, to).await;
+            let result = calendar.sync_primary(cursor, from, to).await;
             // The engine may have stopped meanwhile; nothing to report to then.
             if let Some(inbox) = inbox.upgrade() {
-                let _ = inbox.send(Inbox::ImportFinished { id, date, result });
+                let _ = inbox.send(Inbox::ImportFinished {
+                    id,
+                    date,
+                    incremental,
+                    result,
+                });
             }
         });
     }
 
-    /// Applies an import's result (AD-9, AD-17), unless it is stale: an id other
-    /// than the latest issued, or a date that is no longer today. Events are merged
-    /// into a copy of today and the diff committed like any plan change; nothing
-    /// changed commits nothing. Success clears `Sync` and marks the account signed
-    /// in; "not signed in" marks it signed out with no status; any other failure
-    /// sets `Sync` and leaves the plan as is. Publishes only on a visible change.
-    /// Logs ids, dates, kinds and counts only (AD-14).
+    /// Applies a sync's result (AD-9, AD-17), unless it is stale: an id other
+    /// than the latest issued, or a date that is no longer today; a stale result
+    /// changes nothing at all.
+    ///
+    /// Success marks the account signed in, clears `Sync` and the backoff (only a
+    /// success or a sign-out resets it), merges
+    /// the changes into a copy of today, and commits the diff, one
+    /// `CalendarChanged` entry per touched item, and the cursor update as one
+    /// batch; nothing changed commits nothing. A `410` on an incremental sync
+    /// clears that calendar's cursor and fetches again at once. A 403/429 grows
+    /// the backoff and sets `Sync`. "Not signed in" (or no client) marks the
+    /// account signed out and schedules no poll; any other failure sets `Sync`
+    /// and leaves the plan as is. Every other outcome schedules the next poll.
+    /// Publishes only on a visible change. Logs ids, dates, kinds and counts only
+    /// (AD-14).
     async fn import_finished(
         &mut self,
         id: u64,
         date: Date,
-        result: Result<Vec<FetchedEvent>, CalendarError>,
+        incremental: Option<String>,
+        result: Result<SyncBatch, CalendarError>,
     ) {
         if id != self.import_issued || date != self.day.date() {
             tracing::debug!(id, latest = self.import_issued, %date, "stale import dropped");
             return;
         }
+        self.in_flight = false;
         let status_before = self.status.clone();
         let google_before = self.google;
         let mut changed = false;
         match result {
-            Ok(events) => {
+            Ok(batch) => {
                 self.set_google(GoogleAccount::SignedIn);
                 self.status.remove(&StatusKey::Sync);
-                let mut next = self.day.clone();
-                let ids = self.ids.clone();
-                match merge(&mut next, &events, || ids.new_item_id()) {
-                    Ok(count) => {
-                        tracing::info!(id, %date, fetched = events.len(), count, "calendar import merged");
-                        if next != self.day {
-                            let batch = diff(&self.day, &next);
-                            changed = self.swap_after_commit(next, self.work_end, batch).await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(id, %date, kind = domain_kind(&e), "calendar merge rejected");
-                        self.status
-                            .insert(StatusKey::Sync, format!("Calendar import failed: {e}"));
-                    }
-                }
+                self.rate_limits = 0;
+                changed = self.apply_sync(id, date, batch).await;
+                self.schedule_poll();
+            }
+            Err(e) if e.kind == CalendarErrorKind::Gone && incremental.is_some() => {
+                let calendar_id = incremental.unwrap_or_default();
+                tracing::info!(id, "calendar sync token expired: fetching again");
+                let batch = StoreBatch::from_iter([StoreOp::ClearSyncCursor {
+                    calendar_id: calendar_id.clone(),
+                }]);
+                self.commit(batch).await;
+                // Even if the clear failed to commit, never reuse a dead token.
+                self.cursors.remove(&calendar_id);
+                self.start_import();
             }
             Err(e) if e.kind == CalendarErrorKind::NotSignedIn => {
                 tracing::debug!(id, "calendar import: not signed in");
+                self.rate_limits = 0;
                 self.set_google(GoogleAccount::SignedOut);
             }
-            Err(e) => {
-                tracing::warn!(id, kind = error_kind(&e), "calendar import failed");
-                if e.kind == CalendarErrorKind::NoClient {
-                    self.set_google(GoogleAccount::SignedOut);
-                } else if self.google == GoogleAccount::Unknown {
-                    // A stored session exists; only this fetch failed.
+            Err(e) if e.kind == CalendarErrorKind::RateLimited => {
+                self.rate_limits = self.rate_limits.saturating_add(1);
+                tracing::warn!(id, limits = self.rate_limits, "calendar sync rate limited");
+                if self.google == GoogleAccount::Unknown {
                     self.set_google(GoogleAccount::SignedIn);
                 }
                 self.status.insert(
                     StatusKey::Sync,
+                    "Google is limiting requests; syncing again later".to_owned(),
+                );
+                self.schedule_poll();
+            }
+            Err(e) => {
+                tracing::warn!(id, kind = error_kind(&e), "calendar import failed");
+                self.status.insert(
+                    StatusKey::Sync,
                     format!("Calendar import failed: {}", e.message),
                 );
+                if e.kind == CalendarErrorKind::NoClient {
+                    self.set_google(GoogleAccount::SignedOut);
+                } else {
+                    if self.google == GoogleAccount::Unknown {
+                        // A stored session exists; only this fetch failed.
+                        self.set_google(GoogleAccount::SignedIn);
+                    }
+                    self.schedule_poll();
+                }
             }
         }
         if changed || self.status != status_before || self.google != google_before {
             self.publish();
         }
+    }
+
+    /// Merges a successful sync of today into a copy of the day at `now` and
+    /// commits, as one batch, the plan diff, a `CalendarChanged` entry per touched
+    /// item, and the cursor change: the new token for today, or the calendar's
+    /// cursor removed when Google sent none. Swaps the day and the cursors in only
+    /// after the commit. Returns whether the day changed. A merge rejected by the
+    /// domain sets `Sync` and changes nothing.
+    async fn apply_sync(&mut self, id: u64, date: Date, batch: SyncBatch) -> bool {
+        let SyncBatch {
+            calendar_id,
+            changes,
+            next_token,
+        } = batch;
+        let now = self.clock.now();
+        let mut next = self.day.clone();
+        let ids = self.ids.clone();
+        let touched = match merge(&mut next, &changes, now, || ids.new_item_id()) {
+            Ok(touched) => touched,
+            Err(e) => {
+                tracing::warn!(id, %date, kind = domain_kind(&e), "calendar merge rejected");
+                self.status
+                    .insert(StatusKey::Sync, format!("Calendar import failed: {e}"));
+                return false;
+            }
+        };
+        tracing::info!(
+            id,
+            %date,
+            fetched = changes.len(),
+            count = touched.len(),
+            "calendar sync merged"
+        );
+        let cursor = next_token.map(|token| SyncCursor {
+            calendar_id: calendar_id.clone(),
+            token,
+            date,
+        });
+        let cursor_op = match &cursor {
+            Some(c) if self.cursors.get(&calendar_id) != Some(c) => {
+                Some(StoreOp::PutSyncCursor { cursor: c.clone() })
+            }
+            Some(_) => None,
+            None => self
+                .cursors
+                .contains_key(&calendar_id)
+                .then(|| StoreOp::ClearSyncCursor {
+                    calendar_id: calendar_id.clone(),
+                }),
+        };
+        let day_changed = next != self.day;
+        if !day_changed && cursor_op.is_none() {
+            return false;
+        }
+        let mut ops = if day_changed {
+            diff(&self.day, &next)
+        } else {
+            StoreBatch::new()
+        };
+        ops.extend(
+            touched.iter().map(|&item_id| {
+                commands::log_op(date, now, DayLogKind::CalendarChanged { item_id })
+            }),
+        );
+        ops.extend(cursor_op);
+        if !self.swap_after_commit(next, self.work_end, ops).await {
+            return false;
+        }
+        match cursor {
+            Some(c) => {
+                self.cursors.insert(calendar_id, c);
+            }
+            None => {
+                self.cursors.remove(&calendar_id);
+            }
+        }
+        day_changed
+    }
+
+    /// Schedules the next poll after a sync result: `POLL_EVERY`, or after `n`
+    /// consecutive rate limits `min(POLL_EVERY·2^n, BACKOFF_MAX)`, each jittered
+    /// by ±`JITTER` from the [`Random`] port.
+    fn schedule_poll(&mut self) {
+        let base = backoff_base(self.rate_limits);
+        let delay = jittered(base, self.random.unit());
+        self.poll_at = Some(
+            self.clock
+                .now()
+                .checked_add(delay)
+                .unwrap_or(Timestamp::MAX),
+        );
+        tracing::debug!(delay_secs = delay.as_secs(), "calendar poll scheduled");
     }
 
     /// Sets the account state, except that a sign-in in progress stays shown until
@@ -774,12 +943,14 @@ impl Actor {
     }
 
     /// The one deadline the loop waits on (AD-3): the earliest of the heartbeat,
-    /// the running item's unprompted planned end, and the local-midnight rollover.
+    /// the running item's unprompted planned end, the local-midnight rollover, and
+    /// the calendar poll.
     fn next_deadline(&self) -> Timestamp {
         [
             Some(self.heartbeat_at),
             self.planned_end().map(|(_, end)| end),
             self.rollover_at(),
+            self.poll_at,
         ]
         .into_iter()
         .flatten()
@@ -816,9 +987,17 @@ impl Actor {
     }
 
     /// Handles whatever is due: a planned-end prompt (an effect only: no state,
-    /// commit or snapshot), the heartbeat, and/or the midnight rollover.
+    /// commit or snapshot), the heartbeat, the midnight rollover, and/or the
+    /// calendar poll. A heartbeat firing `WAKE_LATENESS` late means the machine
+    /// slept, so a scheduled poll starts at once, unless it is backing off from
+    /// rate limits.
     async fn on_deadline(&mut self) {
         let now = self.clock.now();
+        // Checked before the heartbeat moves `heartbeat_at` on.
+        let woke = self
+            .heartbeat_at
+            .checked_add(WAKE_LATENESS)
+            .is_ok_and(|late| now >= late);
         if let Some((key @ (item_id, _), end)) = self.planned_end()
             && now >= end
         {
@@ -844,6 +1023,15 @@ impl Actor {
         self.roll_over_if_due(now).await;
         if now >= self.heartbeat_at {
             self.heartbeat(now).await;
+        }
+        // A rollover just started a sync, which clears `poll_at`.
+        if let Some(due) = self.poll_at
+            && !self.in_flight
+            // A wake never cuts a rate-limit backoff short.
+            && (now >= due || (woke && self.rate_limits == 0))
+        {
+            tracing::debug!(woke, "calendar poll due");
+            self.start_import();
         }
     }
 
@@ -1072,10 +1260,55 @@ fn error_kind(e: &CalendarError) -> &'static str {
         CalendarErrorKind::NotSignedIn => "not_signed_in",
         CalendarErrorKind::NoClient => "no_client",
         CalendarErrorKind::Auth => "auth",
+        CalendarErrorKind::RateLimited => "rate_limited",
+        CalendarErrorKind::Gone => "gone",
         CalendarErrorKind::Other => "other",
     }
 }
 
+/// The poll base after `limits` consecutive rate limits:
+/// `min(POLL_EVERY·2^limits, BACKOFF_MAX)`.
+fn backoff_base(limits: u32) -> Duration {
+    POLL_EVERY
+        .checked_mul(2u32.checked_pow(limits).unwrap_or(u32::MAX))
+        .map_or(BACKOFF_MAX, |d| d.min(BACKOFF_MAX))
+}
+
+/// `round(base · (1 − JITTER + 2·JITTER·unit))` in whole seconds, with `unit`
+/// clamped into `[0, 1]`.
+fn jittered(base: Duration, unit: f64) -> Duration {
+    let factor = 1.0 - JITTER + 2.0 * JITTER * unit.clamp(0.0, 1.0);
+    Duration::from_secs_f64((base.as_secs_f64() * factor).round())
+}
+
 fn deadline_after(now: Timestamp) -> Timestamp {
     now.checked_add(HEARTBEAT_EVERY).unwrap_or(Timestamp::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_backoff_base_doubles_up_to_the_cap() {
+        let secs = |n| backoff_base(n).as_secs();
+        assert_eq!(secs(0), 300);
+        assert_eq!(secs(1), 600);
+        assert_eq!(secs(2), 1_200);
+        assert_eq!(secs(3), 2_400);
+        assert_eq!(secs(4), 3_600);
+        assert_eq!(secs(40), 3_600);
+        assert_eq!(secs(u32::MAX), 3_600);
+    }
+
+    #[test]
+    fn the_jitter_is_a_quarter_either_way_rounded_to_seconds() {
+        let secs = |base: u64, unit| jittered(Duration::from_secs(base), unit).as_secs();
+        assert_eq!(secs(300, 0.0), 225);
+        assert_eq!(secs(300, 0.2), 255);
+        assert_eq!(secs(300, 0.5), 300);
+        assert_eq!(secs(300, 1.0), 375);
+        assert_eq!(secs(3_600, 0.0), 2_700);
+        assert_eq!(secs(300, 7.0), 375, "clamped");
+    }
 }
