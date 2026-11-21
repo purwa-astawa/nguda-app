@@ -10,8 +10,9 @@ use nguda_core::{
     ActualSegment, Baseline, BaselineItem, CalendarChange, CalendarEntry, CalendarError,
     CalendarErrorKind, CalendarInfo, CalendarRef, Date, Day, DayLogEntry, DayLogKind, EventKey,
     ExportRange, FetchedEvent, GapFigure, IsoWeek, ItemId, ItemStatus, LockChoice, LockDecision,
-    OrderKey, PlanItem, PlanItemRecord, PlannedSource, PromptKind, ReportRow, Segment, SlotKind,
-    Span, StoreError, StoreOp, SyncBatch, SyncCursor, TagGap, TimeZone, WorkEnd, export_csv,
+    OAuthClient, OrderKey, PlanItem, PlanItemRecord, PlannedSource, PromptKind, ReportRow, Segment,
+    SessionStore, SlotKind, Span, StoreError, StoreOp, SyncBatch, SyncCursor, TagGap, TimeZone,
+    WorkEnd, export_csv,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -21,8 +22,8 @@ use crate::test_support::{
     ts,
 };
 use crate::{
-    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, GoogleAccount, InsertAnchor,
-    NextItem, QueryError, ReorderAnchor, Snapshot, StatusEntry, StatusKey, spawn,
+    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, GoogleAccount, GoogleClient,
+    InsertAnchor, NextItem, QueryError, ReorderAnchor, Snapshot, StatusEntry, StatusKey, spawn,
 };
 
 const DAY_SECS: i64 = 86_400;
@@ -3470,7 +3471,7 @@ async fn an_unchanged_re_import_commits_and_publishes_nothing() {
     h.send(EngineMsg::SignIn);
     h.rev(3).await;
     h.sign_ins(1).await;
-    h.calendar.resolve_sign_in(0, Ok(()));
+    h.calendar.resolve_sign_in(0, Ok(SessionStore::Stored));
     h.rev(4).await;
     h.fetches(2).await;
     let batches = store.batches().len();
@@ -3495,7 +3496,7 @@ async fn a_stale_import_is_dropped() {
     let snap = h.rev(2).await;
     assert_eq!(snap.google, GoogleAccount::SigningIn);
     h.sign_ins(1).await;
-    h.calendar.resolve_sign_in(0, Ok(()));
+    h.calendar.resolve_sign_in(0, Ok(SessionStore::Stored));
     let snap = h.rev(3).await;
     assert_eq!(snap.google, GoogleAccount::SignedIn);
     h.fetches(2).await;
@@ -3609,7 +3610,7 @@ async fn a_stale_sign_in_outcome_is_dropped() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(h.rx.borrow().rev, 3);
     assert_eq!(h.rx.borrow().google, GoogleAccount::SigningIn);
-    h.calendar.resolve_sign_in(1, Ok(()));
+    h.calendar.resolve_sign_in(1, Ok(SessionStore::Stored));
     let snap = h.rev(4).await;
     assert_eq!(snap.google, GoogleAccount::SignedIn);
     assert_eq!(sync_status(&snap), None);
@@ -3640,7 +3641,7 @@ async fn an_import_failure_keeps_the_plan_and_the_next_success_clears_sync() {
     h.send(EngineMsg::SignIn);
     h.rev(3).await;
     h.sign_ins(1).await;
-    h.calendar.resolve_sign_in(0, Ok(()));
+    h.calendar.resolve_sign_in(0, Ok(SessionStore::Stored));
     h.rev(4).await;
     h.fetches(2).await;
     h.calendar
@@ -4233,7 +4234,7 @@ async fn a_stale_sync_result_changes_no_plan_or_cursor() {
     h.send(EngineMsg::SignIn);
     h.rev(2).await;
     h.sign_ins(1).await;
-    h.calendar.resolve_sign_in(0, Ok(()));
+    h.calendar.resolve_sign_in(0, Ok(SessionStore::Stored));
     h.rev(3).await;
     h.fetches(2).await;
     let batches = store.batches().len();
@@ -4309,7 +4310,7 @@ async fn not_signed_in_schedules_no_poll_until_a_sign_in() {
     h.send(EngineMsg::SignIn);
     h.rev(3).await;
     h.sign_ins(1).await;
-    h.calendar.resolve_sign_in(0, Ok(()));
+    h.calendar.resolve_sign_in(0, Ok(SessionStore::Stored));
     h.rev(4).await;
     h.fetches(1).await;
 }
@@ -5553,4 +5554,332 @@ async fn unticking_a_calendar_never_hides_an_added_event() {
     assert_eq!(today.item(id(100)).unwrap().status(), ItemStatus::Pending);
     assert_eq!(today.item(id(101)).unwrap().status(), ItemStatus::Removed);
     assert!(today.item(id(101)).unwrap().hidden_at().is_some());
+}
+
+// --- Sign-in hardening (R1, AD-13) ---
+
+fn secret_store_status(snap: &Snapshot) -> Option<&str> {
+    snap.status
+        .iter()
+        .find(|e| e.key == StatusKey::SecretStore)
+        .map(|e| e.message.as_str())
+}
+
+fn oauth(id: &str, secret: Option<&str>) -> OAuthClient {
+    OAuthClient {
+        id: id.into(),
+        secret: secret.map(str::to_owned),
+    }
+}
+
+const EXPIRED: &str = "Your Google sign-in expired or was revoked. Sign in again.";
+
+/// A started engine at 1 000 whose startup round imported event `a`, signed in,
+/// at rev 2, with the next poll scheduled.
+async fn signed_in_with_an_item() -> (Harness, Arc<MemoryStore>) {
+    let (mut h, store) = running_on(1_000, None).await;
+    h.fetches(1).await;
+    h.calendar
+        .resolve_events(0, Ok(vec![event("a", "Standup", 9_000, 9_900)]));
+    let snap = h.rev(2).await;
+    assert_eq!(snap.google, GoogleAccount::SignedIn);
+    (h, store)
+}
+
+#[tokio::test]
+async fn a_byo_client_is_persisted_handed_to_the_source_and_reloaded_at_startup() {
+    let (mut h, store, snap) =
+        listing_fails_on(1_000, CalendarErrorKind::NotSignedIn, "not signed in").await;
+    assert_eq!(h.calendar.clients(), vec![None], "startup hands no client");
+    assert_eq!(
+        snap.google_client,
+        GoogleClient {
+            custom_id: None,
+            available: true
+        }
+    );
+    h.send(EngineMsg::SetGoogleClient {
+        client: Some(oauth(" abc ", Some(""))),
+    });
+    let snap = h.rev(3).await;
+    assert_eq!(
+        snap.google_client,
+        GoogleClient {
+            custom_id: Some("abc".into()),
+            available: true
+        }
+    );
+    assert_eq!(store.google_client(), Some(oauth("abc", None)));
+    assert_eq!(h.calendar.clients().last(), Some(&Some(oauth("abc", None))));
+    // The same client again: no commit, no publish.
+    let batches = store.batches().len();
+    h.send(EngineMsg::SetGoogleClient {
+        client: Some(oauth("abc", None)),
+    });
+    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    let snap = h.rev(4).await;
+    assert_eq!(snap.work_end.minutes(), 1, "rev 4 is the work-end change");
+    assert_eq!(store.batches().len(), batches + 1, "only the work-end");
+    drop(h);
+
+    // A restart hands the stored client to the source before the first publish.
+    let calendar = FakeCalendar::new();
+    calendar.set_listing(Err(cal_err(CalendarErrorKind::NotSignedIn, "no")));
+    let mut h = start_on(&FakeClock::at(1_000), &store, calendar);
+    let snap = h.rev(2).await;
+    assert_eq!(snap.google_client.custom_id.as_deref(), Some("abc"));
+    assert_eq!(h.calendar.clients(), vec![Some(oauth("abc", None))]);
+
+    // Clearing it removes it and goes back to the built-in client.
+    h.send(EngineMsg::SetGoogleClient { client: None });
+    let snap = h.rev(3).await;
+    assert_eq!(snap.google_client.custom_id, None);
+    assert_eq!(store.google_client(), None);
+    assert_eq!(h.calendar.clients().last(), Some(&None));
+}
+
+#[tokio::test]
+async fn a_byo_client_is_rejected_unless_signed_out_or_with_a_blank_id() {
+    // Unknown: the startup round has not answered.
+    let (mut h, store) = running_on(1_000, None).await;
+    let snap = expect_rejected(
+        &mut h,
+        &store,
+        EngineMsg::SetGoogleClient {
+            client: Some(oauth("abc", None)),
+        },
+        2,
+    )
+    .await;
+    assert!(
+        rejected(&snap).is_some_and(|m| m.contains("sign out before changing the Google client")),
+        "{:?}",
+        rejected(&snap)
+    );
+    assert_eq!(store.google_client(), None);
+    assert_eq!(h.calendar.clients(), vec![None]);
+
+    // Signed in.
+    let (mut h, store) = signed_in_with_an_item().await;
+    expect_rejected(
+        &mut h,
+        &store,
+        EngineMsg::SetGoogleClient { client: None },
+        3,
+    )
+    .await;
+
+    // Signing in.
+    h.send(EngineMsg::SignIn);
+    h.rev(4).await;
+    expect_rejected(
+        &mut h,
+        &store,
+        EngineMsg::SetGoogleClient {
+            client: Some(oauth("abc", None)),
+        },
+        5,
+    )
+    .await;
+
+    // Signed out, but the id is blank.
+    let (mut h, store, _) =
+        listing_fails_on(1_000, CalendarErrorKind::NotSignedIn, "not signed in").await;
+    expect_rejected(
+        &mut h,
+        &store,
+        EngineMsg::SetGoogleClient {
+            client: Some(oauth("   ", Some("s"))),
+        },
+        3,
+    )
+    .await;
+    assert_eq!(store.google_client(), None);
+}
+
+#[tokio::test]
+async fn with_no_client_at_all_the_snapshot_says_none_is_available() {
+    let (clock, store) = (FakeClock::at(1_000), MemoryStore::new());
+    let calendar = FakeCalendar::new();
+    calendar.set_built_in(false);
+    calendar.set_listing(Err(cal_err(CalendarErrorKind::NotSignedIn, "no")));
+    let mut h = start_on(&clock, &store, calendar);
+    assert!(!h.rev(2).await.google_client.available);
+    h.send(EngineMsg::SetGoogleClient {
+        client: Some(oauth("mine", None)),
+    });
+    let snap = h.rev(3).await;
+    assert!(snap.google_client.available);
+}
+
+#[tokio::test]
+async fn sign_out_keeps_the_items_aborts_the_round_and_schedules_no_poll() {
+    let (mut h, store) = signed_in_with_an_item().await;
+    // The poll starts a second round, still in flight.
+    h.tick_to(1_000 + 300).await;
+    h.fetches(2).await;
+    let lists = h.calendar.list_count();
+    let before = h.rx.borrow().clone();
+    let (cursors, calendars) = (store.stored_cursors(), store.stored_calendars());
+    let log = store.day_log(day1());
+    let batches = store.batches().len();
+
+    h.send(EngineMsg::SignOut);
+    let snap = h.rev(3).await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    assert_eq!(sync_status(&snap), None);
+    assert_eq!(snap.day, before.day, "every item stays");
+    assert_eq!(snap.calendars, before.calendars);
+    h.until(|| h.calendar.sign_out_count() == 1).await;
+
+    // The aborted round's answer is dropped.
+    h.calendar
+        .resolve_events(1, Ok(vec![event("b", "Late", 12_000, 12_900)]));
+    // No poll: advancing well past the poll time starts no round.
+    h.tick_to(1_000 + 3 * 300).await;
+    assert_eq!(h.rx.borrow().rev, 3);
+    assert_eq!(h.calendar.fetch_count(), 2);
+    assert_eq!(h.calendar.list_count(), lists);
+    assert_eq!(store.stored_cursors(), cursors);
+    assert_eq!(store.stored_calendars(), calendars);
+    assert_eq!(store.day_log(day1()), log);
+    // Only heartbeats were committed.
+    assert!(
+        store.batches()[batches..]
+            .iter()
+            .all(|b| matches!(b.ops(), [StoreOp::SetLastAlive { .. }]))
+    );
+}
+
+#[tokio::test]
+async fn sign_out_during_sign_in_drops_the_sign_in() {
+    let (mut h, _store) = running_on(1_000, None).await;
+    h.send(EngineMsg::SignIn);
+    h.rev(2).await;
+    h.sign_ins(1).await;
+    h.send(EngineMsg::SignOut);
+    let snap = h.rev(3).await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    let lists = h.calendar.list_count();
+    h.calendar.resolve_sign_in(0, Ok(SessionStore::Stored));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(h.rx.borrow().rev, 3);
+    assert_eq!(h.rx.borrow().google, GoogleAccount::SignedOut);
+    assert_eq!(h.calendar.list_count(), lists, "no round after it");
+}
+
+#[tokio::test]
+async fn a_sign_out_that_cannot_delete_sets_the_secret_store_status() {
+    let (mut h, _store) = signed_in_with_an_item().await;
+    h.calendar.set_sign_out_result(Err(cal_err(
+        CalendarErrorKind::Other,
+        "the keyring is locked",
+    )));
+    h.send(EngineMsg::SignOut);
+    let snap = h.rev(4).await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    assert_eq!(
+        secret_store_status(&snap),
+        Some("Could not remove the Google sign-in from the keyring: the keyring is locked")
+    );
+}
+
+#[tokio::test]
+async fn a_session_only_sign_in_sets_the_secret_store_status_and_commits_nothing() {
+    let (mut h, store, _) =
+        listing_fails_on(1_000, CalendarErrorKind::NotSignedIn, "not signed in").await;
+    h.calendar.set_listing(Ok(vec![primary_info()]));
+    let batches = store.batches().len();
+    h.send(EngineMsg::SignIn);
+    h.rev(3).await;
+    h.sign_ins(1).await;
+    h.calendar.resolve_sign_in(0, Ok(SessionStore::SessionOnly));
+    let snap = h.rev(4).await;
+    assert_eq!(snap.google, GoogleAccount::SignedIn);
+    assert_eq!(
+        secret_store_status(&snap),
+        Some("No keyring is available: the Google sign-in lasts until nguda quits.")
+    );
+    assert_eq!(
+        store.batches().len(),
+        batches,
+        "the sign-in commits nothing"
+    );
+
+    // Signing out of a session-only sign-in clears the notice.
+    h.send(EngineMsg::SignOut);
+    let snap = h.rev(5).await;
+    assert_eq!(secret_store_status(&snap), None);
+
+    // A later stored sign-in keeps it clear.
+    h.send(EngineMsg::SignIn);
+    h.rev(6).await;
+    h.sign_ins(2).await;
+    h.calendar.resolve_sign_in(1, Ok(SessionStore::SessionOnly));
+    assert!(secret_store_status(&h.rev(7).await).is_some());
+    h.send(EngineMsg::SignIn);
+    h.rev(8).await;
+    h.sign_ins(3).await;
+    h.calendar.resolve_sign_in(2, Ok(SessionStore::Stored));
+    assert_eq!(secret_store_status(&h.rev(9).await), None);
+}
+
+#[tokio::test]
+async fn an_expired_session_in_a_round_signs_out_and_asks_to_sign_in_again() {
+    let (mut h, store) = running_on(1_000, None).await;
+    h.fetches(1).await;
+    h.calendar.resolve_fetch(
+        0,
+        Err(cal_err(
+            CalendarErrorKind::SessionExpired,
+            "the Google sign-in expired or was revoked",
+        )),
+    );
+    let snap = h.rev(2).await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    assert_eq!(sync_status(&snap), Some(EXPIRED));
+    // The listing's part of the round is still applied.
+    assert_eq!(store.stored_calendars().len(), 1);
+    // No poll follows.
+    h.tick_to(1_000 + 3 * 300).await;
+    assert_eq!(h.calendar.fetch_count(), 1);
+}
+
+#[tokio::test]
+async fn an_expired_session_in_the_listing_signs_out() {
+    let (_h, _store, snap) =
+        listing_fails_on(1_000, CalendarErrorKind::SessionExpired, "expired").await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    assert_eq!(sync_status(&snap), Some(EXPIRED));
+}
+
+#[tokio::test]
+async fn an_expired_session_in_an_added_event_fetch_signs_out() {
+    let (mut h, _store) = signed_in_with_an_item().await;
+    h.send(EngineMsg::AddCalendarEvent {
+        calendar_id: "other@example.com".into(),
+        event_id: "o1".into(),
+    });
+    h.gets(1).await;
+    h.calendar
+        .resolve_get(0, Err(cal_err(CalendarErrorKind::SessionExpired, "x")));
+    let snap = h.rev(3).await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    assert_eq!(sync_status(&snap), Some(EXPIRED));
+}
+
+#[tokio::test]
+async fn an_expired_session_in_an_events_query_signs_out_and_answers_its_kind() {
+    let (mut h, _store) = signed_in_with_an_item().await;
+    let query = h.query_events("other@example.com", day1());
+    h.event_lists(1).await;
+    h.calendar
+        .resolve_list_events(0, Err(cal_err(CalendarErrorKind::SessionExpired, "x")));
+    assert_eq!(
+        query.await.unwrap(),
+        Err(QueryError::Calendar(CalendarErrorKind::SessionExpired))
+    );
+    let snap = h.rev(3).await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
+    assert_eq!(sync_status(&snap), Some(EXPIRED));
 }

@@ -138,6 +138,9 @@ pub enum CalendarErrorKind {
     RateLimited,
     /// The sync token is no longer valid (HTTP 410): sync again from scratch.
     Gone,
+    /// Google refused to refresh the access token (`invalid_grant`): the sign-in
+    /// expired or was revoked, and the stored session is gone.
+    SessionExpired,
     /// A network, HTTP, or parsing failure.
     Other,
 }
@@ -166,6 +169,33 @@ impl fmt::Display for CalendarError {
 }
 
 impl std::error::Error for CalendarError {}
+
+/// An OAuth client the user brought (AD-13), used in place of the built-in one.
+/// `Debug` prints the id only: the secret stays out of logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthClient {
+    pub id: String,
+    /// The client secret, when the client has one.
+    pub secret: Option<String>,
+}
+
+impl fmt::Debug for OAuthClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthClient")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a sign-in's session was kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SessionStore {
+    /// In the secret store: the sign-in survives a restart.
+    Stored,
+    /// In memory only, as no secret store could take it: the sign-in lasts until
+    /// the app quits (AD-13).
+    SessionOnly,
+}
 
 /// The result of a calendar request. Std-only, so core needs no async runtime.
 pub type CalendarFuture<T> = Pin<Box<dyn Future<Output = Result<T, CalendarError>> + Send>>;
@@ -256,8 +286,22 @@ pub fn hide_calendar(
 /// A calendar account. Every call does network or user-interactive I/O, so the
 /// engine runs them off its actor (AD-17).
 pub trait CalendarSource: Send + Sync + 'static {
-    /// Signs in interactively (the system browser), storing the session.
-    fn sign_in(&self) -> CalendarFuture<()>;
+    /// Signs in interactively (the system browser), storing the session, and
+    /// tells where it was kept.
+    fn sign_in(&self) -> CalendarFuture<SessionStore>;
+
+    /// Signs out: forgets the session at once, so no later request is signed, and
+    /// deletes the stored one. A sign-in that started before this call keeps
+    /// nothing.
+    fn sign_out(&self) -> CalendarFuture<()>;
+
+    /// Replaces the user's own OAuth client (`None` goes back to the built-in
+    /// one). Memory only: no I/O.
+    fn set_client(&self, client: Option<OAuthClient>);
+
+    /// Whether any OAuth client (the user's or a built-in one) is there to sign
+    /// in with. Memory only: no I/O.
+    fn has_client(&self) -> bool;
 
     /// The account's calendars the user can read, in Google's order.
     fn list_calendars(&self) -> CalendarFuture<Vec<CalendarInfo>>;
@@ -550,6 +594,17 @@ mod tests {
 
     fn empty_day() -> Day {
         Day::new(date(2026, 11, 21), "UTC")
+    }
+
+    #[test]
+    fn an_oauth_client_debug_hides_the_secret() {
+        let c = OAuthClient {
+            id: "my-client".into(),
+            secret: Some("s3cret-value".into()),
+        };
+        let shown = format!("{c:?}");
+        assert!(shown.contains("my-client"), "{shown}");
+        assert!(!shown.contains("s3cret-value"), "{shown}");
     }
 
     /// Ids 1000, 1001, ... for new items.

@@ -27,8 +27,11 @@
 //!
 //! [`sign_in`] is fire-and-forget like the plan commands: the engine runs the
 //! Google sign-in off its actor, and the snapshot's `google` field shows its
-//! progress (AD-17). So is [`add_calendar_event`]: the engine fetches the event
-//! off its actor, and it shows up in the snapshot (or a `sync` status entry).
+//! progress (AD-17). So are [`sign_out`] and [`set_google_client`], whose
+//! results show in the snapshot's `google` and `googleClient` fields (or a
+//! status entry); the client secret is never sent back (AD-13). So is
+//! [`add_calendar_event`]: the engine fetches the event off its actor, and it
+//! shows up in the snapshot (or a `sync` status entry).
 //!
 //! [`query_calendar_events`] is another `async` read-only request/reply, for the
 //! picker of today's events of one calendar (R4). A query superseded by a newer
@@ -37,12 +40,12 @@
 
 use nguda_core::{
     BaselineItem, Date, Day, DayLogEntry, DayLogKind, DayReport, ExportRange, GapFigure, IsoWeek,
-    ItemId, ItemStatus, LockChoice, LockDecision, PlanItem, PlannedSource, ReportRow, Span,
-    Timestamp, Uuid, WeekReport, closed_secs,
+    ItemId, ItemStatus, LockChoice, LockDecision, OAuthClient, PlanItem, PlannedSource, ReportRow,
+    Span, Timestamp, Uuid, WeekReport, closed_secs,
 };
 use nguda_engine::{
-    CalendarEvent, EngineHandle, EngineMsg, GoogleAccount, InsertAnchor, QueryError, ReorderAnchor,
-    Snapshot, StatusKey,
+    CalendarEvent, EngineHandle, EngineMsg, GoogleAccount, GoogleClient, InsertAnchor, QueryError,
+    ReorderAnchor, Snapshot, StatusKey,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(any(debug_assertions, test))]
@@ -280,6 +283,29 @@ pub fn carry_over_to_tomorrow(
 #[specta::specta]
 pub fn sign_in(engine: State<'_, EngineHandle>) -> Result<(), String> {
     send(&engine, Ok(sign_in_msg()))
+}
+
+/// Signs out of Google (R1): the stored sign-in is deleted and polling stops;
+/// every plan item stays. Fire-and-forget: the snapshot's `google` field turns
+/// `signedOut`, and a keyring failure shows as a `secretStore` status entry.
+#[tauri::command]
+#[specta::specta]
+pub fn sign_out(engine: State<'_, EngineHandle>) -> Result<(), String> {
+    send(&engine, Ok(sign_out_msg()))
+}
+
+/// Sets the user's own Google OAuth client (AD-13); a missing or blank
+/// `client_id` clears it, going back to the built-in client. A blank secret
+/// means none. The engine rejects it unless signed out. Fire-and-forget: the
+/// snapshot's `googleClient.customId` shows the id, never the secret.
+#[tauri::command]
+#[specta::specta]
+pub fn set_google_client(
+    engine: State<'_, EngineHandle>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<(), String> {
+    send(&engine, Ok(set_google_client_msg(client_id, client_secret)))
 }
 
 /// Includes exactly `calendar_ids` in today's plan (R2), un-including every other
@@ -672,6 +698,20 @@ fn sign_in_msg() -> EngineMsg {
     EngineMsg::SignIn
 }
 
+fn sign_out_msg() -> EngineMsg {
+    EngineMsg::SignOut
+}
+
+fn set_google_client_msg(client_id: Option<String>, client_secret: Option<String>) -> EngineMsg {
+    let client = client_id
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| OAuthClient {
+            id,
+            secret: client_secret.filter(|s| !s.trim().is_empty()),
+        });
+    EngineMsg::SetGoogleClient { client }
+}
+
 fn set_included_calendars_msg(calendar_ids: Vec<String>) -> EngineMsg {
     EngineMsg::SetIncludedCalendars { calendar_ids }
 }
@@ -756,6 +796,27 @@ pub struct SnapshotEvent {
     /// The account's calendars as last listed, in Google's order. Empty before
     /// the first listing.
     pub calendars: Vec<CalendarView>,
+    /// The OAuth client sign-in uses. Never the secret.
+    pub google_client: GoogleClientView,
+}
+
+/// The OAuth client sign-in uses (AD-13). Never carries the secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleClientView {
+    /// The user's own client id, when one is set.
+    pub custom_id: Option<String>,
+    /// Whether any client (the user's or a built-in one) can sign in.
+    pub available: bool,
+}
+
+impl From<&GoogleClient> for GoogleClientView {
+    fn from(c: &GoogleClient) -> Self {
+        Self {
+            custom_id: c.custom_id.clone(),
+            available: c.available,
+        }
+    }
 }
 
 /// One calendar of the account and whether it feeds today's plan.
@@ -895,9 +956,12 @@ pub enum StatusKeyView {
     Overflow,
     /// The last CSV export failed; cleared by the next successful one.
     Export,
-    /// The last Google sign-in or calendar import failed; cleared by the next
-    /// successful one.
+    /// The last Google sign-in or calendar import failed, or the sign-in
+    /// expired; cleared by the next successful one or a sign-out.
     Sync,
+    /// The sign-in lasts only until the app quits (no keyring), or a sign-out
+    /// could not delete it from the keyring.
+    SecretStore,
 }
 
 impl From<StatusKey> for StatusKeyView {
@@ -908,6 +972,7 @@ impl From<StatusKey> for StatusKeyView {
             StatusKey::Overflow => Self::Overflow,
             StatusKey::Export => Self::Export,
             StatusKey::Sync => Self::Sync,
+            StatusKey::SecretStore => Self::SecretStore,
         }
     }
 }
@@ -1241,6 +1306,7 @@ impl From<&Snapshot> for SnapshotEvent {
             overflow: s.overflow.iter().map(ToString::to_string).collect(),
             known_tags: s.known_tags.clone(),
             google: s.google.into(),
+            google_client: (&s.google_client).into(),
             calendars: s
                 .calendars
                 .iter()
@@ -1315,6 +1381,8 @@ pub fn specta_builder() -> Builder<Wry> {
             set_work_end,
             carry_over_to_tomorrow,
             sign_in,
+            sign_out,
+            set_google_client,
             set_included_calendars,
             exclude_event,
             include_event,
@@ -1543,6 +1611,31 @@ mod tests {
             EngineMsg::CarryOverToTomorrow { expected_rev: 7 }
         );
         assert_eq!(sign_in_msg(), EngineMsg::SignIn);
+        assert_eq!(sign_out_msg(), EngineMsg::SignOut);
+        assert_eq!(
+            set_google_client_msg(Some("abc".into()), Some("shh".into())),
+            EngineMsg::SetGoogleClient {
+                client: Some(OAuthClient {
+                    id: "abc".into(),
+                    secret: Some("shh".into())
+                })
+            }
+        );
+        assert_eq!(
+            set_google_client_msg(Some("abc".into()), Some("  ".into())),
+            EngineMsg::SetGoogleClient {
+                client: Some(OAuthClient {
+                    id: "abc".into(),
+                    secret: None
+                })
+            }
+        );
+        for blank in [None, Some(String::new()), Some("  ".into())] {
+            assert_eq!(
+                set_google_client_msg(blank, Some("shh".into())),
+                EngineMsg::SetGoogleClient { client: None }
+            );
+        }
         assert_eq!(
             exclude_event_msg(A, 9),
             Ok(EngineMsg::ExcludeEvent {
@@ -1745,6 +1838,10 @@ mod tests {
             }],
             known_tags: vec!["meeting".into(), "old".into(), "Team".into()],
             google: GoogleAccount::SignedIn,
+            google_client: GoogleClient {
+                custom_id: Some("my-client".into()),
+                available: true,
+            },
             calendars: vec![
                 nguda_core::CalendarEntry {
                     id: "me@example.com".into(),
@@ -1763,6 +1860,13 @@ mod tests {
         let ev = SnapshotEvent::from(&snap);
         assert_eq!(ev.rev, 5);
         assert_eq!(ev.google, GoogleAccountView::SignedIn);
+        assert_eq!(
+            ev.google_client,
+            GoogleClientView {
+                custom_id: Some("my-client".into()),
+                available: true,
+            }
+        );
         assert_eq!(
             ev.calendars,
             vec![
@@ -1886,6 +1990,13 @@ mod tests {
         assert_eq!(key(StatusKey::Overflow), "\"overflow\"");
         assert_eq!(key(StatusKey::Export), "\"export\"");
         assert_eq!(key(StatusKey::Sync), "\"sync\"");
+        assert_eq!(key(StatusKey::SecretStore), "\"secretStore\"");
+        let client = serde_json::to_string(&GoogleClientView {
+            custom_id: Some("abc".into()),
+            available: false,
+        })
+        .unwrap();
+        assert_eq!(client, r#"{"customId":"abc","available":false}"#);
         let google = |g| serde_json::to_string(&GoogleAccountView::from(g)).unwrap();
         assert_eq!(google(GoogleAccount::Unknown), "\"unknown\"");
         assert_eq!(google(GoogleAccount::SignedOut), "\"signedOut\"");
@@ -1928,6 +2039,10 @@ mod tests {
                 known_tags: vec![],
                 google: GoogleAccountView::Unknown,
                 calendars: vec![],
+                google_client: GoogleClientView {
+                    custom_id: None,
+                    available: false,
+                },
             }
         );
     }

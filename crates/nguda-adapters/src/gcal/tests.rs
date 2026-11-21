@@ -70,8 +70,11 @@ impl SecretStore for BrokenSecrets {
     }
 }
 
-fn client() -> Option<(String, String)> {
-    Some(("client-id".into(), "client-secret".into()))
+fn client() -> Option<OAuthClient> {
+    Some(OAuthClient {
+        id: "client-id".into(),
+        secret: Some("client-secret".into()),
+    })
 }
 
 fn config(server: &MockServer) -> GcalConfig {
@@ -87,7 +90,19 @@ fn no_browser() -> OpenUrl {
 /// the loopback redirect with `code` and the returned state (or `state` when
 /// given), from a plain thread.
 fn browser(seen: Arc<Mutex<Option<Url>>>, state: Option<&'static str>) -> OpenUrl {
+    gated_browser(seen, state, None)
+}
+
+/// Like [`browser`], but with a `gate`, the redirect waits until the gate gets a
+/// message (or its sender is dropped).
+fn gated_browser(
+    seen: Arc<Mutex<Option<Url>>>,
+    state: Option<&'static str>,
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+) -> OpenUrl {
+    let gate = Arc::new(Mutex::new(gate));
     Arc::new(move |url: &str| {
+        let gate = gate.lock().unwrap().take();
         let url = Url::parse(url).map_err(|e| e.to_string())?;
         *seen.lock().unwrap() = Some(url.clone());
         let param = |name: &str| {
@@ -100,6 +115,9 @@ fn browser(seen: Arc<Mutex<Option<Url>>>, state: Option<&'static str>) -> OpenUr
         let returned = state.map_or_else(|| param("state"), str::to_owned);
         let addr = format!("127.0.0.1:{}", redirect.port().unwrap());
         std::thread::spawn(move || {
+            if let Some(gate) = gate {
+                let _ = gate.recv();
+            }
             // An idle connection held open throughout, like a browser preconnect:
             // it must not block the redirect behind it.
             let _idle = std::net::TcpStream::connect(&addr).unwrap();
@@ -254,19 +272,18 @@ async fn a_token_error_carries_the_oauth_code_only() {
     Mock::given(method("POST"))
         .and(path("/token"))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": "invalid_grant",
+            "error": "invalid_client",
             "error_description": "secret detail rt-9",
         })))
         .mount(&server)
         .await;
-    let source = GcalSource::new(
-        config(&server),
-        MemorySecrets::with_refresh("rt-9"),
-        no_browser(),
-    );
+    let secrets = MemorySecrets::with_refresh("rt-9");
+    let source = GcalSource::new(config(&server), secrets.clone(), no_browser());
     let err = sync_me(&source, None).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::Auth);
-    assert!(err.message.contains("invalid_grant"), "{err}");
+    // Only invalid_grant ends the session: the token stays.
+    assert_eq!(secrets.refresh().as_deref(), Some("rt-9"));
+    assert!(err.message.contains("invalid_client"), "{err}");
     assert!(!err.message.contains("rt-9"), "{err}");
 }
 
@@ -468,12 +485,35 @@ async fn an_unreadable_keyring_is_not_signed_in() {
 }
 
 #[tokio::test]
-async fn a_sign_in_that_cannot_be_stored_leaves_no_session() {
+async fn a_sign_in_that_cannot_be_stored_lasts_for_the_session() {
     let server = MockServer::start().await;
+    // A short-lived access token, so the next fetch must refresh.
+    let mut first = token_json(Some("rt-1"), "at-1");
+    first["expires_in"] = json!(30);
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(Some("rt-1"), "at-1")))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(first))
         .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=rt-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(None, "at-2")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/calendar/v3/calendars/me@example.com/events"))
+        .and(header("authorization", "Bearer at-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/calendar/v3/users/me/calendarList"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("rt-1"))
         .mount(&server)
         .await;
     let seen = Arc::new(Mutex::new(None));
@@ -482,11 +522,308 @@ async fn a_sign_in_that_cannot_be_stored_leaves_no_session() {
         Arc::new(BrokenSecrets),
         browser(seen, None),
     );
-    let err = source.sign_in().await.unwrap_err();
-    assert_eq!(err.kind, CalendarErrorKind::Other);
-    // The exchanged access token was not kept: a fetch is not signed in.
+    assert_eq!(source.sign_in().await.unwrap(), SessionStore::SessionOnly);
+    // The in-memory refresh token signs the next fetch.
+    assert_eq!(sync_me(&source, None).await.unwrap().changes, vec![]);
+    let err = source.list_calendars().await.unwrap_err();
+    assert!(!err.message.contains("rt-1"), "{err}");
+
+    // Signing out forgets it without touching the (broken) store.
+    source.sign_out().await.unwrap();
     let err = sync_me(&source, None).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
+    assert!(!err.message.contains("rt-1"), "{err}");
+}
+
+#[tokio::test]
+async fn a_stored_sign_in_reports_stored() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(Some("rt-1"), "at-1")))
+        .mount(&server)
+        .await;
+    let secrets = Arc::new(MemorySecrets::default());
+    let seen = Arc::new(Mutex::new(None));
+    let source = GcalSource::new(config(&server), secrets.clone(), browser(seen, None));
+    assert_eq!(source.sign_in().await.unwrap(), SessionStore::Stored);
+    assert_eq!(secrets.refresh().as_deref(), Some("rt-1"));
+}
+
+#[tokio::test]
+async fn the_users_own_client_replaces_the_built_in_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("client_id=my-own-id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(Some("rt-1"), "at-1")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let seen = Arc::new(Mutex::new(None));
+    let source = GcalSource::new(
+        config(&server),
+        Arc::new(MemorySecrets::default()),
+        browser(seen.clone(), None),
+    );
+    source.set_client(Some(OAuthClient {
+        id: "my-own-id".into(),
+        secret: None,
+    }));
+    assert!(source.has_client());
+    source.sign_in().await.unwrap();
+
+    let auth_url = seen.lock().unwrap().clone().unwrap();
+    let params: HashMap<String, String> = auth_url.query_pairs().into_owned().collect();
+    assert_eq!(params["client_id"], "my-own-id");
+    let requests = server.received_requests().await.unwrap();
+    let body = String::from_utf8(requests[0].body.clone()).unwrap();
+    assert!(body.contains("client_id=my-own-id"), "{body}");
+    assert!(!body.contains("client-id"), "{body}");
+    // No secret configured: none is sent.
+    assert!(!body.contains("client_secret"), "{body}");
+
+    // Clearing it goes back to the built-in client.
+    source.set_client(None);
+    assert!(source.has_client());
+}
+
+#[tokio::test]
+async fn with_no_client_at_all_has_client_is_false_and_sign_in_fails() {
+    let server = MockServer::start().await;
+    let config = GcalConfig::with_base(&server.uri(), None, Duration::from_secs(1));
+    let source = GcalSource::new(config, Arc::new(MemorySecrets::default()), no_browser());
+    assert!(!source.has_client());
+    let err = source.sign_in().await.unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::NoClient);
+    source.set_client(Some(OAuthClient {
+        id: "mine".into(),
+        secret: None,
+    }));
+    assert!(source.has_client());
+}
+
+#[tokio::test]
+async fn sign_out_deletes_the_stored_token_and_the_next_fetch_is_not_signed_in() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .mount(&server)
+        .await;
+    let secrets = MemorySecrets::with_refresh("rt");
+    let source = GcalSource::new(config(&server), secrets.clone(), no_browser());
+    sync_me(&source, None).await.unwrap();
+    let before = server.received_requests().await.unwrap().len();
+
+    source.sign_out().await.unwrap();
+    assert_eq!(secrets.refresh(), None);
+    let err = sync_me(&source, None).await.unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
+    // The cached access token is gone too: no request was made.
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn sign_out_reports_a_delete_failure() {
+    let server = MockServer::start().await;
+    let source = GcalSource::new(config(&server), Arc::new(BrokenSecrets), no_browser());
+    let err = source.sign_out().await.unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::Other);
+    assert_eq!(err.message, "the keyring is locked or not accessible");
+}
+
+#[tokio::test]
+async fn a_refresh_answered_invalid_grant_deletes_the_token_and_expires_the_session() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "invalid_grant",
+            "error_description": "Token has been expired or revoked. rt-9",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let secrets = MemorySecrets::with_refresh("rt-9");
+    let source = GcalSource::new(config(&server), secrets.clone(), no_browser());
+    let err = sync_me(&source, None).await.unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::SessionExpired);
+    assert!(!err.message.contains("rt-9"), "{err}");
+    assert_eq!(secrets.refresh(), None);
+    // The session is gone: the next fetch makes no request.
+    let err = sync_me(&source, None).await.unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
+}
+
+#[tokio::test]
+async fn an_expired_session_ignores_a_failing_delete() {
+    let server = MockServer::start().await;
+    let mut first = token_json(Some("rt-1"), "at-1");
+    first["expires_in"] = json!(30);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(first))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({ "error": "invalid_grant" })))
+        .mount(&server)
+        .await;
+    let seen = Arc::new(Mutex::new(None));
+    let source = GcalSource::new(
+        config(&server),
+        Arc::new(BrokenSecrets),
+        browser(seen, None),
+    );
+    source.sign_in().await.unwrap();
+    let err = sync_me(&source, None).await.unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::SessionExpired);
+}
+
+#[tokio::test]
+async fn a_sign_in_completing_after_a_sign_out_stores_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(Some("rt-1"), "at-1")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let secrets = Arc::new(MemorySecrets::default());
+    let seen = Arc::new(Mutex::new(None));
+    let (open, gate) = std::sync::mpsc::channel();
+    let source = GcalSource::new(
+        config(&server),
+        secrets.clone(),
+        gated_browser(seen.clone(), None, Some(gate)),
+    );
+    let signing_in = tokio::spawn({
+        let source = source.clone();
+        async move { source.sign_in().await }
+    });
+    while seen.lock().unwrap().is_none() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    source.sign_out().await.unwrap();
+    open.send(()).unwrap();
+    assert!(signing_in.await.unwrap().is_err());
+    assert_eq!(secrets.refresh(), None);
+    let err = sync_me(&source, None).await.unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
+}
+
+/// A secret store holding a token it cannot delete, counting its reads.
+struct UndeletableSecrets {
+    inner: MemorySecrets,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+impl SecretStore for UndeletableSecrets {
+    fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(key)
+    }
+
+    fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
+        self.inner.set(key, value)
+    }
+
+    fn delete(&self, _key: &str) -> Result<(), SecretStoreError> {
+        Err(SecretStoreError::new("the keyring is locked"))
+    }
+}
+
+#[tokio::test]
+async fn after_a_sign_out_whose_delete_failed_the_stored_token_is_not_read_again() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .mount(&server)
+        .await;
+    let secrets = Arc::new(UndeletableSecrets {
+        inner: MemorySecrets::default(),
+        gets: Default::default(),
+    });
+    secrets.inner.set(REFRESH_TOKEN_KEY, "rt").unwrap();
+    let source = GcalSource::new(config(&server), secrets.clone(), no_browser());
+    sync_me(&source, None).await.unwrap();
+    let gets = secrets.gets.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(gets, 1);
+    let requests = server.received_requests().await.unwrap().len();
+
+    assert!(source.sign_out().await.is_err());
+    let err = sync_me(&source, None).await.unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
+    assert_eq!(secrets.gets.load(std::sync::atomic::Ordering::SeqCst), gets);
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+}
+
+/// A secret store whose `set` blocks until `gate` gets a message.
+struct SlowSetSecrets {
+    inner: MemorySecrets,
+    started: AtomicBool,
+    gate: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl SecretStore for SlowSetSecrets {
+    fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
+        self.inner.get(key)
+    }
+
+    fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
+        self.started.store(true, Ordering::SeqCst);
+        let _ = self.gate.lock().unwrap().recv();
+        self.inner.set(key, value)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
+        self.inner.delete(key)
+    }
+}
+
+#[tokio::test]
+async fn a_sign_out_after_aborting_a_sign_in_mid_store_still_deletes_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(Some("rt-1"), "at-1")))
+        .mount(&server)
+        .await;
+    let (release, gate) = std::sync::mpsc::channel();
+    let secrets = Arc::new(SlowSetSecrets {
+        inner: MemorySecrets::default(),
+        started: AtomicBool::new(false),
+        gate: Mutex::new(gate),
+    });
+    let seen = Arc::new(Mutex::new(None));
+    let source = GcalSource::new(config(&server), secrets.clone(), browser(seen, None));
+    let signing_in = tokio::spawn({
+        let source = source.clone();
+        async move { source.sign_in().await }
+    });
+    while !secrets.started.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The engine aborts the sign-in while the keyring write is still running.
+    signing_in.abort();
+    let signing_out = tokio::spawn(source.sign_out());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    release.send(()).unwrap();
+    signing_out.await.unwrap().unwrap();
+    assert_eq!(
+        secrets.inner.refresh(),
+        None,
+        "the delete ran after the store"
+    );
 }
 
 /// A token mock answering any refresh with access token `at`.

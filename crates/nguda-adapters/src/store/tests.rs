@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use nguda_core::{
     Baseline, BaselineItem, CalendarEntry, CalendarRef, Day, DayLogEntry, DayLogKind, ItemId,
-    LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Settings, Span, Store,
-    StoreBatch, StoreOp, SyncCursor, Timestamp, Uuid, WorkEnd,
+    LockDecision, OAuthClient, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Settings, Span,
+    Store, StoreBatch, StoreOp, SyncCursor, Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
@@ -549,6 +549,49 @@ async fn work_end_round_trips_across_a_reopen_and_is_overwritten() {
         .query_row("SELECT count(*) FROM settings", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn the_google_client_round_trips_across_a_reopen_and_is_cleared() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let set =
+        |client: Option<OAuthClient>| StoreBatch::from_iter([StoreOp::SetGoogleClient { client }]);
+    let rows = |path: &Path| -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM settings", [], |r| r.get(0))
+            .unwrap()
+    };
+    let store = SqliteStore::open(&path).unwrap();
+    let with_secret = OAuthClient {
+        id: "abc".into(),
+        secret: Some("shh".into()),
+    };
+    store.commit(set(Some(with_secret.clone()))).await.unwrap();
+    drop(store);
+    assert_eq!(rows(&path), 2);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store.load_settings().await.unwrap().google_client,
+        Some(with_secret)
+    );
+
+    // A client without a secret drops the stored secret.
+    let no_secret = OAuthClient {
+        id: "def".into(),
+        secret: None,
+    };
+    store.commit(set(Some(no_secret.clone()))).await.unwrap();
+    assert_eq!(
+        store.load_settings().await.unwrap().google_client,
+        Some(no_secret)
+    );
+    assert_eq!(rows(&path), 1);
+
+    store.commit(set(None)).await.unwrap();
+    assert_eq!(store.load_settings().await.unwrap(), Settings::default());
+    assert_eq!(rows(&path), 0);
 }
 
 #[tokio::test]
