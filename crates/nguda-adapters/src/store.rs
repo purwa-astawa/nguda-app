@@ -477,19 +477,20 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
         }
         StoreOp::SetLockDecision { date, decision } => {
             let ctx = format!("set lock decision for {date}");
+            let date_text = date.to_string();
             // Decided at most once (AD-7): only an undecided day takes a decision.
             let changed = tx
                 .execute(
                     "UPDATE day SET lock_decision = ?2
                      WHERE date = ?1 AND lock_decision = 'none'",
-                    params![date.to_string(), decision_str(*decision)],
+                    params![date_text, decision_str(*decision)],
                 )
                 .map_err(sql_err(&ctx))?;
             if changed != 1 {
                 let exists = tx
                     .query_row(
                         "SELECT 1 FROM day WHERE date = ?1",
-                        [date.to_string()],
+                        [&date_text],
                         |_| Ok(()),
                     )
                     .optional()

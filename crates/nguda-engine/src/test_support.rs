@@ -56,6 +56,12 @@ pub(crate) fn no_lock(mut day: Day) -> Day {
     day
 }
 
+/// `day`, decided `Lock`.
+pub(crate) fn locked(mut day: Day) -> Day {
+    day.decide_lock(LockChoice::Lock).unwrap();
+    day
+}
+
 /// A settable clock in whole seconds. `sleep_until` wakes when `advance` or `set`
 /// reaches its deadline.
 pub(crate) struct FakeClock(watch::Sender<i64>);

@@ -306,8 +306,16 @@ test("move to tomorrow carries over at the rendered rev", () => {
   assert.deepEqual(carryOverCommand(snap(7)), { name: "carryOverToTomorrow", args: [7] });
 });
 
-function withDecision(s: Snapshot, lockDecision: "none" | "locked" | "noLock"): Snapshot {
+function withDecision(
+  s: Snapshot,
+  lockDecision: NonNullable<Snapshot["day"]>["lockDecision"],
+): Snapshot {
   return { ...s, day: { ...s.day!, lockDecision } };
+}
+
+/** Insert "Call", 15 minutes, now, on `s`. */
+function insertNow(s: Snapshot) {
+  return insertCommand(s, "Call", "15", { place: "now", itemId: null });
 }
 
 test("an undecided day asks for a lock choice on Start and insert-now only", () => {
@@ -316,7 +324,7 @@ test("an undecided day asks for a lock choice on Start and insert-now only", () 
   const start = rowActions(undecided, A).start!;
   assert.deepEqual(start, { name: "startTask", args: ["A", 3, null] });
   assert.equal(asksLockChoice(undecided, start), true);
-  const now = insertCommand(undecided, "Call", "15", { place: "now", itemId: null });
+  const now = insertNow(undecided);
   assert.equal(asksLockChoice(undecided, now), true);
   const end = insertCommand(undecided, "Call", "15", { place: "end", itemId: null });
   assert.equal(asksLockChoice(undecided, end), false, "only the now anchor decides");
@@ -329,7 +337,7 @@ test("the chosen answer's Start and insert-now go out with that choice", () => {
   const start = rowActions(undecided, A).start!;
   assert.deepEqual(withLock(start, "lock"), { name: "startTask", args: ["A", 3, "lock"] });
   assert.deepEqual(withLock(start, "noLock"), { name: "startTask", args: ["A", 3, "noLock"] });
-  const now = insertCommand(undecided, "Call", "15", { place: "now", itemId: null });
+  const now = insertNow(undecided);
   assert.deepEqual(withLock(now, "lock"), {
     name: "insertTask",
     args: ["Call", 900, { place: "now", itemId: null }, 3, "lock"],
@@ -354,7 +362,7 @@ test("Lock day shows only while undecided; the badge reads locked or unlocked", 
     const start = rowActions(decided, A).start!;
     assert.deepEqual(start, { name: "startTask", args: ["A", 4, null] });
     assert.equal(asksLockChoice(decided, start), false);
-    const now = insertCommand(decided, "Call", "15", { place: "now", itemId: null });
+    const now = insertNow(decided);
     assert.equal(asksLockChoice(decided, now), false);
   }
   assert.equal(lockDayCommand({ ...snap(4), day: null }), null);

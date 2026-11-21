@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::clock::{Clock, SleepFuture};
 use crate::order::OrderKey;
-use crate::plan::ItemId;
+use crate::plan::{ItemId, ItemStatus, PlanItemRecord};
 use crate::segment::Segment;
 
 /// The instant `secs` whole seconds after the Unix epoch.
@@ -23,6 +23,24 @@ pub(crate) fn id(n: u128) -> ItemId {
 /// The order key `s`, which must be valid.
 pub(crate) fn key(s: &str) -> OrderKey {
     OrderKey::new(s).unwrap()
+}
+
+/// A pending item record: id `n`, title "item {n}", the given planned length
+/// and order key, and every other field empty.
+pub(crate) fn record(n: u128, planned_secs: u64, order: &str) -> PlanItemRecord {
+    PlanItemRecord {
+        id: id(n),
+        title: format!("item {n}"),
+        planned_secs,
+        order: key(order),
+        fixed: false,
+        pinned_start: None,
+        status: ItemStatus::Pending,
+        removed_at: None,
+        segments: Vec::new(),
+        carried_from: None,
+        tags: Vec::new(),
+    }
 }
 
 /// A closed segment from `from` to `to`, in seconds since the Unix epoch.
