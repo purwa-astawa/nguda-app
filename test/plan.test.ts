@@ -7,8 +7,12 @@ import {
   includeEventCommand,
   pickerCalendars,
   googleSection,
+  googleClientCommand,
+  clearGoogleClientCommand,
   includeCalendarCommand,
   signInCommand,
+  signOutCommand,
+  NO_CLIENT,
   addCommand,
   asksLockChoice,
   carryOverCommand,
@@ -78,6 +82,7 @@ function snap(rev: number, items: Item[] = [F, A, B], running: Snapshot["running
     knownTags: [],
     google: "signedOut",
     calendars: [],
+    googleClient: { customId: null, available: true },
   };
 }
 
@@ -413,17 +418,70 @@ test("tag suggestions are the known tags the item lacks, case-insensitively", ()
 
 test("the Google section follows the account state", () => {
   const at = (google: Snapshot["google"]) => googleSection({ ...snap(1), google });
-  const none = { calendars: [] };
-  assert.deepEqual(at("unknown"), { label: "Checking…", signIn: false, busy: false, ...none });
-  assert.deepEqual(at("signedOut"), { label: "Not signed in", signIn: true, busy: false, ...none });
+  const hidden = {
+    signIn: false,
+    busy: false,
+    noClient: null,
+    signOut: false,
+    clientForm: false,
+    customId: null,
+    calendars: [],
+  };
+  assert.deepEqual(at("unknown"), { ...hidden, label: "Checking…" });
+  assert.deepEqual(at("signedOut"), {
+    ...hidden,
+    label: "Not signed in",
+    signIn: true,
+    clientForm: true,
+  });
   assert.deepEqual(at("signingIn"), {
+    ...hidden,
     label: "Waiting for browser…",
     signIn: true,
     busy: true,
-    ...none,
   });
-  assert.deepEqual(at("signedIn"), { label: "Signed in", signIn: false, busy: false, ...none });
+  assert.deepEqual(at("signedIn"), { ...hidden, label: "Signed in", signOut: true });
   assert.deepEqual(signInCommand(), { name: "signIn", args: [] });
+  assert.deepEqual(signOutCommand(), { name: "signOut", args: [] });
+});
+
+test("signed out with no client, Sign in is disabled with the explanation", () => {
+  const s = { ...snap(1), googleClient: { customId: null, available: false } };
+  const g = googleSection(s);
+  assert.equal(g.signIn, true);
+  assert.equal(g.busy, true);
+  assert.equal(g.noClient, NO_CLIENT);
+  assert.equal(
+    NO_CLIENT,
+    "No Google client is built in. Enter your own OAuth client ID to sign in.",
+  );
+  assert.equal(g.clientForm, true);
+  // Once the user's own client is saved, Sign in is enabled and shows its id.
+  const saved = googleSection({ ...s, googleClient: { customId: "abc", available: true } });
+  assert.equal(saved.busy, false);
+  assert.equal(saved.noClient, null);
+  assert.equal(saved.customId, "abc");
+  // The form and the explanation show only while signed out.
+  const signedIn = googleSection({ ...s, google: "signedIn" });
+  assert.equal(signedIn.clientForm, false);
+  assert.equal(signedIn.noClient, null);
+  assert.equal(googleSection({ ...s, google: "signingIn" }).clientForm, false);
+});
+
+test("the OAuth client form trims, drops a blank secret, and clears on a blank id", () => {
+  assert.deepEqual(googleClientCommand(" abc ", " shh "), {
+    name: "setGoogleClient",
+    args: ["abc", "shh"],
+  });
+  assert.deepEqual(googleClientCommand("abc", "  "), {
+    name: "setGoogleClient",
+    args: ["abc", null],
+  });
+  assert.deepEqual(googleClientCommand("  ", "shh"), {
+    name: "setGoogleClient",
+    args: [null, null],
+  });
+  assert.deepEqual(clearGoogleClientCommand(), { name: "setGoogleClient", args: [null, null] });
 });
 
 const calendars: Snapshot["calendars"] = [

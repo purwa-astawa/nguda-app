@@ -11,7 +11,7 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 
 use crate::baseline::{Baseline, LockDecision};
-use crate::calendar::{CalendarEntry, SyncCursor};
+use crate::calendar::{CalendarEntry, OAuthClient, SyncCursor};
 use crate::day_log::DayLogEntry;
 use crate::plan::{Day, ItemId, PlanItem};
 use crate::settings::{Settings, WorkEnd};
@@ -46,6 +46,9 @@ pub enum StoreOp {
     SetInterruptStack { date: Date, items: Vec<ItemId> },
     /// Stores the work-end setting, replacing any earlier value.
     SetWorkEnd { work_end: WorkEnd },
+    /// Stores the user's own OAuth client, replacing any earlier one; `None`
+    /// removes it. A client with no secret stores none.
+    SetGoogleClient { client: Option<OAuthClient> },
     /// Sets the stored day `date`'s lock decision (AD-7).
     SetLockDecision { date: Date, decision: LockDecision },
     /// Writes the stored day's baseline (AD-6). Insert-only: a second baseline for

@@ -12,10 +12,10 @@ use std::time::Duration;
 use nguda_core::{
     CalendarChange, CalendarEntry, CalendarError, CalendarErrorKind, CalendarSource, Clock, Date,
     Day, DayLogKind, EventKey, ExportRange, FetchedEvent, FileSink, IdGen, IsoWeek, ItemId,
-    LockDecision, OpenSegmentRef, PlanItem, PromptId, PromptKind, Random, Running, Schedule, Store,
-    StoreBatch, StoreError, StoreOp, SyncBatch, SyncCursor, TimeZone, Timestamp, WorkEnd,
-    add_event, added_refs, export_csv, hide_calendar, in_plan, merge, merge_tag_names, reconcile,
-    reflow, report, sort_tag_names, week_report,
+    LockDecision, OAuthClient, OpenSegmentRef, PlanItem, PromptId, PromptKind, Random, Running,
+    Schedule, SessionStore, Store, StoreBatch, StoreError, StoreOp, SyncBatch, SyncCursor,
+    TimeZone, Timestamp, WorkEnd, add_event, added_refs, export_csv, hide_calendar, in_plan, merge,
+    merge_tag_names, reconcile, reflow, report, sort_tag_names, week_report,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -23,8 +23,8 @@ use crate::batch::diff;
 use crate::commands::{self, Reject, domain_kind};
 use crate::{
     AddedOutcome, BACKOFF_MAX, CalendarEvent, CalendarOutcome, DayReply, Effect, EngineDeps,
-    EngineMsg, EventsReply, GoogleAccount, HEARTBEAT_EVERY, Inbox, JITTER, NextItem, POLL_EVERY,
-    QueryError, Snapshot, StatusEntry, StatusKey, SyncRound, WAKE_LATENESS, WeekReply,
+    EngineMsg, EventsReply, GoogleAccount, GoogleClient, HEARTBEAT_EVERY, Inbox, JITTER, NextItem,
+    POLL_EVERY, QueryError, Snapshot, StatusEntry, StatusKey, SyncRound, WAKE_LATENESS, WeekReply,
 };
 
 pub(crate) async fn run(
@@ -45,6 +45,7 @@ pub(crate) async fn run(
                 Some(Inbox::QueryWeek { week, reply }) => actor.query_week(week, reply),
                 Some(Inbox::ExportFinished { id, result }) => actor.export_finished(id, result),
                 Some(Inbox::SignInFinished { id, result }) => actor.sign_in_finished(id, result),
+                Some(Inbox::SignOutFinished { id, result }) => actor.sign_out_finished(id, result),
                 Some(Inbox::ImportFinished { id, date, result }) => {
                     actor.import_finished(id, date, result).await;
                 }
@@ -75,6 +76,13 @@ struct Actor {
     random: Arc<dyn Random>,
     /// The last sign-in request id handed out; only its outcome applies.
     sign_in_issued: u64,
+    /// The task of the latest sign-in issued, aborted by a sign-out.
+    sign_in_task: Option<tokio::task::JoinHandle<()>>,
+    /// The user's own OAuth client, as last committed or loaded. Never logged
+    /// or published: it may hold a secret.
+    google_client: Option<OAuthClient>,
+    /// Whether the calendar source has any client to sign in with.
+    client_available: bool,
     /// The last sync request id handed out; only its result applies.
     import_issued: u64,
     /// The last calendar-events query id handed out; only its result is
@@ -157,6 +165,9 @@ impl Actor {
             calendar: deps.calendar,
             random: deps.random,
             sign_in_issued: 0,
+            sign_in_task: None,
+            google_client: None,
+            client_available: false,
             import_issued: 0,
             events_query_issued: 0,
             cursors: BTreeMap::new(),
@@ -211,13 +222,17 @@ impl Actor {
             Some(day) => day,
             None => self.load_or_new(today, "load today").await,
         };
-        self.work_end = match self.store.load_settings().await {
-            Ok(settings) => settings.work_end,
+        let settings = match self.store.load_settings().await {
+            Ok(settings) => settings,
             Err(e) => {
                 self.store_failed("load settings", &e);
-                WorkEnd::DEFAULT
+                nguda_core::Settings::default()
             }
         };
+        self.work_end = settings.work_end;
+        self.google_client = settings.google_client;
+        self.calendar.set_client(self.google_client.clone());
+        self.client_available = self.calendar.has_client();
         self.known_tags = match self.store.load_tag_names().await {
             Ok(mut names) => {
                 sort_tag_names(&mut names);
@@ -330,12 +345,14 @@ impl Actor {
     /// the latest issued, or a date that is no longer today; a stale round
     /// changes nothing at all.
     ///
-    /// A listing failure fails the whole round: "not signed in" (or no client)
-    /// marks the account signed out and schedules no poll, a 403/429 grows the
+    /// A listing failure fails the whole round: an expired session signs out
+    /// (see [`Self::session_expired`]), "not signed in" (or no client) marks the
+    /// account signed out and schedules no poll, a 403/429 grows the
     /// backoff and sets `Sync`, any other failure sets `Sync`; the table and the
     /// plan stay as they are. Otherwise the account is signed in, the successful
     /// calendars are applied as one batch (see [`Self::apply_round`]), and then, in
-    /// precedence: a `410` on an incremental sync starts a new round at once
+    /// precedence: an expired session signs out; a `410` on an incremental sync
+    /// starts a new round at once
     /// (that calendar's cursor already cleared); else a 403/429 grows the backoff
     /// and sets `Sync`; else any other failure sets `Sync`; else `Sync` and the
     /// backoff are cleared. Every outcome but a new round or a sign-out schedules
@@ -360,7 +377,9 @@ impl Actor {
                 self.set_google(GoogleAccount::SignedIn);
                 let failures = self.apply_round(id, date, round).await;
                 changed = failures.changed;
-                if failures.gone {
+                if failures.expired {
+                    self.session_expired(id);
+                } else if failures.gone {
                     tracing::info!(id, "calendar sync token expired: fetching again");
                     self.start_import();
                 } else if failures.rate_limited {
@@ -377,6 +396,7 @@ impl Actor {
                     self.schedule_poll();
                 }
             }
+            Err(e) if e.kind == CalendarErrorKind::SessionExpired => self.session_expired(id),
             Err(e) if e.kind == CalendarErrorKind::NotSignedIn => {
                 tracing::debug!(id, "calendar import: not signed in");
                 self.rate_limits = 0;
@@ -408,6 +428,24 @@ impl Actor {
         if changed || self.status != status_before || self.google != google_before {
             self.publish();
         }
+    }
+
+    /// Handles a session Google no longer honours (the source already forgot and
+    /// deleted it): unless already signed out (a sign-out came first), marks
+    /// the account signed out, asks to sign in again in `Sync`, and resets the
+    /// backoff. Schedules no poll. Publishing is the caller's.
+    fn session_expired(&mut self, id: u64) {
+        self.poll_at = None;
+        if self.google == GoogleAccount::SignedOut {
+            return;
+        }
+        tracing::warn!(id, "google sign-in expired or revoked");
+        self.rate_limits = 0;
+        self.set_google(GoogleAccount::SignedOut);
+        self.status.insert(
+            StatusKey::Sync,
+            "Your Google sign-in expired or was revoked. Sign in again.".to_owned(),
+        );
     }
 
     /// Grows the rate-limit backoff, sets `Sync`, and schedules the next poll.
@@ -492,6 +530,9 @@ impl Actor {
                         }
                     }
                 }
+                Err(e) if e.kind == CalendarErrorKind::SessionExpired => {
+                    failures.expired = true;
+                }
                 Err(e) if e.kind == CalendarErrorKind::Gone && incremental => {
                     cursors.remove(&calendar_id);
                     dead.push(calendar_id);
@@ -535,6 +576,9 @@ impl Actor {
                     }
                 }
                 Ok(_) => {}
+                Err(e) if e.kind == CalendarErrorKind::SessionExpired => {
+                    failures.expired = true;
+                }
                 Err(e) if e.kind == CalendarErrorKind::RateLimited => {
                     failures.rate_limited = true;
                 }
@@ -697,28 +741,161 @@ impl Actor {
         let calendar = self.calendar.clone();
         let inbox = self.inbox.clone();
         tracing::info!(id, "google sign-in started");
-        tokio::spawn(async move {
+        if let Some(task) = self.sign_in_task.take() {
+            task.abort();
+        }
+        self.sign_in_task = Some(tokio::spawn(async move {
             let result = calendar.sign_in().await;
             // The engine may have stopped meanwhile; nothing to report to then.
             if let Some(inbox) = inbox.upgrade() {
                 let _ = inbox.send(Inbox::SignInFinished { id, result });
             }
+        }));
+    }
+
+    /// Signs out (R1): drops any sign-in or round in flight (aborting their
+    /// tasks, so their outcomes never apply), schedules no poll, resets the
+    /// backoff, marks the account signed out, clears `Sync` and `SecretStore`,
+    /// and publishes. The source forgets the session at once; deleting the
+    /// stored one runs off the actor (AD-17) and comes back as
+    /// [`Inbox::SignOutFinished`]. Plan, calendar table, cursors and day log are
+    /// untouched.
+    fn sign_out(&mut self) {
+        self.sign_in_issued += 1;
+        if let Some(task) = self.sign_in_task.take() {
+            task.abort();
+        }
+        self.import_issued += 1;
+        if let Some(task) = self.round_task.take() {
+            task.abort();
+        }
+        self.in_flight = false;
+        self.poll_at = None;
+        self.rate_limits = 0;
+        self.google = GoogleAccount::SignedOut;
+        self.status.remove(&StatusKey::Sync);
+        self.status.remove(&StatusKey::SecretStore);
+        self.publish();
+        let id = self.sign_in_issued;
+        // Memory only: the source forgets the session before the future runs.
+        let delete = self.calendar.sign_out();
+        let inbox = self.inbox.clone();
+        tracing::info!(id, "google sign-out started");
+        tokio::spawn(async move {
+            let result = delete.await;
+            // The engine may have stopped meanwhile; nothing to report to then.
+            if let Some(inbox) = inbox.upgrade() {
+                let _ = inbox.send(Inbox::SignOutFinished { id, result });
+            }
         });
     }
 
+    /// Applies a sign-out's deletion: a failure sets `SecretStore`, unless a
+    /// newer sign-in was issued since. Logs the kind only (AD-14).
+    fn sign_out_finished(&mut self, id: u64, result: Result<(), CalendarError>) {
+        if id != self.sign_in_issued {
+            tracing::debug!(id, latest = self.sign_in_issued, "stale sign-out dropped");
+            return;
+        }
+        match result {
+            Ok(()) => tracing::info!(id, "google sign-out finished"),
+            Err(e) => {
+                tracing::warn!(
+                    id,
+                    kind = error_kind(&e),
+                    "google sign-out could not delete"
+                );
+                self.status.insert(
+                    StatusKey::SecretStore,
+                    format!(
+                        "Could not remove the Google sign-in from the keyring: {}",
+                        e.message
+                    ),
+                );
+                self.publish();
+            }
+        }
+    }
+
+    /// Sets the user's own OAuth client (R1, AD-13), only while signed out: the
+    /// id trimmed and non-blank, a blank secret dropped. The same client changes
+    /// nothing. Otherwise commits it, hands it to the source, and publishes. A
+    /// rejection sets `CommandRejected`. Never logs the client.
+    async fn set_google_client(&mut self, client: Option<OAuthClient>) {
+        const CMD: &str = commands::SET_GOOGLE_CLIENT;
+        if self.google != GoogleAccount::SignedOut {
+            let reject = Reject::invalid(CMD, "sign out before changing the Google client");
+            self.reject(CMD, None, &reject);
+            return;
+        }
+        let client = match client {
+            None => None,
+            Some(OAuthClient { id, secret }) => {
+                let id = id.trim().to_owned();
+                if id.is_empty() {
+                    let reject = Reject::invalid(CMD, "the client ID must not be blank");
+                    self.reject(CMD, None, &reject);
+                    return;
+                }
+                let secret = secret
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
+                Some(OAuthClient { id, secret })
+            }
+        };
+        let status_before = self.status.clone();
+        self.status.remove(&StatusKey::CommandRejected);
+        if client == self.google_client {
+            tracing::debug!("google client unchanged");
+            if self.status != status_before {
+                self.publish();
+            }
+            return;
+        }
+        let batch = StoreBatch::from_iter([StoreOp::SetGoogleClient {
+            client: client.clone(),
+        }]);
+        if self.commit(batch).await {
+            tracing::info!(custom = client.is_some(), "google client changed");
+            self.calendar.set_client(client.clone());
+            self.google_client = client;
+            self.client_available = self.calendar.has_client();
+        }
+        self.publish();
+    }
+
     /// Applies the latest sign-in's outcome; an older one is dropped (AD-17).
-    /// Success marks the account signed in, clears `Sync`, and imports today's
-    /// events; failure marks it signed out and sets `Sync` with the message only.
-    fn sign_in_finished(&mut self, id: u64, result: Result<(), CalendarError>) {
+    /// Success marks the account signed in, clears `Sync`, sets `SecretStore`
+    /// when the session lives in memory only (else clears it), and imports
+    /// today's events; failure marks it signed out and sets `Sync` with the
+    /// message only.
+    fn sign_in_finished(&mut self, id: u64, result: Result<SessionStore, CalendarError>) {
         if id != self.sign_in_issued {
             tracing::debug!(id, latest = self.sign_in_issued, "stale sign-in dropped");
             return;
         }
+        self.sign_in_task = None;
         match result {
-            Ok(()) => {
-                tracing::info!(id, "google sign-in succeeded");
+            Ok(kept) => {
+                tracing::info!(
+                    id,
+                    session_only = kept == SessionStore::SessionOnly,
+                    "google sign-in succeeded"
+                );
                 self.google = GoogleAccount::SignedIn;
                 self.status.remove(&StatusKey::Sync);
+                match kept {
+                    SessionStore::Stored => {
+                        self.status.remove(&StatusKey::SecretStore);
+                    }
+                    SessionStore::SessionOnly => {
+                        self.status.insert(
+                            StatusKey::SecretStore,
+                            "No keyring is available: the Google sign-in lasts until nguda quits."
+                                .to_owned(),
+                        );
+                    }
+                }
                 self.publish();
                 self.start_import();
             }
@@ -778,14 +955,24 @@ impl Actor {
     /// Answers a calendar-events query with its listing: `Stale` when a newer
     /// query was issued or `date` is no longer today, the failure's kind on an
     /// error, else the events sorted by start, each marked whether today's plan
-    /// has it ([`in_plan`]). Changes nothing.
+    /// has it ([`in_plan`]). Changes nothing, except that an expired session
+    /// (even in a stale answer) signs out and publishes.
     fn calendar_events_fetched(
-        &self,
+        &mut self,
         id: u64,
         date: Date,
         result: Result<Vec<FetchedEvent>, CalendarError>,
         reply: oneshot::Sender<EventsReply>,
     ) {
+        if let Err(e) = &result
+            && e.kind == CalendarErrorKind::SessionExpired
+        {
+            let before = (self.google, self.status.clone());
+            self.session_expired(id);
+            if before != (self.google, self.status.clone()) {
+                self.publish();
+            }
+        }
         let answer = if id != self.events_query_issued || date != self.day.date() {
             tracing::debug!(id, latest = self.events_query_issued, %date, "stale events dropped");
             Err(QueryError::Stale)
@@ -850,6 +1037,14 @@ impl Actor {
             }
             Ok(None) => {
                 return self.add_failed("not found, all-day, declined, or not today");
+            }
+            Err(e) if e.kind == CalendarErrorKind::SessionExpired => {
+                let before = (self.google, self.status.clone());
+                self.session_expired(0);
+                if before != (self.google, self.status.clone()) {
+                    self.publish();
+                }
+                return;
             }
             Err(e) => {
                 tracing::warn!(kind = error_kind(&e), "calendar event fetch failed");
@@ -1097,6 +1292,14 @@ impl Actor {
             }
             EngineMsg::SignIn => {
                 self.sign_in();
+                false
+            }
+            EngineMsg::SignOut => {
+                self.sign_out();
+                false
+            }
+            EngineMsg::SetGoogleClient { client } => {
+                self.set_google_client(client).await;
                 false
             }
             EngineMsg::SetIncludedCalendars { calendar_ids } => {
@@ -1503,6 +1706,10 @@ impl Actor {
             known_tags: self.known_tags.clone(),
             google: self.google,
             calendars: self.calendars.clone(),
+            google_client: GoogleClient {
+                custom_id: self.google_client.as_ref().map(|c| c.id.clone()),
+                available: self.client_available,
+            },
             status: self
                 .status
                 .iter()
@@ -1531,6 +1738,8 @@ struct RoundFailures {
     rate_limited: bool,
     /// The first other failure's message.
     other: Option<String>,
+    /// A sync or refresh found the session expired or revoked.
+    expired: bool,
 }
 
 /// One sync round (AD-17), run off the actor: lists the calendars (a failure
@@ -1739,6 +1948,7 @@ fn error_kind(e: &CalendarError) -> &'static str {
         CalendarErrorKind::Auth => "auth",
         CalendarErrorKind::RateLimited => "rate_limited",
         CalendarErrorKind::Gone => "gone",
+        CalendarErrorKind::SessionExpired => "session_expired",
         CalendarErrorKind::Other => "other",
     }
 }

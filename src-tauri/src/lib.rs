@@ -158,8 +158,18 @@ pub(crate) struct IdleCalendar;
 
 #[cfg(test)]
 impl CalendarSource for IdleCalendar {
-    fn sign_in(&self) -> nguda_core::CalendarFuture<()> {
+    fn sign_in(&self) -> nguda_core::CalendarFuture<nguda_core::SessionStore> {
         Box::pin(std::future::pending())
+    }
+
+    fn sign_out(&self) -> nguda_core::CalendarFuture<()> {
+        Box::pin(std::future::pending())
+    }
+
+    fn set_client(&self, _client: Option<nguda_core::OAuthClient>) {}
+
+    fn has_client(&self) -> bool {
+        false
     }
 
     fn list_calendars(&self) -> nguda_core::CalendarFuture<Vec<nguda_core::CalendarInfo>> {

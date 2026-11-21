@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use nguda_core::{
     Baseline, CalendarChange, CalendarEntry, CalendarError, CalendarErrorKind, CalendarFuture,
     CalendarInfo, CalendarSource, Clock, Date, Day, DayLogEntry, FetchedEvent, FileSink,
-    FileSinkError, IdGen, ItemId, LockChoice, LockDecision, OpenSegmentRef, OrderKey, PlanItem,
-    PlanItemRecord, PromptId, Random, Segment, Settings, SleepFuture, Store, StoreBatch,
-    StoreError, StoreFuture, StoreOp, SyncBatch, SyncCursor, Timestamp, Uuid, WorkEnd,
+    FileSinkError, IdGen, ItemId, LockChoice, LockDecision, OAuthClient, OpenSegmentRef, OrderKey,
+    PlanItem, PlanItemRecord, PromptId, Random, Segment, SessionStore, Settings, SleepFuture,
+    Store, StoreBatch, StoreError, StoreFuture, StoreOp, SyncBatch, SyncCursor, Timestamp, Uuid,
+    WorkEnd,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -144,6 +145,8 @@ struct Data {
     stacks: BTreeMap<Date, Vec<ItemId>>,
     /// `None` until a work-end is stored.
     work_end: Option<WorkEnd>,
+    /// The user's own OAuth client, when stored.
+    google_client: Option<OAuthClient>,
     /// date → lock decision; a missing date is undecided.
     decisions: BTreeMap<Date, LockDecision>,
     /// date → its write-once baseline.
@@ -274,6 +277,7 @@ impl Data {
                 self.stacks.insert(*date, items.clone());
             }
             StoreOp::SetWorkEnd { work_end } => self.work_end = Some(*work_end),
+            StoreOp::SetGoogleClient { client } => self.google_client = client.clone(),
             StoreOp::SetLockDecision { date, decision } => {
                 if !self.days.contains_key(date) {
                     return Err(StoreError::new(format!("set lock decision: no day {date}")));
@@ -443,6 +447,11 @@ impl MemoryStore {
         self.data.lock().unwrap().stacks.insert(date, items);
     }
 
+    /// The stored OAuth client.
+    pub(crate) fn google_client(&self) -> Option<OAuthClient> {
+        self.data.lock().unwrap().google_client.clone()
+    }
+
     /// Stores `work_end` as is, bypassing batches.
     pub(crate) fn seed_work_end(&self, work_end: WorkEnd) {
         self.data.lock().unwrap().work_end = Some(work_end);
@@ -579,6 +588,7 @@ impl Store for MemoryStore {
         self.read(|d| {
             Ok(Settings {
                 work_end: d.work_end.unwrap_or_default(),
+                google_client: d.google_client.clone(),
             })
         })
     }
@@ -653,7 +663,7 @@ pub(crate) type ListCall = (String, (Timestamp, Timestamp));
 /// What one `get_event` call was given: the calendar id, the event id, and the
 /// window.
 pub(crate) type GetCall = (String, String, (Timestamp, Timestamp));
-type SignInReply = oneshot::Sender<Result<(), CalendarError>>;
+type SignInReply = oneshot::Sender<Result<SessionStore, CalendarError>>;
 /// What one sync call was given: the calendar id, the sync token (`None` for a
 /// full fetch), and the window.
 pub(crate) type SyncCall = (String, Option<String>, (Timestamp, Timestamp));
@@ -680,6 +690,14 @@ pub(crate) struct FakeCalendar {
     sign_ins: Mutex<Vec<Option<SignInReply>>>,
     listing: Mutex<Result<Vec<CalendarInfo>, CalendarError>>,
     lists: AtomicU64,
+    /// Whether a client is built in.
+    built_in: AtomicBool,
+    /// Every `set_client` call, in order.
+    clients: Mutex<Vec<Option<OAuthClient>>>,
+    /// How many `sign_out` calls were made.
+    sign_outs: AtomicU64,
+    /// What every `sign_out` answers.
+    sign_out_result: Mutex<Result<(), CalendarError>>,
 }
 
 impl Default for FakeCalendar {
@@ -691,6 +709,10 @@ impl Default for FakeCalendar {
             sign_ins: Mutex::default(),
             listing: Mutex::new(Ok(vec![primary_info()])),
             lists: AtomicU64::new(0),
+            built_in: AtomicBool::new(true),
+            clients: Mutex::default(),
+            sign_outs: AtomicU64::new(0),
+            sign_out_result: Mutex::new(Ok(())),
         }
     }
 }
@@ -698,6 +720,26 @@ impl Default for FakeCalendar {
 impl FakeCalendar {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Sets whether a client is built in (`true` by default).
+    pub(crate) fn set_built_in(&self, built_in: bool) {
+        self.built_in.store(built_in, Ordering::SeqCst);
+    }
+
+    /// Every `set_client` call, in order.
+    pub(crate) fn clients(&self) -> Vec<Option<OAuthClient>> {
+        self.clients.lock().unwrap().clone()
+    }
+
+    /// How many sign-outs were made.
+    pub(crate) fn sign_out_count(&self) -> u64 {
+        self.sign_outs.load(Ordering::SeqCst)
+    }
+
+    /// Sets what every later sign-out answers.
+    pub(crate) fn set_sign_out_result(&self, result: Result<(), CalendarError>) {
+        *self.sign_out_result.lock().unwrap() = result;
     }
 
     /// Sets what every later listing answers.
@@ -809,7 +851,7 @@ impl FakeCalendar {
     }
 
     /// Answers sign-in `n` (0-based) with `result`.
-    pub(crate) fn resolve_sign_in(&self, n: usize, result: Result<(), CalendarError>) {
+    pub(crate) fn resolve_sign_in(&self, n: usize, result: Result<SessionStore, CalendarError>) {
         let reply = self.sign_ins.lock().unwrap()[n]
             .take()
             .expect("sign-in already resolved");
@@ -822,10 +864,30 @@ fn dropped() -> CalendarError {
 }
 
 impl CalendarSource for FakeCalendar {
-    fn sign_in(&self) -> CalendarFuture<()> {
+    fn sign_in(&self) -> CalendarFuture<SessionStore> {
         let (tx, rx) = oneshot::channel();
         self.sign_ins.lock().unwrap().push(Some(tx));
         Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
+    }
+
+    fn sign_out(&self) -> CalendarFuture<()> {
+        self.sign_outs.fetch_add(1, Ordering::SeqCst);
+        let result = self.sign_out_result.lock().unwrap().clone();
+        Box::pin(async move { result })
+    }
+
+    fn set_client(&self, client: Option<OAuthClient>) {
+        self.clients.lock().unwrap().push(client);
+    }
+
+    fn has_client(&self) -> bool {
+        self.built_in.load(Ordering::SeqCst)
+            || self
+                .clients
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(Option::is_some)
     }
 
     fn list_calendars(&self) -> CalendarFuture<Vec<CalendarInfo>> {

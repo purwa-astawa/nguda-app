@@ -226,6 +226,23 @@ body {
   color: #666;
 }
 
+.google .no-client {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.google .oauth-client {
+  display: flex;
+  flex-wrap: wrap;
+  flex-basis: 100%;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.google .oauth-client span {
+  flex-basis: 100%;
+}
+
 .google .picker {
   display: flex;
   flex-direction: column;

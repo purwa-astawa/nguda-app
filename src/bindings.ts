@@ -54,6 +54,19 @@ export const commands = {
 	 */
 	signIn: () => typedError<null, string>(__TAURI_INVOKE("sign_in")),
 	/**
+	 *  Signs out of Google (R1): the stored sign-in is deleted and polling stops;
+	 *  every plan item stays. Fire-and-forget: the snapshot's `google` field turns
+	 *  `signedOut`, and a keyring failure shows as a `secretStore` status entry.
+	 */
+	signOut: () => typedError<null, string>(__TAURI_INVOKE("sign_out")),
+	/**
+	 *  Sets the user's own Google OAuth client (AD-13); a missing or blank
+	 *  `client_id` clears it, going back to the built-in client. A blank secret
+	 *  means none. The engine rejects it unless signed out. Fire-and-forget: the
+	 *  snapshot's `googleClient.customId` shows the id, never the secret.
+	 */
+	setGoogleClient: (clientId: string | null, clientSecret: string | null) => typedError<null, string>(__TAURI_INVOKE("set_google_client", { clientId, clientSecret })),
+	/**
 	 *  Includes exactly `calendar_ids` in today's plan (R2), un-including every other
 	 *  listed calendar. Fire-and-forget: the new flags show in the snapshot's
 	 *  `calendars`. Unknown ids are ignored.
@@ -300,6 +313,25 @@ export type GoogleAccountView =
 "unknown" | "signedOut" | 
 /**  Waiting for the browser sign-in. */
 "signingIn" | "signedIn";
+
+/**  The OAuth client sign-in uses (AD-13). Never carries the secret. */
+export type GoogleClientView = GoogleClientView_Serialize | GoogleClientView_Deserialize;
+
+/**  The OAuth client sign-in uses (AD-13). Never carries the secret. */
+export type GoogleClientView_Deserialize = {
+	/**  The user's own client id, when one is set. */
+	customId?: string | null,
+	/**  Whether any client (the user's or a built-in one) can sign in. */
+	available: boolean,
+};
+
+/**  The OAuth client sign-in uses (AD-13). Never carries the secret. */
+export type GoogleClientView_Serialize = {
+	/**  The user's own client id, when one is set. */
+	customId: string | null,
+	/**  Whether any client (the user's or a built-in one) can sign in. */
+	available: boolean,
+};
 
 /**
  *  An insert target, never a numeric index (AD-15). `before` and `after` need
@@ -581,6 +613,8 @@ export type SnapshotEvent_Deserialize = {
 	 *  the first listing.
 	 */
 	calendars: CalendarView[],
+	/**  The OAuth client sign-in uses. Never the secret. */
+	googleClient: GoogleClientView_Deserialize,
 };
 
 /**
@@ -619,16 +653,23 @@ export type SnapshotEvent_Serialize = {
 	 *  the first listing.
 	 */
 	calendars: CalendarView[],
+	/**  The OAuth client sign-in uses. Never the secret. */
+	googleClient: GoogleClientView_Serialize,
 };
 
 export type StatusKeyView = "store" | "commandRejected" | "overflow" | 
 /**  The last CSV export failed; cleared by the next successful one. */
 "export" | 
 /**
- *  The last Google sign-in or calendar import failed; cleared by the next
- *  successful one.
+ *  The last Google sign-in or calendar import failed, or the sign-in
+ *  expired; cleared by the next successful one or a sign-out.
  */
-"sync";
+"sync" | 
+/**
+ *  The sign-in lasts only until the app quits (no keyring), or a sign-out
+ *  could not delete it from the keyring.
+ */
+"secretStore";
 
 export type StatusView = {
 	key: StatusKeyView,

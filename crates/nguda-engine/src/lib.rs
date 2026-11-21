@@ -116,6 +116,21 @@
 //! signed in" sets no status, only [`GoogleAccount::SignedOut`], and schedules
 //! no poll. Tokens and event titles are never logged.
 //!
+//! Sign-in hardening (R1, AD-13): [`EngineMsg::SetGoogleClient`] stores the
+//! user's own OAuth client in the settings (only while signed out) and hands it
+//! to the source, which uses it in place of the built-in one;
+//! [`Snapshot::google_client`] shows its id (never the secret) and whether any
+//! client is there to sign in with. [`EngineMsg::SignOut`] aborts a sign-in or
+//! round in flight (their outcomes are dropped), schedules no poll, marks the
+//! account signed out, clears `Sync`, and has the source forget and delete the
+//! stored sign-in off the actor; plan items, the calendar table, cursors, and the
+//! day log stay as they are. A sign-in the source could keep in memory only sets
+//! [`StatusKey::SecretStore`]. A [`CalendarErrorKind::SessionExpired`] answer
+//! (Google refused the refresh token) from a round, an added-event fetch, or an
+//! events query marks the account signed out, asks to sign in again in `Sync`,
+//! resets the backoff, and schedules no poll; a round's successful parts are
+//! still applied.
+//!
 //! Single events (R4): [`EngineMsg::ExcludeEvent`] and
 //! [`EngineMsg::IncludeEvent`] toggle a user-owned flag on a pending imported
 //! item with no time recorded. An excluded item stays pending and in the plan
@@ -145,8 +160,8 @@ use std::time::Duration;
 use nguda_core::{
     CalendarChange, CalendarEntry, CalendarError, CalendarErrorKind, CalendarSource, Clock, Date,
     Day, DayReport, ExportRange, FetchedEvent, FileSink, IdGen, IsoWeek, ItemId, LockChoice,
-    PromptId, PromptKind, Random, Running, Schedule, Store, StoreError, SyncBatch, TimeZone,
-    Timestamp, WeekReport, WorkEnd,
+    OAuthClient, PromptId, PromptKind, Random, Running, Schedule, SessionStore, Store, StoreError,
+    SyncBatch, TimeZone, Timestamp, WeekReport, WorkEnd,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -293,6 +308,17 @@ pub enum EngineMsg {
         calendar_id: String,
         event_id: String,
     },
+    /// Signs out of Google (R1): aborts a sign-in or sync round in flight,
+    /// schedules no poll, marks the account [`GoogleAccount::SignedOut`], clears
+    /// [`StatusKey::Sync`], and deletes the stored sign-in off the actor (a
+    /// failure sets [`StatusKey::SecretStore`]). Plan items, the calendar table,
+    /// cursors, and the day log stay. Not rev-checked.
+    SignOut,
+    /// Sets the user's own OAuth client (`None` goes back to the built-in one),
+    /// persisted and handed to the calendar source (AD-13). The id is trimmed and
+    /// must not be blank; a blank secret means none. Rejected unless the account
+    /// is signed out; the same client changes nothing. Not rev-checked.
+    SetGoogleClient { client: Option<OAuthClient> },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -329,9 +355,23 @@ pub enum StatusKey {
     Overflow,
     /// The last CSV export failed. Cleared by the next successful export.
     Export,
-    /// The last Google sign-in or calendar import failed. Cleared by the next
-    /// successful sign-in or import.
+    /// The last Google sign-in or calendar import failed, or the sign-in
+    /// expired. Cleared by the next successful sign-in or import, or a sign-out.
     Sync,
+    /// The sign-in lives in memory only (no secret store took it), or a
+    /// sign-out could not delete the stored one. Cleared by a stored sign-in or
+    /// the next sign-out.
+    SecretStore,
+}
+
+/// The OAuth client the account signs in with. Never carries the secret (AD-13).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GoogleClient {
+    /// The user's own client id, when one is set.
+    pub custom_id: Option<String>,
+    /// Whether any client (the user's or a built-in one) is there to sign in
+    /// with.
+    pub available: bool,
 }
 
 /// What the engine knows about the Google account. Never carries an address or a
@@ -384,6 +424,8 @@ pub struct Snapshot {
     /// The account's calendars as last listed, in Google's order, with whether
     /// each feeds the plan. Empty before the first listing.
     pub calendars: Vec<CalendarEntry>,
+    /// The OAuth client sign-in uses.
+    pub google_client: GoogleClient,
 }
 
 /// The item the tray shows while nothing runs.
@@ -526,6 +568,12 @@ pub(crate) enum Inbox {
     /// A sign-in task's outcome, tagged with its request id. Only the latest
     /// sign-in's outcome applies (AD-17).
     SignInFinished {
+        id: u64,
+        result: Result<SessionStore, CalendarError>,
+    },
+    /// A sign-out's deletion of the stored sign-in, tagged with the sign-in id
+    /// current when it started: dropped once a newer sign-in was issued.
+    SignOutFinished {
         id: u64,
         result: Result<(), CalendarError>,
     },

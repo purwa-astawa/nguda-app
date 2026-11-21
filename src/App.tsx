@@ -6,6 +6,8 @@ import {
   addCommand,
   asksLockChoice,
   carryOverCommand,
+  clearGoogleClientCommand,
+  googleClientCommand,
   googleSection,
   insertCommand,
   insertPositions,
@@ -17,6 +19,7 @@ import {
   pickerCalendars,
   scheduleLabel,
   signInCommand,
+  signOutCommand,
   withLock,
   workEndCommand,
   type Command,
@@ -76,6 +79,12 @@ async function dispatch(cmd: Command): Promise<string | null> {
       break;
     case "signIn":
       res = await commands.signIn();
+      break;
+    case "signOut":
+      res = await commands.signOut();
+      break;
+    case "setGoogleClient":
+      res = await commands.setGoogleClient(...cmd.args);
       break;
     case "setIncludedCalendars":
       res = await commands.setIncludedCalendars(...cmd.args);
@@ -213,6 +222,9 @@ function App() {
   const [insertAt, setInsertAt] = useState("end");
   // The work-end field's draft; `null` shows the snapshot's value.
   const [workEnd, setWorkEnd] = useState<string | null>(null);
+  // The "your own OAuth client" form's fields; the secret is never shown back.
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
   // Bumped by the tray's or a notification's Extend…; the running row focuses its extend field.
   const [focusExtend, setFocusExtend] = useState(0);
   // A Start or insert-now held back until the user answers "lock the day?" (AD-7).
@@ -359,6 +371,54 @@ function App() {
           <button type="button" disabled={google.busy} onClick={() => send(signInCommand())}>
             Sign in
           </button>
+        )}
+        {google.noClient && <p className="no-client">{google.noClient}</p>}
+        {google.signOut && (
+          <button type="button" onClick={() => send(signOutCommand())}>
+            Sign out
+          </button>
+        )}
+        {google.clientForm && (
+          <form
+            noValidate
+            className="oauth-client"
+            aria-label="Your own OAuth client"
+            onSubmit={(e) => {
+              e.preventDefault();
+              send(googleClientCommand(clientId, clientSecret));
+              setClientId("");
+              setClientSecret("");
+            }}
+          >
+            <span>
+              Your own OAuth client
+              {google.customId ? `: ${google.customId}` : " (none: using the built-in client)"}
+            </span>
+            <input
+              aria-label="Client ID"
+              placeholder="Client ID"
+              value={clientId}
+              onChange={(e) => setClientId(e.target.value)}
+            />
+            <input
+              aria-label="Client secret (optional)"
+              placeholder="Client secret (optional)"
+              type="password"
+              autoComplete="off"
+              value={clientSecret}
+              onChange={(e) => setClientSecret(e.target.value)}
+            />
+            <button type="submit" disabled={!clientId.trim()}>
+              Save
+            </button>
+            <button
+              type="button"
+              disabled={!google.customId}
+              onClick={() => send(clearGoogleClientCommand())}
+            >
+              Clear
+            </button>
+          </form>
         )}
         {google.calendars.length > 0 && (
           <fieldset className="calendars">

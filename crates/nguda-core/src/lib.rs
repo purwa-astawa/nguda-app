@@ -30,8 +30,8 @@ mod test_support;
 pub use baseline::{Baseline, BaselineItem, LockChoice, LockDecision, baseline};
 pub use calendar::{
     CalendarChange, CalendarEntry, CalendarError, CalendarErrorKind, CalendarFuture, CalendarInfo,
-    CalendarSource, EventKey, FetchedEvent, SyncBatch, SyncCursor, add_event, added_refs,
-    hide_calendar, in_plan, merge, reconcile,
+    CalendarSource, EventKey, FetchedEvent, OAuthClient, SessionStore, SyncBatch, SyncCursor,
+    add_event, added_refs, hide_calendar, in_plan, merge, reconcile,
 };
 pub use clock::{Clock, SleepFuture};
 pub use day_log::{DayLogEntry, DayLogKind};

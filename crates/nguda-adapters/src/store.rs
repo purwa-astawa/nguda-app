@@ -15,9 +15,9 @@ use std::thread::JoinHandle;
 
 use nguda_core::{
     Baseline, BaselineItem, CalendarEntry, CalendarRef, Date, Day, DayLogEntry, DayLogKind, ItemId,
-    ItemStatus, LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Segment,
-    Settings, Span, Store, StoreBatch, StoreError, StoreFuture, StoreOp, SyncCursor, Timestamp,
-    Uuid, WorkEnd,
+    ItemStatus, LockDecision, OAuthClient, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord,
+    Segment, Settings, Span, Store, StoreBatch, StoreError, StoreFuture, StoreOp, SyncCursor,
+    Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Params, Row, Transaction, params};
 use rusqlite_migration::{Migrations, SchemaVersion};
@@ -529,6 +529,34 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
             )
             .map_err(sql_err(ctx))?;
         }
+        StoreOp::SetGoogleClient { client } => {
+            let ctx = "set google client";
+            let upsert = |key: &str, value: &str| {
+                tx.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    params![key, value],
+                )
+                .map_err(sql_err(ctx))
+            };
+            let delete = |key: &str| {
+                tx.execute("DELETE FROM settings WHERE key = ?1", [key])
+                    .map_err(sql_err(ctx))
+            };
+            match client {
+                None => {
+                    delete(SETTING_GOOGLE_CLIENT_ID)?;
+                    delete(SETTING_GOOGLE_CLIENT_SECRET)?;
+                }
+                Some(c) => {
+                    upsert(SETTING_GOOGLE_CLIENT_ID, &c.id)?;
+                    match &c.secret {
+                        Some(secret) => upsert(SETTING_GOOGLE_CLIENT_SECRET, secret)?,
+                        None => delete(SETTING_GOOGLE_CLIENT_SECRET)?,
+                    };
+                }
+            }
+        }
         StoreOp::SetLockDecision { date, decision } => {
             let ctx = format!("set lock decision for {date}");
             let date_text = date.to_string();
@@ -768,26 +796,38 @@ fn parse_decision(text: &str) -> Option<LockDecision> {
 
 /// Stored `settings.key` values.
 const SETTING_WORK_END: &str = "work_end";
+const SETTING_GOOGLE_CLIENT_ID: &str = "google_client_id";
+const SETTING_GOOGLE_CLIENT_SECRET: &str = "google_client_secret";
 
 /// The stored settings, each missing row at its default. An unparseable value is an
 /// error, never silently defaulted.
 fn load_settings(conn: &Connection) -> Result<Settings, StoreError> {
     let ctx = "load settings";
-    let work_end = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            [SETTING_WORK_END],
-            |r| r.get::<_, String>(0),
-        )
+    let setting = |key: &str| {
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+            r.get::<_, String>(0)
+        })
         .optional()
-        .map_err(sql_err(ctx))?
+        .map_err(sql_err(ctx))
+    };
+    let work_end = setting(SETTING_WORK_END)?
         .map(|text| {
             text.parse::<WorkEnd>()
                 .map_err(|_| StoreError::new(format!("{ctx}: invalid stored work_end")))
         })
         .transpose()?
         .unwrap_or_default();
-    Ok(Settings { work_end })
+    let google_client = match setting(SETTING_GOOGLE_CLIENT_ID)? {
+        Some(id) => Some(OAuthClient {
+            id,
+            secret: setting(SETTING_GOOGLE_CLIENT_SECRET)?,
+        }),
+        None => None,
+    };
+    Ok(Settings {
+        work_end,
+        google_client,
+    })
 }
 
 /// Stored `day_log.kind` values.

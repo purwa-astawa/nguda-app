@@ -48,6 +48,8 @@ export type Command =
   | { name: "setWorkEnd"; args: [minutes: number] }
   | { name: "carryOverToTomorrow"; args: [expectedRev: number] }
   | { name: "signIn"; args: [] }
+  | { name: "signOut"; args: [] }
+  | { name: "setGoogleClient"; args: [clientId: string | null, clientSecret: string | null] }
   | { name: "setIncludedCalendars"; args: [calendarIds: string[]] }
   | { name: "excludeEvent"; args: [itemId: string, expectedRev: number] }
   | { name: "includeEvent"; args: [itemId: string, expectedRev: number] }
@@ -370,26 +372,56 @@ export function scheduleLabel(
   return `${zonedTime(item.scheduledStart, tz)}\u2013${zonedTime(item.scheduledEnd, tz)}`;
 }
 
+/** Why Sign in is disabled when no OAuth client is there to sign in with. */
+export const NO_CLIENT =
+  "No Google client is built in. Enter your own OAuth client ID to sign in.";
+
 /** What the Google section shows for the snapshot's account state: its label,
- * whether a Sign in button shows, whether that button is disabled, and the
- * calendars to offer as checkboxes (signed in only, in the snapshot's order). */
+ * whether a Sign in button shows, whether that button is disabled (`busy`) and
+ * why (`noClient`), whether a Sign out button shows, whether the "your own
+ * OAuth client" form shows (signed out only) with the current custom id, and
+ * the calendars to offer as checkboxes (signed in only, in the snapshot's
+ * order). */
 export type GoogleSection = {
   label: string;
   signIn: boolean;
   busy: boolean;
+  noClient: string | null;
+  signOut: boolean;
+  clientForm: boolean;
+  customId: string | null;
   calendars: CalendarView[];
 };
 
 export function googleSection(snap: Snapshot): GoogleSection {
+  const hidden = {
+    signIn: false,
+    busy: false,
+    noClient: null,
+    signOut: false,
+    clientForm: false,
+    customId: null,
+    calendars: [],
+  };
   switch (snap.google) {
     case "unknown":
-      return { label: "Checking…", signIn: false, busy: false, calendars: [] };
-    case "signedOut":
-      return { label: "Not signed in", signIn: true, busy: false, calendars: [] };
+      return { ...hidden, label: "Checking…" };
+    case "signedOut": {
+      const available = snap.googleClient.available;
+      return {
+        ...hidden,
+        label: "Not signed in",
+        signIn: true,
+        busy: !available,
+        noClient: available ? null : NO_CLIENT,
+        clientForm: true,
+        customId: snap.googleClient.customId ?? null,
+      };
+    }
     case "signingIn":
-      return { label: "Waiting for browser…", signIn: true, busy: true, calendars: [] };
+      return { ...hidden, label: "Waiting for browser…", signIn: true, busy: true };
     case "signedIn":
-      return { label: "Signed in", signIn: false, busy: false, calendars: snap.calendars };
+      return { ...hidden, label: "Signed in", signOut: true, calendars: snap.calendars };
   }
 }
 
@@ -409,4 +441,22 @@ export function includeCalendarCommand(
 /** Signs in to Google; progress comes back in `snapshot.google`. */
 export function signInCommand(): Command {
   return { name: "signIn", args: [] };
+}
+
+/** Signs out of Google; every plan item stays. */
+export function signOutCommand(): Command {
+  return { name: "signOut", args: [] };
+}
+
+/** Saves the user's own OAuth client: the id and secret trimmed, a blank secret
+ * sent as none. A blank id clears the client, like {@link clearGoogleClientCommand}. */
+export function googleClientCommand(clientId: string, clientSecret: string): Command {
+  const id = clientId.trim();
+  const secret = clientSecret.trim();
+  return { name: "setGoogleClient", args: [id || null, id && secret ? secret : null] };
+}
+
+/** Clears the user's own OAuth client, going back to the built-in one. */
+export function clearGoogleClientCommand(): Command {
+  return { name: "setGoogleClient", args: [null, null] };
 }

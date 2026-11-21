@@ -9,6 +9,8 @@ use jiff::Timestamp;
 use jiff::civil::{Date, Time};
 use jiff::tz::TimeZone;
 
+use crate::calendar::OAuthClient;
+
 const MINUTES_PER_DAY: u16 = 24 * 60;
 
 /// The local time of day the user's work ends, in whole minutes after midnight,
@@ -104,9 +106,11 @@ impl FromStr for WorkEnd {
 }
 
 /// Every user setting, each with its default when nothing is stored.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     pub work_end: WorkEnd,
+    /// The user's own OAuth client; `None` uses the built-in one (AD-13).
+    pub google_client: Option<OAuthClient>,
 }
 
 #[cfg(test)]

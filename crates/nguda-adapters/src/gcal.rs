@@ -6,7 +6,15 @@
 //! browser is opened through a callback the shell injects, so this crate never
 //! depends on Tauri (AD-1). The refresh token goes to the [`SecretStore`] and is
 //! kept in memory for the session; it is never logged or put in an error message.
-//! Access tokens are cached in memory until shortly before they expire.
+//! When the secret store cannot take it, the sign-in lives in memory only until
+//! the app quits ([`SessionStore::SessionOnly`]). Access tokens are cached in
+//! memory until shortly before they expire. A refresh Google answers with
+//! `invalid_grant` ends the session: the token is forgotten and deleted, and the
+//! request fails [`CalendarErrorKind::SessionExpired`].
+//!
+//! The user's own OAuth client ([`CalendarSource::set_client`]) takes the place of
+//! the built-in one. Sign-out bumps a session generation, so a sign-in or refresh
+//! that started before it keeps nothing.
 //!
 //! Only GET requests go to the Calendar API, and POST only to the token endpoint.
 //! OAuth is driven by `oauth2` over this crate's `reqwest` client, so no second
@@ -15,14 +23,15 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nguda_core::{
     CalendarChange, CalendarError, CalendarErrorKind, CalendarFuture, CalendarInfo, CalendarSource,
-    EventKey, FetchedEvent, SecretStore, SyncBatch, Timestamp,
+    EventKey, FetchedEvent, OAuthClient, SecretStore, SessionStore, SyncBatch, Timestamp,
 };
-use oauth2::basic::{BasicClient, BasicRequestTokenError};
+use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicRequestTokenError};
 use oauth2::{
     AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet,
     EndpointSet, HttpRequest, HttpResponse, PkceCodeChallenge, RedirectUrl, RefreshToken, Scope,
@@ -48,8 +57,8 @@ pub type OpenUrl = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Where and as whom the source talks to Google.
 #[derive(Clone)]
 pub struct GcalConfig {
-    /// The OAuth client id and secret, or `None` when the build has none.
-    pub client: Option<(String, String)>,
+    /// The built-in OAuth client, or `None` when the build has none.
+    pub client: Option<OAuthClient>,
     pub auth_url: String,
     pub token_url: String,
     /// The Calendar API base URL, ending in `/`.
@@ -62,7 +71,7 @@ impl fmt::Debug for GcalConfig {
     /// Never prints the client secret.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GcalConfig")
-            .field("client", &self.client.as_ref().map(|(id, _)| id))
+            .field("client", &self.client.as_ref().map(|c| &c.id))
             .field("auth_url", &self.auth_url)
             .field("token_url", &self.token_url)
             .field("api_base", &self.api_base)
@@ -73,18 +82,17 @@ impl fmt::Debug for GcalConfig {
 
 impl GcalConfig {
     /// Google's endpoints, with the client built in from `NGUDA_GOOGLE_CLIENT_ID`
-    /// and `NGUDA_GOOGLE_CLIENT_SECRET` at compile time (`None` unless both are
-    /// set and non-empty).
+    /// and `NGUDA_GOOGLE_CLIENT_SECRET` at compile time (`None` unless the id is
+    /// set and non-empty; an empty or missing secret means none).
     pub fn google() -> Self {
-        let client = match (
-            option_env!("NGUDA_GOOGLE_CLIENT_ID"),
-            option_env!("NGUDA_GOOGLE_CLIENT_SECRET"),
-        ) {
-            (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => {
-                Some((id.to_owned(), secret.to_owned()))
-            }
-            _ => None,
-        };
+        let client = option_env!("NGUDA_GOOGLE_CLIENT_ID")
+            .filter(|id| !id.is_empty())
+            .map(|id| OAuthClient {
+                id: id.to_owned(),
+                secret: option_env!("NGUDA_GOOGLE_CLIENT_SECRET")
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+            });
         Self {
             client,
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
@@ -96,11 +104,7 @@ impl GcalConfig {
 
     /// The same as [`GcalConfig::google`] with every endpoint under `base` and the
     /// given client and timeout: for tests against a mock server.
-    pub fn with_base(
-        base: &str,
-        client: Option<(String, String)>,
-        redirect_timeout: Duration,
-    ) -> Self {
+    pub fn with_base(base: &str, client: Option<OAuthClient>, redirect_timeout: Duration) -> Self {
         let base = base.trim_end_matches('/');
         Self {
             client,
@@ -123,10 +127,25 @@ struct Inner {
     secrets: Arc<dyn SecretStore>,
     open_url: OpenUrl,
     http: reqwest::Client,
+    /// The user's own OAuth client, used in place of the built-in one.
+    custom: Mutex<Option<OAuthClient>>,
     /// The refresh token, once read from or written to the secret store.
     refresh: Mutex<Option<String>>,
     /// The current access token and when to stop using it.
     access: Mutex<Option<(String, Instant)>>,
+    /// Bumped by each sign-out: a sign-in or refresh that started under an older
+    /// generation keeps nothing. Shared with the blocking keyring closures.
+    generation: Arc<AtomicU64>,
+    /// Whether the current session lives in memory only.
+    session_only: AtomicBool,
+    /// Set by a sign-out (or an expiry): the secret store is not read again
+    /// until a sign-in keeps a new session, so a token whose delete failed is
+    /// never picked back up this session.
+    signed_out: AtomicBool,
+    /// Serializes secret store writes inside the blocking closures, so a
+    /// sign-out's delete always runs after any store a sign-in made before the
+    /// sign-out, even when the sign-in's task was aborted mid-store.
+    keyring: Arc<Mutex<()>>,
 }
 
 type Client = BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
@@ -145,17 +164,46 @@ impl GcalSource {
                 secrets,
                 open_url,
                 http,
+                custom: Mutex::new(None),
                 refresh: Mutex::new(None),
                 access: Mutex::new(None),
+                generation: Arc::new(AtomicU64::new(0)),
+                session_only: AtomicBool::new(false),
+                signed_out: AtomicBool::new(false),
+                keyring: Arc::new(Mutex::new(())),
             }),
         }
     }
 }
 
 impl CalendarSource for GcalSource {
-    fn sign_in(&self) -> CalendarFuture<()> {
+    fn sign_in(&self) -> CalendarFuture<SessionStore> {
         let inner = self.inner.clone();
         Box::pin(async move { inner.sign_in().await })
+    }
+
+    fn sign_out(&self) -> CalendarFuture<()> {
+        // Forget the session now, before the future runs, so nothing after this
+        // call is signed.
+        let delete = self.inner.forget_session();
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            if delete {
+                inner.delete_stored().await
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn set_client(&self, client: Option<OAuthClient>) {
+        *self.inner.custom.lock().unwrap() = client;
+        // An access token belongs to the client that issued it.
+        *self.inner.access.lock().unwrap() = None;
+    }
+
+    fn has_client(&self) -> bool {
+        self.inner.effective_client().is_some()
     }
 
     fn list_calendars(&self) -> CalendarFuture<Vec<CalendarInfo>> {
@@ -223,6 +271,14 @@ fn no_client() -> CalendarError {
     )
 }
 
+fn not_signed_in() -> CalendarError {
+    CalendarError::new(CalendarErrorKind::NotSignedIn, "not signed in to Google")
+}
+
+fn superseded() -> CalendarError {
+    other("the sign-in was cancelled by a sign-out")
+}
+
 /// A transport failure, without the URL (it may name the account's calendar).
 fn transport(e: reqwest::Error) -> CalendarError {
     let e = e.without_url();
@@ -234,12 +290,54 @@ fn transport(e: reqwest::Error) -> CalendarError {
 }
 
 impl Inner {
+    /// The user's own client, else the built-in one.
+    fn effective_client(&self) -> Option<OAuthClient> {
+        self.custom
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.config.client.clone())
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Clears the in-memory session and bumps the generation, telling whether
+    /// the stored session should be deleted too (not when it lived in memory
+    /// only).
+    fn forget_session(&self) -> bool {
+        let mut refresh = self.refresh.lock().unwrap();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.signed_out.store(true, Ordering::SeqCst);
+        *refresh = None;
+        *self.access.lock().unwrap() = None;
+        !self.session_only.swap(false, Ordering::SeqCst)
+    }
+
+    /// Deletes the stored refresh token.
+    async fn delete_stored(&self) -> Result<(), CalendarError> {
+        let secrets = self.secrets.clone();
+        let keyring = self.keyring.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = keyring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            secrets.delete(REFRESH_TOKEN_KEY)
+        })
+        .await
+        .map_err(|_| other("the keyring task failed"))?
+        .map_err(|e| other(e.message))
+    }
+
     fn client(&self, redirect: Option<&str>) -> Result<Client, CalendarError> {
-        let (id, secret) = self.config.client.as_ref().ok_or_else(no_client)?;
+        let OAuthClient { id, secret } = self.effective_client().ok_or_else(no_client)?;
         let bad = |what: &str| other(format!("invalid {what} URL"));
-        let mut client = BasicClient::new(ClientId::new(id.clone()))
-            .set_client_secret(ClientSecret::new(secret.clone()))
-            .set_auth_type(AuthType::RequestBody)
+        let mut client = BasicClient::new(ClientId::new(id)).set_auth_type(AuthType::RequestBody);
+        if let Some(secret) = secret {
+            client = client.set_client_secret(ClientSecret::new(secret));
+        }
+        let mut client = client
             .set_auth_uri(AuthUrl::new(self.config.auth_url.clone()).map_err(|_| bad("auth"))?)
             .set_token_uri(TokenUrl::new(self.config.token_url.clone()).map_err(|_| bad("token"))?);
         if let Some(redirect) = redirect {
@@ -280,9 +378,10 @@ impl Inner {
         }
     }
 
-    async fn sign_in(&self) -> Result<(), CalendarError> {
+    async fn sign_in(&self) -> Result<SessionStore, CalendarError> {
+        let generation = self.generation();
         // Fail before opening anything when there is no client.
-        self.config.client.as_ref().ok_or_else(no_client)?;
+        self.effective_client().ok_or_else(no_client)?;
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|_| other("could not open the sign-in redirect port"))?;
@@ -321,16 +420,44 @@ impl Inner {
             .ok_or_else(|| auth("Google returned no refresh token"))?
             .secret()
             .clone();
-        let secrets = self.secrets.clone();
-        let stored = refresh.clone();
-        tokio::task::spawn_blocking(move || secrets.set(REFRESH_TOKEN_KEY, &stored))
+        let outcome = {
+            // The blocking closure holds the keyring lock across the generation
+            // check and the store, so a sign-out (which bumps the generation
+            // before its delete takes the lock) either comes first, and this
+            // stores nothing, or deletes after it. That holds even if this task
+            // is aborted while the closure runs.
+            let secrets = self.secrets.clone();
+            let stored = refresh.clone();
+            let keyring = self.keyring.clone();
+            let current = self.generation.clone();
+            let set = tokio::task::spawn_blocking(move || {
+                let _guard = keyring
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if current.load(Ordering::SeqCst) != generation {
+                    return None;
+                }
+                Some(secrets.set(REFRESH_TOKEN_KEY, &stored))
+            })
             .await
-            .map_err(|_| other("the keyring task failed"))?
-            .map_err(|e| other(format!("could not store the sign-in: {}", e.message)))?;
-        // Only a stored sign-in counts: cache the access token after the store.
+            .map_err(|_| other("the keyring task failed"))?;
+            // Any store failure means no secret store: keep the sign-in in memory.
+            match set {
+                None => return Err(superseded()),
+                Some(Ok(())) => SessionStore::Stored,
+                Some(Err(_)) => SessionStore::SessionOnly,
+            }
+        };
+        let mut memory = self.refresh.lock().unwrap();
+        if self.generation() != generation {
+            return Err(superseded());
+        }
+        self.session_only
+            .store(outcome == SessionStore::SessionOnly, Ordering::SeqCst);
+        self.signed_out.store(false, Ordering::SeqCst);
         self.cache_access(token.access_token().secret().clone(), token.expires_in());
-        *self.refresh.lock().unwrap() = Some(refresh);
-        Ok(())
+        *memory = Some(refresh);
+        Ok(outcome)
     }
 
     fn cache_access(&self, token: String, expires_in: Option<Duration>) {
@@ -342,9 +469,13 @@ impl Inner {
     }
 
     /// The refresh token: from memory, else from the secret store.
-    async fn refresh_token(&self) -> Result<Option<String>, CalendarError> {
+    async fn refresh_token(&self, generation: u64) -> Result<Option<String>, CalendarError> {
         if let Some(token) = self.refresh.lock().unwrap().clone() {
             return Ok(Some(token));
+        }
+        if self.signed_out.load(Ordering::SeqCst) {
+            // Signed out this session: never pick a stored token back up.
+            return Ok(None);
         }
         let secrets = self.secrets.clone();
         let token = tokio::task::spawn_blocking(move || secrets.get(REFRESH_TOKEN_KEY))
@@ -358,8 +489,12 @@ impl Inner {
                     format!("could not read the sign-in: {}", e.message),
                 )
             })?;
+        let mut memory = self.refresh.lock().unwrap();
+        if self.generation() != generation {
+            return Err(not_signed_in());
+        }
         if let Some(token) = &token {
-            *self.refresh.lock().unwrap() = Some(token.clone());
+            *memory = Some(token.clone());
         }
         Ok(token)
     }
@@ -372,19 +507,57 @@ impl Inner {
         {
             return Ok(token);
         }
-        let refresh = self.refresh_token().await?.ok_or_else(|| {
-            CalendarError::new(CalendarErrorKind::NotSignedIn, "not signed in to Google")
-        })?;
+        let generation = self.generation();
+        let refresh = self
+            .refresh_token(generation)
+            .await?
+            .ok_or_else(not_signed_in)?;
         let client = self.client(None)?;
         let refresh = RefreshToken::new(refresh);
-        let token = client
+        let token = match client
             .exchange_refresh_token(&refresh)
             .request_async(&self.oauth_http())
             .await
-            .map_err(token_error)?;
+        {
+            Ok(token) => token,
+            Err(oauth2::RequestTokenError::ServerResponse(r))
+                if *r.error() == BasicErrorResponseType::InvalidGrant =>
+            {
+                return Err(self.expire(generation, refresh.secret()).await);
+            }
+            Err(e) => return Err(token_error(e)),
+        };
         let access = token.access_token().secret().clone();
+        let _memory = self.refresh.lock().unwrap();
+        if self.generation() != generation {
+            return Err(not_signed_in());
+        }
         self.cache_access(access.clone(), token.expires_in());
         Ok(access)
+    }
+
+    /// Ends a session Google no longer honours: forgets it and deletes the stored
+    /// token, ignoring a delete failure.
+    async fn expire(&self, generation: u64, refused: &str) -> CalendarError {
+        let expired = CalendarError::new(
+            CalendarErrorKind::SessionExpired,
+            "the Google sign-in expired or was revoked",
+        );
+        {
+            let mut memory = self.refresh.lock().unwrap();
+            let newer = memory.as_deref().is_some_and(|t| t != refused);
+            if self.generation() != generation || newer {
+                // A sign-out or a newer sign-in already took over.
+                return expired;
+            }
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.signed_out.store(true, Ordering::SeqCst);
+            *memory = None;
+            *self.access.lock().unwrap() = None;
+            self.session_only.store(false, Ordering::SeqCst);
+        }
+        let _ = self.delete_stored().await;
+        expired
     }
 
     /// A GET to the Calendar API, parsed as `T`.

@@ -104,6 +104,8 @@ const LOCK_DAY: &str = "LockDay";
 pub(crate) const CARRY_OVER: &str = "CarryOverToTomorrow";
 const EXPORT_CSV: &str = "ExportCsv";
 const SIGN_IN: &str = "SignIn";
+const SIGN_OUT: &str = "SignOut";
+pub(crate) const SET_GOOGLE_CLIENT: &str = "SetGoogleClient";
 const SET_INCLUDED_CALENDARS: &str = "SetIncludedCalendars";
 const EXCLUDE_EVENT: &str = "ExcludeEvent";
 const INCLUDE_EVENT: &str = "IncludeEvent";
@@ -131,6 +133,8 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::CarryOverToTomorrow { .. } => CARRY_OVER,
         EngineMsg::ExportCsv { .. } => EXPORT_CSV,
         EngineMsg::SignIn => SIGN_IN,
+        EngineMsg::SignOut => SIGN_OUT,
+        EngineMsg::SetGoogleClient { .. } => SET_GOOGLE_CLIENT,
         EngineMsg::SetIncludedCalendars { .. } => SET_INCLUDED_CALENDARS,
         EngineMsg::ExcludeEvent { .. } => EXCLUDE_EVENT,
         EngineMsg::IncludeEvent { .. } => INCLUDE_EVENT,
@@ -147,6 +151,8 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
         | EngineMsg::CarryOverToTomorrow { .. }
         | EngineMsg::ExportCsv { .. }
         | EngineMsg::SignIn
+        | EngineMsg::SignOut
+        | EngineMsg::SetGoogleClient { .. }
         | EngineMsg::SetIncludedCalendars { .. }
         | EngineMsg::AddCalendarEvent { .. } => None,
         EngineMsg::InsertTask { anchor, .. } => match anchor {
@@ -285,6 +291,12 @@ pub(crate) fn apply(
         EngineMsg::ExportCsv { .. } => Err(Reject::invalid(EXPORT_CSV, "not a plan command")),
         // The actor routes it to `sign_in`, off the plan path; never reached.
         EngineMsg::SignIn => Err(Reject::invalid(SIGN_IN, "not a plan command")),
+        // The actor routes it to `sign_out`; never reached.
+        EngineMsg::SignOut => Err(Reject::invalid(SIGN_OUT, "not a plan command")),
+        // The actor routes it to `set_google_client`; never reached.
+        EngineMsg::SetGoogleClient { .. } => {
+            Err(Reject::invalid(SET_GOOGLE_CLIENT, "not a plan command"))
+        }
         // The actor routes it to `set_included_calendars`; never reached.
         EngineMsg::SetIncludedCalendars { .. } => Err(Reject::invalid(
             SET_INCLUDED_CALENDARS,
