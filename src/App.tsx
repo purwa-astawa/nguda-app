@@ -149,6 +149,8 @@ function EventPicker({ snap, send }: { snap: Snapshot; send: (cmd: Command) => v
   };
 
   const tz = snap.day?.tz ?? "UTC";
+  // The list shows only for the calendar it was fetched for.
+  const shown = listed?.calendarId === calendarId ? listed : null;
 
   return (
     <div className="picker">
@@ -165,34 +167,37 @@ function EventPicker({ snap, send }: { snap: Snapshot; send: (cmd: Command) => v
       <button type="button" onClick={show}>
         Show today's events
       </button>
-      {listed?.calendarId === calendarId && listed.kind === "error" && (
+      {shown?.kind === "error" && (
         <p className="status" role="alert">
-          {listed.message}
+          {shown.message}
         </p>
       )}
-      {listed?.calendarId === calendarId && listed.kind === "events" && (
-        listed.events.length === 0 ? (
+      {shown?.kind === "events" && (
+        shown.events.length === 0 ? (
           <p>No timed events today.</p>
         ) : (
           <ul>
-            {listed.events.map((e) => (
-              <li key={e.eventId}>
-                <span className="when">
-                  {scheduleLabel({ scheduledStart: e.start, scheduledEnd: e.end }, tz)}
-                </span>
-                <span className="title">{e.title}</span>
-                <button
-                  type="button"
-                  disabled={e.inPlan || sent.has(e.eventId)}
-                  onClick={() => {
-                    send(addCalendarEventCommand(e.calendarId, e.eventId));
-                    setSent((s) => new Set(s).add(e.eventId));
-                  }}
-                >
-                  {e.inPlan ? "In plan" : sent.has(e.eventId) ? "Added" : "Add"}
-                </button>
-              </li>
-            ))}
+            {shown.events.map((e) => {
+              const added = sent.has(e.eventId);
+              return (
+                <li key={e.eventId}>
+                  <span className="when">
+                    {scheduleLabel({ scheduledStart: e.start, scheduledEnd: e.end }, tz)}
+                  </span>
+                  <span className="title">{e.title}</span>
+                  <button
+                    type="button"
+                    disabled={e.inPlan || added}
+                    onClick={() => {
+                      send(addCalendarEventCommand(e.calendarId, e.eventId));
+                      setSent((s) => new Set(s).add(e.eventId));
+                    }}
+                  >
+                    {e.inPlan ? "In plan" : added ? "Added" : "Add"}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )
       )}

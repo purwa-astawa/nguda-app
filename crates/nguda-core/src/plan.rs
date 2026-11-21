@@ -135,15 +135,6 @@ pub struct CalendarRef {
     pub source_secs: u64,
 }
 
-impl CalendarRef {
-    /// Whether `other` names the same event instance (the merge key, AD-9).
-    pub fn same_key(&self, other: &CalendarRef) -> bool {
-        self.calendar_id == other.calendar_id
-            && self.source_id == other.source_id
-            && self.instance_start == other.instance_start
-    }
-}
-
 /// Every field of a [`PlanItem`], public, for rehydrating stored rows. Turn it into
 /// an item only through [`PlanItem::restore`], which checks its consistency.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1545,10 +1536,8 @@ mod tests {
             ..record(ItemStatus::Pending)
         });
         let source = CalendarRef {
-            calendar_id: "cal".into(),
-            source_id: "ev".into(),
             instance_start: Some(ts(5)),
-            source_secs: 1500,
+            ..imported_source()
         };
         let r = PlanItemRecord {
             source: Some(source.clone()),
@@ -1562,14 +1551,8 @@ mod tests {
 
     #[test]
     fn restore_requires_a_source_and_removed_status_for_hidden_at() {
-        let source = CalendarRef {
-            calendar_id: "cal".into(),
-            source_id: "ev".into(),
-            instance_start: None,
-            source_secs: 1500,
-        };
+        let source = imported_source();
         assert_invalid(PlanItemRecord {
-            status: ItemStatus::Removed,
             removed_at: Some(ts(10)),
             hidden_at: Some(ts(10)),
             ..record(ItemStatus::Removed)

@@ -8,22 +8,23 @@ use std::time::Duration;
 
 use nguda_core::{
     ActualSegment, Baseline, BaselineItem, CalendarChange, CalendarEntry, CalendarError,
-    CalendarErrorKind, CalendarInfo, CalendarRef, Date, Day, DayLogEntry, DayLogKind, EventKey,
-    ExportRange, FetchedEvent, GapFigure, IsoWeek, ItemId, ItemStatus, LockChoice, LockDecision,
-    OAuthClient, OrderKey, PlanItem, PlanItemRecord, PlannedSource, PromptKind, ReportRow, Segment,
-    SessionStore, SlotKind, Span, StoreError, StoreOp, SyncBatch, SyncCursor, TagGap, TimeZone,
-    WorkEnd, export_csv,
+    CalendarErrorKind, CalendarInfo, CalendarRef, Clock, Date, Day, DayLogEntry, DayLogKind,
+    EventKey, ExportRange, FetchedEvent, GapFigure, IsoWeek, ItemId, ItemStatus, LockChoice,
+    LockDecision, OAuthClient, OrderKey, PlanItem, PlanItemRecord, PlannedSource, PromptKind,
+    ReportRow, Segment, SessionStore, SlotKind, Span, StoreError, StoreOp, SyncBatch, SyncCursor,
+    TagGap, TimeZone, WorkEnd, export_csv, hide_calendar,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::test_support::{
-    FakeCalendar, FakeClock, FakeFileSink, FixedRandom, INJECTED, MemoryStore, SINK_FAILURE,
-    SeqIds, day_running_other, day1, day2, id, item, key, locked, no_lock, primary_info, prompt,
-    ts,
+    CALENDAR, FakeCalendar, FakeClock, FakeFileSink, FixedRandom, INJECTED, MemoryStore,
+    SINK_FAILURE, SeqIds, day_running_other, day1, day2, full_record_of, id, item, key, locked,
+    no_lock, primary_info, prompt, ts,
 };
 use crate::{
-    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, GoogleAccount, GoogleClient,
-    InsertAnchor, NextItem, QueryError, ReorderAnchor, Snapshot, StatusEntry, StatusKey, spawn,
+    CalendarEvent, CalendarOutcome, Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg,
+    GoogleAccount, GoogleClient, Inbox, InsertAnchor, NextItem, QueryError, ReorderAnchor,
+    Snapshot, StatusEntry, StatusKey, SyncRound, spawn,
 };
 
 const DAY_SECS: i64 = 86_400;
@@ -3137,7 +3138,7 @@ async fn a_failed_store_read_sets_the_export_status_and_writes_nothing() {
 #[tokio::test]
 async fn a_stale_export_failure_after_a_newer_success_is_dropped() {
     let (mut h, _store) = past_day_engine().await;
-    let finished = |id, result| crate::Inbox::ExportFinished { id, result };
+    let finished = |id, result| Inbox::ExportFinished { id, result };
     h.engine.tx.send(finished(2, Ok(5))).ok().unwrap();
     h.engine
         .tx
@@ -3321,7 +3322,7 @@ async fn a_failed_set_tags_commit_keeps_the_day_and_the_known_names() {
 
 fn event(source_id: &str, title: &str, start: i64, end: i64) -> FetchedEvent {
     FetchedEvent {
-        calendar_id: "me@example.com".into(),
+        calendar_id: CAL.into(),
         source_id: source_id.into(),
         instance_start: None,
         title: title.into(),
@@ -3478,7 +3479,7 @@ async fn an_unchanged_re_import_commits_and_publishes_nothing() {
     h.calendar.resolve_events(1, Ok(events));
     // A later command's rev proves the import published nothing.
     tokio::time::sleep(Duration::from_millis(20)).await;
-    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    h.send(set_work_end(1));
     let snap = h.rev(5).await;
     assert_eq!(day_of(&snap).items().len(), 1);
     assert_eq!(
@@ -3653,14 +3654,10 @@ async fn an_import_failure_keeps_the_plan_and_the_next_success_clears_sync() {
 
 // --- Polling sync (AD-3, AD-9, AD-17) ---
 
-const CAL: &str = crate::test_support::CALENDAR;
+const CAL: &str = CALENDAR;
 
 fn sync(changes: Vec<CalendarChange>, token: Option<&str>) -> Result<SyncBatch, CalendarError> {
-    Ok(SyncBatch {
-        calendar_id: CAL.into(),
-        changes,
-        next_token: token.map(str::to_owned),
-    })
+    sync_of(CAL, changes, token)
 }
 
 fn upsert(source_id: &str, title: &str, start: i64, end: i64) -> CalendarChange {
@@ -3676,8 +3673,12 @@ fn cancelled(source_id: &str) -> CalendarChange {
 }
 
 fn cursor(token: &str, date: Date) -> SyncCursor {
+    cursor_of(CAL, token, date)
+}
+
+fn cursor_of(calendar_id: &str, token: &str, date: Date) -> SyncCursor {
     SyncCursor {
-        calendar_id: CAL.into(),
+        calendar_id: calendar_id.into(),
         token: token.into(),
         date,
     }
@@ -3763,7 +3764,7 @@ impl Harness {
     async fn tick_to(&self, target: i64) {
         tokio::time::sleep(Duration::from_millis(20)).await;
         loop {
-            let now = nguda_core::Clock::now(self.clock.as_ref()).as_second();
+            let now = Clock::now(self.clock.as_ref()).as_second();
             if now >= target {
                 break;
             }
@@ -4398,11 +4399,7 @@ fn other_upsert(source_id: &str, start: i64, end: i64) -> CalendarChange {
 }
 
 fn other_cursor(token: &str, date: Date) -> SyncCursor {
-    SyncCursor {
-        calendar_id: OTHER.into(),
-        token: token.into(),
-        date,
-    }
+    cursor_of(OTHER, token, date)
 }
 
 /// [`imported_item`] of calendar [`OTHER`].
@@ -4417,22 +4414,8 @@ fn other_item(
     let mut source = base.source().unwrap().clone();
     source.calendar_id = OTHER.into();
     PlanItem::restore(PlanItemRecord {
-        id: base.id(),
-        title: base.title().to_owned(),
-        planned_secs: base.planned_secs(),
-        order: base.order().clone(),
-        fixed: base.fixed(),
-        pinned_start: base.pinned_start(),
-        status: base.status(),
-        removed_at: base.removed_at(),
-        segments: base.segments().to_vec(),
-        carried_from: None,
-        tags: base.tags().to_vec(),
         source: Some(source),
-        removed_by_source_at: None,
-        hidden_at: None,
-        excluded: false,
-        added: false,
+        ..full_record_of(&base)
     })
     .unwrap()
 }
@@ -4671,7 +4654,7 @@ async fn an_unchanged_or_unknown_selection_changes_nothing() {
     h.send(select(&[CAL, "nobody@example.com"]));
     h.send(select(&[CAL]));
     tokio::time::sleep(Duration::from_millis(20)).await;
-    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    h.send(set_work_end(1));
     h.rev(3).await;
     assert_eq!(
         store.batches().len(),
@@ -4847,15 +4830,15 @@ async fn a_listing_failure_changes_neither_the_table_nor_the_plan() {
 
 /// Posts a round result straight into the engine's inbox, as a round task that
 /// finished before it was aborted would.
-fn deliver_round(h: &Harness, id: u64, date: Date, outcomes: Vec<crate::CalendarOutcome>) {
-    let round = crate::SyncRound {
+fn deliver_round(h: &Harness, id: u64, date: Date, outcomes: Vec<CalendarOutcome>) {
+    let round = SyncRound {
         calendars: vec![entry(CAL, true, true), entry(OTHER, false, true)],
         outcomes,
         added: Vec::new(),
     };
     h.engine
         .tx
-        .send(crate::Inbox::ImportFinished {
+        .send(Inbox::ImportFinished {
             id,
             date,
             result: Ok(round),
@@ -4863,8 +4846,8 @@ fn deliver_round(h: &Harness, id: u64, date: Date, outcomes: Vec<crate::Calendar
         .unwrap();
 }
 
-fn primary_outcome(token: &str) -> crate::CalendarOutcome {
-    crate::CalendarOutcome {
+fn primary_outcome(token: &str) -> CalendarOutcome {
+    CalendarOutcome {
         calendar_id: CAL.into(),
         incremental: false,
         result: sync(vec![upsert("late", "Late", 9_000, 9_900)], Some(token)),
@@ -4891,7 +4874,7 @@ async fn a_delivered_round_with_a_superseded_id_changes_nothing() {
     );
     deliver_round(&h, 1, day1(), vec![primary_outcome("stale")]);
     tokio::time::sleep(Duration::from_millis(20)).await;
-    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    h.send(set_work_end(1));
     let after = h.rev(3).await;
     assert_eq!(after.day, snap.day, "no plan change");
     assert_eq!(after.calendars, snap.calendars);
@@ -4926,7 +4909,7 @@ async fn a_delivered_round_for_a_rolled_over_date_changes_nothing() {
     // The current id (the rollover's round 2), but yesterday's date.
     deliver_round(&h, 2, day1(), vec![primary_outcome("yesterday")]);
     tokio::time::sleep(Duration::from_millis(20)).await;
-    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    h.send(set_work_end(1));
     let after = h.rev(3).await;
     assert_eq!(after.day, snap.day, "no plan change");
     assert_eq!(after.calendars, snap.calendars);
@@ -4944,22 +4927,9 @@ async fn a_delivered_round_for_a_rolled_over_date_changes_nothing() {
 /// `item` with its `excluded` and `added` flags set as given.
 fn flagged(item: PlanItem, excluded: bool, added: bool) -> PlanItem {
     PlanItem::restore(PlanItemRecord {
-        id: item.id(),
-        title: item.title().to_owned(),
-        planned_secs: item.planned_secs(),
-        order: item.order().clone(),
-        fixed: item.fixed(),
-        pinned_start: item.pinned_start(),
-        status: item.status(),
-        removed_at: item.removed_at(),
-        segments: item.segments().to_vec(),
-        carried_from: item.carried_from(),
-        tags: item.tags().to_vec(),
-        source: item.source().cloned(),
-        removed_by_source_at: item.removed_by_source_at(),
-        hidden_at: item.hidden_at(),
         excluded,
         added,
+        ..full_record_of(&item)
     })
     .unwrap()
 }
@@ -5027,7 +4997,7 @@ impl Harness {
         &self,
         calendar_id: &str,
         date: Date,
-    ) -> tokio::task::JoinHandle<Result<Vec<crate::CalendarEvent>, QueryError>> {
+    ) -> tokio::task::JoinHandle<Result<Vec<CalendarEvent>, QueryError>> {
         let engine = self.engine.clone();
         let calendar_id = calendar_id.to_owned();
         tokio::spawn(async move { engine.query_calendar_events(calendar_id, date).await })
@@ -5331,7 +5301,7 @@ async fn adding_a_live_event_changes_nothing_and_a_removed_one_is_revived() {
     day.remove(id(101), ts(500)).unwrap();
     day.add(other_item(102, "o3", 24_000, vec![], ItemStatus::Pending))
         .unwrap();
-    nguda_core::hide_calendar(&mut day, OTHER, ts(600)).unwrap();
+    hide_calendar(&mut day, OTHER, ts(600)).unwrap();
     // Hiding took 100 too; bring it back as a live item of the plan.
     let mut live = Day::new(day1(), "UTC");
     for i in day.items() {
@@ -5354,7 +5324,7 @@ async fn adding_a_live_event_changes_nothing_and_a_removed_one_is_revived() {
         )))),
     );
     tokio::time::sleep(Duration::from_millis(20)).await;
-    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    h.send(set_work_end(1));
     let snap = h.rev(2).await;
     assert_eq!(day_of(&snap).item(id(100)), day.item(id(100)), "unchanged");
 
@@ -5394,7 +5364,7 @@ async fn an_add_result_after_a_rollover_is_dropped() {
         )))),
     );
     tokio::time::sleep(Duration::from_millis(20)).await;
-    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    h.send(set_work_end(1));
     let snap = h.rev(3).await;
     assert!(day_of(&snap).items().is_empty());
     assert!(
@@ -5616,7 +5586,7 @@ async fn a_byo_client_is_persisted_handed_to_the_source_and_reloaded_at_startup(
     h.send(EngineMsg::SetGoogleClient {
         client: Some(oauth("abc", None)),
     });
-    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    h.send(set_work_end(1));
     let snap = h.rev(4).await;
     assert_eq!(snap.work_end.minutes(), 1, "rev 4 is the work-end change");
     assert_eq!(store.batches().len(), batches + 1, "only the work-end");

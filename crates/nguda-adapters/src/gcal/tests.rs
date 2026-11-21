@@ -7,8 +7,9 @@ use std::sync::Mutex;
 
 use nguda_core::SecretStoreError;
 use serde_json::json;
-use wiremock::matchers::query_param_is_missing;
-use wiremock::matchers::{body_string_contains, header, method, path, query_param};
+use wiremock::matchers::{
+    body_string_contains, header, method, path, query_param, query_param_is_missing,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
@@ -47,26 +48,23 @@ impl SecretStore for MemorySecrets {
     }
 }
 
+/// The error message of every [`BrokenSecrets`] call.
+const LOCKED: &str = "the keyring is locked or not accessible";
+
 /// A secret store whose every call fails, like a locked or missing keyring.
 struct BrokenSecrets;
 
 impl SecretStore for BrokenSecrets {
     fn get(&self, _key: &str) -> Result<Option<String>, SecretStoreError> {
-        Err(SecretStoreError::new(
-            "the keyring is locked or not accessible",
-        ))
+        Err(SecretStoreError::new(LOCKED))
     }
 
     fn set(&self, _key: &str, _value: &str) -> Result<(), SecretStoreError> {
-        Err(SecretStoreError::new(
-            "the keyring is locked or not accessible",
-        ))
+        Err(SecretStoreError::new(LOCKED))
     }
 
     fn delete(&self, _key: &str) -> Result<(), SecretStoreError> {
-        Err(SecretStoreError::new(
-            "the keyring is locked or not accessible",
-        ))
+        Err(SecretStoreError::new(LOCKED))
     }
 }
 
@@ -431,20 +429,12 @@ async fn fetch_refreshes_then_parses_and_pages_a_calendars_events() {
 #[tokio::test]
 async fn an_http_failure_is_an_other_error_without_details() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(None, "at")))
-        .mount(&server)
-        .await;
+    mount_token(&server).await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(503).set_body_string("Standup details"))
         .mount(&server)
         .await;
-    let source = GcalSource::new(
-        config(&server),
-        MemorySecrets::with_refresh("rt"),
-        no_browser(),
-    );
+    let source = signed_in(&server);
     let err = sync_me(&source, None).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::Other);
     assert_eq!(err.message, "Calendar API HTTP 503");
@@ -630,7 +620,7 @@ async fn sign_out_reports_a_delete_failure() {
     let source = GcalSource::new(config(&server), Arc::new(BrokenSecrets), no_browser());
     let err = source.sign_out().await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::Other);
-    assert_eq!(err.message, "the keyring is locked or not accessible");
+    assert_eq!(err.message, LOCKED);
 }
 
 #[tokio::test]

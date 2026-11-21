@@ -24,7 +24,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use nguda_core::{
@@ -34,19 +34,20 @@ use nguda_core::{
 use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicRequestTokenError};
 use oauth2::{
     AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet,
-    EndpointSet, HttpRequest, HttpResponse, PkceCodeChallenge, RedirectUrl, RefreshToken, Scope,
-    TokenResponse, TokenUrl,
+    EndpointSet, HttpRequest, HttpResponse, PkceCodeChallenge, RedirectUrl, RefreshToken,
+    RequestTokenError, Scope, TokenResponse, TokenUrl,
 };
-use reqwest::Url;
+use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinError;
 
 /// The secret store key of the Google refresh token.
-pub const REFRESH_TOKEN_KEY: &str = "google-refresh-token";
+pub(crate) const REFRESH_TOKEN_KEY: &str = "google-refresh-token";
 
 /// The read-only scopes nguda asks for (AD-9), exactly these two.
-pub const SCOPES: [&str; 2] = [
+pub(crate) const SCOPES: [&str; 2] = [
     "https://www.googleapis.com/auth/calendar.events.readonly",
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
 ];
@@ -279,6 +280,10 @@ fn superseded() -> CalendarError {
     other("the sign-in was cancelled by a sign-out")
 }
 
+fn keyring_task_failed(_: JoinError) -> CalendarError {
+    other("the keyring task failed")
+}
+
 /// A transport failure, without the URL (it may name the account's calendar).
 fn transport(e: reqwest::Error) -> CalendarError {
     let e = e.without_url();
@@ -320,13 +325,11 @@ impl Inner {
         let secrets = self.secrets.clone();
         let keyring = self.keyring.clone();
         tokio::task::spawn_blocking(move || {
-            let _guard = keyring
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _guard = keyring.lock().unwrap_or_else(PoisonError::into_inner);
             secrets.delete(REFRESH_TOKEN_KEY)
         })
         .await
-        .map_err(|_| other("the keyring task failed"))?
+        .map_err(keyring_task_failed)?
         .map_err(|e| other(e.message))
     }
 
@@ -431,16 +434,14 @@ impl Inner {
             let keyring = self.keyring.clone();
             let current = self.generation.clone();
             let set = tokio::task::spawn_blocking(move || {
-                let _guard = keyring
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _guard = keyring.lock().unwrap_or_else(PoisonError::into_inner);
                 if current.load(Ordering::SeqCst) != generation {
                     return None;
                 }
                 Some(secrets.set(REFRESH_TOKEN_KEY, &stored))
             })
             .await
-            .map_err(|_| other("the keyring task failed"))?;
+            .map_err(keyring_task_failed)?;
             // Any store failure means no secret store: keep the sign-in in memory.
             match set {
                 None => return Err(superseded()),
@@ -480,7 +481,7 @@ impl Inner {
         let secrets = self.secrets.clone();
         let token = tokio::task::spawn_blocking(move || secrets.get(REFRESH_TOKEN_KEY))
             .await
-            .map_err(|_| other("the keyring task failed"))?
+            .map_err(keyring_task_failed)?
             // An unreadable keyring holds no usable session: report not signed in,
             // so the user is offered Sign in rather than shown a phantom account.
             .map_err(|e| {
@@ -520,7 +521,7 @@ impl Inner {
             .await
         {
             Ok(token) => token,
-            Err(oauth2::RequestTokenError::ServerResponse(r))
+            Err(RequestTokenError::ServerResponse(r))
                 if *r.error() == BasicErrorResponseType::InvalidGrant =>
             {
                 return Err(self.expire(generation, refresh.secret()).await);
@@ -587,22 +588,20 @@ impl Inner {
             .await
             .map_err(transport)?;
         let status = response.status();
-        if not_found_ok && status == reqwest::StatusCode::NOT_FOUND {
+        if not_found_ok && status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED {
+        if status == StatusCode::UNAUTHORIZED {
             *self.access.lock().unwrap() = None;
             return Err(auth("Google rejected the access token"));
         }
-        if status == reqwest::StatusCode::FORBIDDEN
-            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        {
+        if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
             return Err(CalendarError::new(
                 CalendarErrorKind::RateLimited,
                 format!("Google is limiting requests (HTTP {})", status.as_u16()),
             ));
         }
-        if status == reqwest::StatusCode::GONE {
+        if status == StatusCode::GONE {
             return Err(CalendarError::new(
                 CalendarErrorKind::Gone,
                 "the calendar sync token expired (HTTP 410)",
@@ -779,18 +778,18 @@ impl Inner {
 /// a token or the raw response body.
 fn token_error(e: BasicRequestTokenError<HttpError>) -> CalendarError {
     match e {
-        oauth2::RequestTokenError::ServerResponse(r) => {
+        RequestTokenError::ServerResponse(r) => {
             auth(format!("Google refused the sign-in ({})", r.error()))
         }
-        oauth2::RequestTokenError::Request(e) => other(e.0),
-        oauth2::RequestTokenError::Parse(..) => auth("the token response could not be read"),
-        oauth2::RequestTokenError::Other(_) => auth("the token request failed"),
+        RequestTokenError::Request(e) => other(e.0),
+        RequestTokenError::Parse(..) => auth("the token response could not be read"),
+        RequestTokenError::Other(_) => auth("the token request failed"),
     }
 }
 
 /// An HTTP failure of the oauth2 hook, with a fixed message.
 #[derive(Debug)]
-pub struct HttpError(&'static str);
+struct HttpError(&'static str);
 
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -957,6 +956,13 @@ struct Attendee {
 }
 
 impl Event {
+    /// A recurring instance's original start; `None` for a single event.
+    fn instance_start(&self) -> Option<Timestamp> {
+        self.original_start_time
+            .as_ref()
+            .and_then(EventTime::instant)
+    }
+
     /// This event as a change of `calendar_id`: a cancellation (keyed on its id and
     /// a recurring instance's original start, whatever its time) or a timed upsert
     /// (see [`Event::timed`]), or `None` when it is skipped.
@@ -969,10 +975,7 @@ impl Event {
         if self.status.as_deref() == Some("cancelled") {
             return Some(CalendarChange::Cancelled(EventKey {
                 calendar_id: calendar_id.to_owned(),
-                instance_start: self
-                    .original_start_time
-                    .as_ref()
-                    .and_then(EventTime::instant),
+                instance_start: self.instance_start(),
                 source_id: self.id,
             }));
         }
@@ -1003,13 +1006,11 @@ impl Event {
         if end <= start || start < window_start || start >= window_end {
             return None;
         }
+        let instance_start = self.instance_start();
         Some(FetchedEvent {
             calendar_id: calendar_id.to_owned(),
             source_id: self.id,
-            instance_start: self
-                .original_start_time
-                .as_ref()
-                .and_then(EventTime::instant),
+            instance_start,
             title: self.summary.unwrap_or_else(|| "(no title)".to_owned()),
             start,
             end,

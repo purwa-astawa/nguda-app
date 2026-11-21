@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use nguda_core::{
     CalendarChange, CalendarEntry, CalendarError, CalendarErrorKind, CalendarSource, Clock, Date,
-    Day, DayLogKind, EventKey, ExportRange, FetchedEvent, FileSink, IdGen, IsoWeek, ItemId,
-    LockDecision, OAuthClient, OpenSegmentRef, PlanItem, PromptId, PromptKind, Random, Running,
-    Schedule, SessionStore, Store, StoreBatch, StoreError, StoreOp, SyncBatch, SyncCursor,
+    Day, DayLogKind, ExportRange, FetchedEvent, FileSink, IdGen, IsoWeek, ItemId, LockDecision,
+    OAuthClient, OpenSegmentRef, PlanItem, PromptId, PromptKind, Random, Running, Schedule,
+    SessionStore, Settings, Store, StoreBatch, StoreError, StoreOp, SyncBatch, SyncCursor,
     TimeZone, Timestamp, WorkEnd, add_event, added_refs, export_csv, hide_calendar, in_plan, merge,
     merge_tag_names, reconcile, reflow, report, sort_tag_names, week_report,
 };
@@ -106,7 +106,8 @@ struct Actor {
     rate_limits: u32,
     /// The Google account state, as last learned from the calendar source.
     google: GoogleAccount,
-    /// The actor's own inbox, weakly held: export tasks post their outcome here
+    /// The actor's own inbox, weakly held: spawned tasks (exports, sign-in and
+    /// sign-out, sync rounds, events queries, event adds) post their outcome here
     /// without keeping the engine alive.
     inbox: mpsc::WeakUnboundedSender<Inbox>,
     /// The last export request id handed out; ids start at 1.
@@ -226,7 +227,7 @@ impl Actor {
             Ok(settings) => settings,
             Err(e) => {
                 self.store_failed("load settings", &e);
-                nguda_core::Settings::default()
+                Settings::default()
             }
         };
         self.work_end = settings.work_end;
@@ -448,6 +449,16 @@ impl Actor {
         );
     }
 
+    /// Expires the session ([`Self::session_expired`]) and publishes when that
+    /// changed the account or the status.
+    fn expire_and_publish(&mut self, id: u64) {
+        let before = (self.google, self.status.clone());
+        self.session_expired(id);
+        if before != (self.google, self.status.clone()) {
+            self.publish();
+        }
+    }
+
     /// Grows the rate-limit backoff, sets `Sync`, and schedules the next poll.
     fn rate_limited(&mut self, id: u64) {
         self.rate_limits = self.rate_limits.saturating_add(1);
@@ -500,11 +511,7 @@ impl Actor {
                         Ok(t) => {
                             next = merged;
                             fetched += changes.len();
-                            for item_id in t {
-                                if !touched.contains(&item_id) {
-                                    touched.push(item_id);
-                                }
-                            }
+                            push_new(&mut touched, t);
                             match next_token {
                                 Some(token) => {
                                     let cursor = SyncCursor {
@@ -563,11 +570,7 @@ impl Actor {
                     match merge(&mut merged, &[change], now, || ids.new_item_id()) {
                         Ok(t) => {
                             next = merged;
-                            for item_id in t {
-                                if !touched.contains(&item_id) {
-                                    touched.push(item_id);
-                                }
-                            }
+                            push_new(&mut touched, t);
                         }
                         Err(e) => {
                             tracing::warn!(id, %date, kind = domain_kind(&e), "added event merge rejected");
@@ -967,11 +970,7 @@ impl Actor {
         if let Err(e) = &result
             && e.kind == CalendarErrorKind::SessionExpired
         {
-            let before = (self.google, self.status.clone());
-            self.session_expired(id);
-            if before != (self.google, self.status.clone()) {
-                self.publish();
-            }
+            self.expire_and_publish(id);
         }
         let answer = if id != self.events_query_issued || date != self.day.date() {
             tracing::debug!(id, latest = self.events_query_issued, %date, "stale events dropped");
@@ -1039,11 +1038,7 @@ impl Actor {
                 return self.add_failed("not found, all-day, declined, or not today");
             }
             Err(e) if e.kind == CalendarErrorKind::SessionExpired => {
-                let before = (self.google, self.status.clone());
-                self.session_expired(0);
-                if before != (self.google, self.status.clone()) {
-                    self.publish();
-                }
+                self.expire_and_publish(0);
                 return;
             }
             Err(e) => {
@@ -1786,6 +1781,15 @@ async fn sync_round(
     })
 }
 
+/// Appends the `ids` not already in `into`, in order.
+fn push_new(into: &mut Vec<ItemId>, ids: Vec<ItemId>) {
+    for id in ids {
+        if !into.contains(&id) {
+            into.push(id);
+        }
+    }
+}
+
 /// Whether `change` is of event `event_id` of calendar `calendar_id`.
 fn names(change: &CalendarChange, calendar_id: &str, event_id: &str) -> bool {
     let (c, e) = match change {
@@ -1802,14 +1806,7 @@ fn calendar_events(day: &Day, mut events: Vec<FetchedEvent>) -> Vec<CalendarEven
     events
         .into_iter()
         .map(|e| {
-            let in_plan = in_plan(
-                day,
-                &EventKey {
-                    calendar_id: e.calendar_id.clone(),
-                    source_id: e.source_id.clone(),
-                    instance_start: e.instance_start,
-                },
-            );
+            let in_plan = in_plan(day, &e.key());
             CalendarEvent {
                 calendar_id: e.calendar_id,
                 event_id: e.source_id,
