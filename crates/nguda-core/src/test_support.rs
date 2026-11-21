@@ -42,6 +42,7 @@ pub(crate) fn record(n: u128, planned_secs: u64, order: &str) -> PlanItemRecord 
         tags: Vec::new(),
         source: None,
         removed_by_source_at: None,
+        hidden_at: None,
     }
 }
 

@@ -133,12 +133,12 @@ fn token_json(refresh: Option<&str>, access: &str) -> serde_json::Value {
     body
 }
 
-async fn mount_primary(server: &MockServer, id: &str) {
-    Mock::given(method("GET"))
-        .and(path("/calendar/v3/users/me/calendarList/primary"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": id })))
-        .mount(server)
-        .await;
+/// Syncs `me@example.com`, fully when `token` is `None`.
+async fn sync_me(source: &GcalSource, token: Option<&str>) -> Result<SyncBatch, CalendarError> {
+    let (from, to) = window();
+    source
+        .sync_calendar("me@example.com".into(), token.map(str::to_owned), from, to)
+        .await
 }
 
 fn timed(id: &str, title: &str, start: &str, end: &str) -> serde_json::Value {
@@ -184,7 +184,6 @@ async fn sign_in_exchanges_the_code_and_stores_the_refresh_token() {
         .expect(1)
         .mount(&server)
         .await;
-    mount_primary(&server, "me@example.com").await;
     Mock::given(method("GET"))
         .and(path("/calendar/v3/calendars/me@example.com/events"))
         .and(header("authorization", "Bearer at-1"))
@@ -214,11 +213,7 @@ async fn sign_in_exchanges_the_code_and_stores_the_refresh_token() {
     assert!(!params["state"].is_empty());
 
     // The access token from the exchange is reused: no refresh happens.
-    let (from, to) = window();
-    assert_eq!(
-        source.sync_primary(None, from, to).await.unwrap().changes,
-        vec![]
-    );
+    assert_eq!(sync_me(&source, None).await.unwrap().changes, vec![]);
     assert_get_only(&server.received_requests().await.unwrap());
 }
 
@@ -269,8 +264,7 @@ async fn a_token_error_carries_the_oauth_code_only() {
         MemorySecrets::with_refresh("rt-9"),
         no_browser(),
     );
-    let (from, to) = window();
-    let err = source.sync_primary(None, from, to).await.unwrap_err();
+    let err = sync_me(&source, None).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::Auth);
     assert!(err.message.contains("invalid_grant"), "{err}");
     assert!(!err.message.contains("rt-9"), "{err}");
@@ -301,14 +295,13 @@ async fn fetch_without_a_refresh_token_is_not_signed_in() {
         Arc::new(MemorySecrets::default()),
         no_browser(),
     );
-    let (from, to) = window();
-    let err = source.sync_primary(None, from, to).await.unwrap_err();
+    let err = sync_me(&source, None).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn fetch_refreshes_then_parses_and_pages_the_primary_events() {
+async fn fetch_refreshes_then_parses_and_pages_a_calendars_events() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
@@ -318,7 +311,6 @@ async fn fetch_refreshes_then_parses_and_pages_the_primary_events() {
         .expect(1)
         .mount(&server)
         .await;
-    mount_primary(&server, "me@example.com").await;
     let events = "/calendar/v3/calendars/me@example.com/events";
     let page1 = json!({
         "items": [
@@ -384,8 +376,7 @@ async fn fetch_refreshes_then_parses_and_pages_the_primary_events() {
         MemorySecrets::with_refresh("rt-1"),
         no_browser(),
     );
-    let (from, to) = window();
-    let got = source.sync_primary(None, from, to).await.unwrap();
+    let got = sync_me(&source, None).await.unwrap();
     let ts = |s: &str| s.parse::<Timestamp>().unwrap();
     assert_eq!(got.calendar_id, "me@example.com");
     assert_eq!(got.next_token.as_deref(), Some("sync-1"));
@@ -416,7 +407,7 @@ async fn fetch_refreshes_then_parses_and_pages_the_primary_events() {
         ]
     );
     // A second fetch reuses the refreshed access token (the token mock expects 1).
-    source.sync_primary(None, from, to).await.unwrap();
+    sync_me(&source, None).await.unwrap();
     assert_get_only(&server.received_requests().await.unwrap());
 }
 
@@ -437,8 +428,7 @@ async fn an_http_failure_is_an_other_error_without_details() {
         MemorySecrets::with_refresh("rt"),
         no_browser(),
     );
-    let (from, to) = window();
-    let err = source.sync_primary(None, from, to).await.unwrap_err();
+    let err = sync_me(&source, None).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::Other);
     assert_eq!(err.message, "Calendar API HTTP 503");
 }
@@ -472,8 +462,7 @@ fn the_config_debug_never_prints_the_secret() {
 async fn an_unreadable_keyring_is_not_signed_in() {
     let server = MockServer::start().await;
     let source = GcalSource::new(config(&server), Arc::new(BrokenSecrets), no_browser());
-    let (from, to) = window();
-    let err = source.sync_primary(None, from, to).await.unwrap_err();
+    let err = sync_me(&source, None).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
     assert!(server.received_requests().await.unwrap().is_empty());
 }
@@ -496,8 +485,7 @@ async fn a_sign_in_that_cannot_be_stored_leaves_no_session() {
     let err = source.sign_in().await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::Other);
     // The exchanged access token was not kept: a fetch is not signed in.
-    let (from, to) = window();
-    let err = source.sync_primary(None, from, to).await.unwrap_err();
+    let err = sync_me(&source, None).await.unwrap_err();
     assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
 }
 
@@ -522,7 +510,7 @@ fn signed_in(server: &MockServer) -> GcalSource {
 async fn an_incremental_sync_sends_only_the_token_and_parses_cancellations() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    // The cursor names the calendar: no primary lookup.
+    // The calendar is named by the caller: no calendar lookup.
     Mock::given(method("GET"))
         .and(path("/calendar/v3/users/me/calendarList/primary"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "x" })))
@@ -575,9 +563,7 @@ async fn an_incremental_sync_sends_only_the_token_and_parses_cancellations() {
         .await;
 
     let source = signed_in(&server);
-    let (from, to) = window();
-    let cursor = Some(("me@example.com".to_owned(), "sync-1".to_owned()));
-    let got = source.sync_primary(cursor, from, to).await.unwrap();
+    let got = sync_me(&source, Some("sync-1")).await.unwrap();
     let ts = |s: &str| s.parse::<Timestamp>().unwrap();
     assert_eq!(got.calendar_id, "me@example.com");
     assert_eq!(got.next_token.as_deref(), Some("sync-2"));
@@ -611,7 +597,6 @@ async fn an_incremental_sync_sends_only_the_token_and_parses_cancellations() {
 async fn a_last_page_without_a_sync_token_yields_none() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    mount_primary(&server, "me@example.com").await;
     Mock::given(method("GET"))
         .and(path("/calendar/v3/calendars/me@example.com/events"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -621,11 +606,7 @@ async fn a_last_page_without_a_sync_token_yields_none() {
         })))
         .mount(&server)
         .await;
-    let (from, to) = window();
-    let got = signed_in(&server)
-        .sync_primary(None, from, to)
-        .await
-        .unwrap();
+    let got = sync_me(&signed_in(&server), None).await.unwrap();
     assert_eq!(got.changes.len(), 1);
     assert_eq!(got.next_token, None);
 }
@@ -643,10 +624,7 @@ async fn limits_and_an_expired_sync_token_have_their_own_kinds() {
             .respond_with(ResponseTemplate::new(code).set_body_string("Standup sync-1"))
             .mount(&server)
             .await;
-        let (from, to) = window();
-        let cursor = Some(("me@example.com".to_owned(), "sync-1".to_owned()));
-        let err = signed_in(&server)
-            .sync_primary(cursor, from, to)
+        let err = sync_me(&signed_in(&server), Some("sync-1"))
             .await
             .unwrap_err();
         assert_eq!(err.kind, kind, "{code}");
@@ -655,4 +633,125 @@ async fn limits_and_an_expired_sync_token_have_their_own_kinds() {
         assert!(!err.message.contains("Standup"), "{err}");
         assert_get_only(&server.received_requests().await.unwrap());
     }
+}
+
+#[tokio::test]
+async fn a_full_sync_needs_no_calendar_lookup() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/calendar/v3/calendars/me@example.com/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .mount(&server)
+        .await;
+    sync_me(&signed_in(&server), None).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.url.path().contains("calendarList")),
+        "no calendarList request"
+    );
+}
+
+#[tokio::test]
+async fn a_non_primary_calendar_id_is_percent_encoded_and_names_the_batch() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let id = "en.usa#holiday@group.v.calendar.google.com";
+    Mock::given(method("GET"))
+        .and(path(
+            "/calendar/v3/calendars/en.usa%23holiday@group.v.calendar.google.com/events",
+        ))
+        .and(query_param("timeMin", "2026-11-21T00:00:00Z"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                timed("h", "Holiday call", "2026-11-21T09:00:00Z", "2026-11-21T09:30:00Z"),
+            ],
+            "nextSyncToken": "s-h",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (from, to) = window();
+    let got = signed_in(&server)
+        .sync_calendar(id.into(), None, from, to)
+        .await
+        .unwrap();
+    assert_eq!(got.calendar_id, id);
+    assert_eq!(got.next_token.as_deref(), Some("s-h"));
+    match &got.changes[..] {
+        [CalendarChange::Upsert(e)] => assert_eq!(e.calendar_id, id),
+        other => panic!("{other:?}"),
+    }
+    assert_get_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test]
+async fn list_calendars_pages_prefers_the_override_and_reads_primary() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let list = "/calendar/v3/users/me/calendarList";
+    Mock::given(method("GET"))
+        .and(path(list))
+        .and(query_param("minAccessRole", "reader"))
+        .and(query_param("maxResults", "250"))
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                { "id": "me@example.com", "summary": "me@example.com", "primary": true },
+                { "id": "team@group", "summary": "Team", "summaryOverride": "My team" },
+            ],
+            "nextPageToken": "p2",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(list))
+        .and(query_param("minAccessRole", "reader"))
+        .and(query_param("pageToken", "p2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                { "id": "x#holiday@group", "summary": "Holidays", "primary": false },
+            ],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let got = signed_in(&server).list_calendars().await.unwrap();
+    let flat: Vec<(&str, &str, bool)> = got
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str(), c.primary))
+        .collect();
+    assert_eq!(
+        flat,
+        vec![
+            ("me@example.com", "me@example.com", true),
+            ("team@group", "My team", false),
+            ("x#holiday@group", "Holidays", false),
+        ]
+    );
+    assert_get_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test]
+async fn list_calendars_failures_keep_their_kinds() {
+    let server = MockServer::start().await;
+    let err = GcalSource::new(
+        config(&server),
+        Arc::new(MemorySecrets::default()),
+        no_browser(),
+    )
+    .list_calendars()
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::NotSignedIn);
+    mount_token(&server).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+    let err = signed_in(&server).list_calendars().await.unwrap_err();
+    assert_eq!(err.kind, CalendarErrorKind::RateLimited);
 }

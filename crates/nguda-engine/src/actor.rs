@@ -10,19 +10,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    CalendarError, CalendarErrorKind, CalendarSource, Clock, Date, Day, DayLogKind, ExportRange,
-    FileSink, IdGen, IsoWeek, ItemId, LockDecision, OpenSegmentRef, PlanItem, PromptId, PromptKind,
-    Random, Running, Schedule, Store, StoreBatch, StoreError, StoreOp, SyncBatch, SyncCursor,
-    TimeZone, Timestamp, WorkEnd, export_csv, merge, merge_tag_names, reflow, report,
-    sort_tag_names, week_report,
+    CalendarEntry, CalendarError, CalendarErrorKind, CalendarSource, Clock, Date, Day, DayLogKind,
+    ExportRange, FileSink, IdGen, IsoWeek, ItemId, LockDecision, OpenSegmentRef, PlanItem,
+    PromptId, PromptKind, Random, Running, Schedule, Store, StoreBatch, StoreError, StoreOp,
+    SyncBatch, SyncCursor, TimeZone, Timestamp, WorkEnd, export_csv, hide_calendar, merge,
+    merge_tag_names, reconcile, reflow, report, sort_tag_names, week_report,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::batch::diff;
 use crate::commands::{self, Reject, domain_kind};
 use crate::{
-    BACKOFF_MAX, DayReply, Effect, EngineDeps, EngineMsg, GoogleAccount, HEARTBEAT_EVERY, Inbox,
-    JITTER, NextItem, POLL_EVERY, Snapshot, StatusEntry, StatusKey, WAKE_LATENESS, WeekReply,
+    BACKOFF_MAX, CalendarOutcome, DayReply, Effect, EngineDeps, EngineMsg, GoogleAccount,
+    HEARTBEAT_EVERY, Inbox, JITTER, NextItem, POLL_EVERY, Snapshot, StatusEntry, StatusKey,
+    SyncRound, WAKE_LATENESS, WeekReply,
 };
 
 pub(crate) async fn run(
@@ -43,13 +44,8 @@ pub(crate) async fn run(
                 Some(Inbox::QueryWeek { week, reply }) => actor.query_week(week, reply),
                 Some(Inbox::ExportFinished { id, result }) => actor.export_finished(id, result),
                 Some(Inbox::SignInFinished { id, result }) => actor.sign_in_finished(id, result),
-                Some(Inbox::ImportFinished {
-                    id,
-                    date,
-                    incremental,
-                    result,
-                }) => {
-                    actor.import_finished(id, date, incremental, result).await;
+                Some(Inbox::ImportFinished { id, date, result }) => {
+                    actor.import_finished(id, date, result).await;
                 }
                 None => break,
             },
@@ -74,11 +70,17 @@ struct Actor {
     /// Each calendar's sync cursor, by calendar id, as last committed or loaded
     /// (AD-17). Never logged: it holds tokens.
     cursors: BTreeMap<String, SyncCursor>,
+    /// The calendar table, in Google's listing order, as last committed or
+    /// loaded (R2).
+    calendars: Vec<CalendarEntry>,
     /// When the next calendar poll is due: `None` while a sync is in flight or
     /// while signed out.
     poll_at: Option<Timestamp>,
     /// Whether the latest sync issued has not answered yet.
     in_flight: bool,
+    /// The task of the latest round issued, aborted when a newer one supersedes
+    /// it so a dropped round makes no more requests.
+    round_task: Option<tokio::task::JoinHandle<()>>,
     /// How many syncs in a row Google answered with 403 or 429.
     rate_limits: u32,
     /// The Google account state, as last learned from the calendar source.
@@ -144,8 +146,10 @@ impl Actor {
             sign_in_issued: 0,
             import_issued: 0,
             cursors: BTreeMap::new(),
+            calendars: Vec::new(),
             poll_at: None,
             in_flight: false,
+            round_task: None,
             rate_limits: 0,
             google: GoogleAccount::Unknown,
             inbox,
@@ -168,8 +172,8 @@ impl Actor {
     }
 
     /// Recovers a crash-left open segment, loads today, the settings, the known
-    /// tag names and the sync cursors, publishes rev 1, and starts syncing today's
-    /// calendar events.
+    /// tag names, the sync cursors and the calendar table, publishes rev 1, and
+    /// starts syncing today's calendar events.
     /// Runs before any message is handled.
     async fn startup(&mut self) {
         let now = self.clock.now();
@@ -220,6 +224,13 @@ impl Actor {
                 BTreeMap::new()
             }
         };
+        self.calendars = match self.store.load_calendars().await {
+            Ok(calendars) => calendars,
+            Err(e) => {
+                self.store_failed("load calendars", &e);
+                Vec::new()
+            }
+        };
         self.heartbeat_at = deadline_after(now);
         self.publish();
         self.start_import();
@@ -257,72 +268,67 @@ impl Actor {
         self.start_import();
     }
 
-    /// Starts a sync of the primary calendar off the actor (AD-17): incremental
-    /// from a cursor issued for today, else a full fetch of today's local day.
-    /// The task posts its result back as [`Inbox::ImportFinished`] under a fresh
-    /// request id and today's date, which supersedes any sync still running. No
-    /// poll is due while it is in flight.
+    /// Starts a sync round off the actor (AD-17) under a fresh request id and
+    /// today's date, superseding any round still running. The task lists the
+    /// calendars, reconciles them with the stored table, then syncs each included
+    /// calendar in turn: incrementally from a cursor issued for today, else a
+    /// full fetch of today's local day. It posts the round back as
+    /// [`Inbox::ImportFinished`]. The superseded round's task is aborted. No poll
+    /// is due while it is in flight.
     fn start_import(&mut self) {
         self.import_issued += 1;
         let id = self.import_issued;
         let date = self.day.date();
         self.poll_at = None;
+        if let Some(task) = self.round_task.take() {
+            task.abort();
+        }
         let Some((from, to)) = day_window(date, &self.tz) else {
             self.in_flight = false;
             tracing::warn!(%date, "no import window for the day");
             return;
         };
         self.in_flight = true;
-        // A cursor from another day never resumes: a new day starts with a full fetch.
-        let cursor = self
+        // A cursor from another day never resumes: a new day starts with full fetches.
+        let tokens: BTreeMap<String, String> = self
             .cursors
             .values()
-            .find(|c| c.date == date)
-            .map(|c| (c.calendar_id.clone(), c.token.clone()));
-        let incremental = cursor.as_ref().map(|(calendar_id, _)| calendar_id.clone());
+            .filter(|c| c.date == date)
+            .map(|c| (c.calendar_id.clone(), c.token.clone()))
+            .collect();
+        let stored = self.calendars.clone();
         let calendar = self.calendar.clone();
         let inbox = self.inbox.clone();
-        tracing::debug!(
-            id,
-            %date,
-            incremental = incremental.is_some(),
-            "calendar sync started"
-        );
-        tokio::spawn(async move {
-            let result = calendar.sync_primary(cursor, from, to).await;
+        tracing::debug!(id, %date, cursors = tokens.len(), "calendar sync round started");
+        self.round_task = Some(tokio::spawn(async move {
+            let result = sync_round(calendar.as_ref(), &stored, &tokens, from, to).await;
             // The engine may have stopped meanwhile; nothing to report to then.
             if let Some(inbox) = inbox.upgrade() {
-                let _ = inbox.send(Inbox::ImportFinished {
-                    id,
-                    date,
-                    incremental,
-                    result,
-                });
+                let _ = inbox.send(Inbox::ImportFinished { id, date, result });
             }
-        });
+        }));
     }
 
-    /// Applies a sync's result (AD-9, AD-17), unless it is stale: an id other
-    /// than the latest issued, or a date that is no longer today; a stale result
+    /// Applies a sync round (AD-9, AD-17), unless it is stale: an id other than
+    /// the latest issued, or a date that is no longer today; a stale round
     /// changes nothing at all.
     ///
-    /// Success marks the account signed in, clears `Sync` and the backoff (only a
-    /// success or a sign-out resets it), merges
-    /// the changes into a copy of today, and commits the diff, one
-    /// `CalendarChanged` entry per touched item, and the cursor update as one
-    /// batch; nothing changed commits nothing. A `410` on an incremental sync
-    /// clears that calendar's cursor and fetches again at once. A 403/429 grows
-    /// the backoff and sets `Sync`. "Not signed in" (or no client) marks the
-    /// account signed out and schedules no poll; any other failure sets `Sync`
-    /// and leaves the plan as is. Every other outcome schedules the next poll.
-    /// Publishes only on a visible change. Logs ids, dates, kinds and counts only
-    /// (AD-14).
+    /// A listing failure fails the whole round: "not signed in" (or no client)
+    /// marks the account signed out and schedules no poll, a 403/429 grows the
+    /// backoff and sets `Sync`, any other failure sets `Sync`; the table and the
+    /// plan stay as they are. Otherwise the account is signed in, the successful
+    /// calendars are applied as one batch (see [`Self::apply_round`]), and then, in
+    /// precedence: a `410` on an incremental sync starts a new round at once
+    /// (that calendar's cursor already cleared); else a 403/429 grows the backoff
+    /// and sets `Sync`; else any other failure sets `Sync`; else `Sync` and the
+    /// backoff are cleared. Every outcome but a new round or a sign-out schedules
+    /// the next poll. Publishes only on a visible change. Logs ids, dates, kinds
+    /// and counts only (AD-14).
     async fn import_finished(
         &mut self,
         id: u64,
         date: Date,
-        incremental: Option<String>,
-        result: Result<SyncBatch, CalendarError>,
+        result: Result<SyncRound, CalendarError>,
     ) {
         if id != self.import_issued || date != self.day.date() {
             tracing::debug!(id, latest = self.import_issued, %date, "stale import dropped");
@@ -333,23 +339,26 @@ impl Actor {
         let google_before = self.google;
         let mut changed = false;
         match result {
-            Ok(batch) => {
+            Ok(round) => {
                 self.set_google(GoogleAccount::SignedIn);
-                self.status.remove(&StatusKey::Sync);
-                self.rate_limits = 0;
-                changed = self.apply_sync(id, date, batch).await;
-                self.schedule_poll();
-            }
-            Err(e) if e.kind == CalendarErrorKind::Gone && incremental.is_some() => {
-                let calendar_id = incremental.unwrap_or_default();
-                tracing::info!(id, "calendar sync token expired: fetching again");
-                let batch = StoreBatch::from_iter([StoreOp::ClearSyncCursor {
-                    calendar_id: calendar_id.clone(),
-                }]);
-                self.commit(batch).await;
-                // Even if the clear failed to commit, never reuse a dead token.
-                self.cursors.remove(&calendar_id);
-                self.start_import();
+                let failures = self.apply_round(id, date, round).await;
+                changed = failures.changed;
+                if failures.gone {
+                    tracing::info!(id, "calendar sync token expired: fetching again");
+                    self.start_import();
+                } else if failures.rate_limited {
+                    self.rate_limited(id);
+                } else if let Some(message) = failures.other {
+                    self.status.insert(
+                        StatusKey::Sync,
+                        format!("Calendar import failed: {message}"),
+                    );
+                    self.schedule_poll();
+                } else {
+                    self.status.remove(&StatusKey::Sync);
+                    self.rate_limits = 0;
+                    self.schedule_poll();
+                }
             }
             Err(e) if e.kind == CalendarErrorKind::NotSignedIn => {
                 tracing::debug!(id, "calendar import: not signed in");
@@ -357,19 +366,13 @@ impl Actor {
                 self.set_google(GoogleAccount::SignedOut);
             }
             Err(e) if e.kind == CalendarErrorKind::RateLimited => {
-                self.rate_limits = self.rate_limits.saturating_add(1);
-                tracing::warn!(id, limits = self.rate_limits, "calendar sync rate limited");
                 if self.google == GoogleAccount::Unknown {
                     self.set_google(GoogleAccount::SignedIn);
                 }
-                self.status.insert(
-                    StatusKey::Sync,
-                    "Google is limiting requests; syncing again later".to_owned(),
-                );
-                self.schedule_poll();
+                self.rate_limited(id);
             }
             Err(e) => {
-                tracing::warn!(id, kind = error_kind(&e), "calendar import failed");
+                tracing::warn!(id, kind = error_kind(&e), "calendar listing failed");
                 self.status.insert(
                     StatusKey::Sync,
                     format!("Calendar import failed: {}", e.message),
@@ -390,81 +393,217 @@ impl Actor {
         }
     }
 
-    /// Merges a successful sync of today into a copy of the day at `now` and
-    /// commits, as one batch, the plan diff, a `CalendarChanged` entry per touched
-    /// item, and the cursor change: the new token for today, or the calendar's
-    /// cursor removed when Google sent none. Swaps the day and the cursors in only
-    /// after the commit. Returns whether the day changed. A merge rejected by the
-    /// domain sets `Sync` and changes nothing.
-    async fn apply_sync(&mut self, id: u64, date: Date, batch: SyncBatch) -> bool {
-        let SyncBatch {
-            calendar_id,
-            changes,
-            next_token,
-        } = batch;
+    /// Grows the rate-limit backoff, sets `Sync`, and schedules the next poll.
+    fn rate_limited(&mut self, id: u64) {
+        self.rate_limits = self.rate_limits.saturating_add(1);
+        tracing::warn!(id, limits = self.rate_limits, "calendar sync rate limited");
+        self.status.insert(
+            StatusKey::Sync,
+            "Google is limiting requests; syncing again later".to_owned(),
+        );
+        self.schedule_poll();
+    }
+
+    /// Applies a listed round to a copy of today at `now` and commits, as one
+    /// batch, the calendar table (when it changed), the plan diff, a
+    /// `CalendarChanged` entry per touched item, and every cursor change: each
+    /// successful calendar's new token for today (or its cursor removed when
+    /// Google sent none), the cursor of each calendar that left the list, and the
+    /// cursor of each calendar whose incremental sync hit a `410`. A calendar
+    /// whose merge the domain rejects is skipped and counts as a failure. Swaps
+    /// the day, the table and the cursors in only after the commit; a dead
+    /// token is forgotten even if the commit failed. Nothing changed commits
+    /// nothing.
+    async fn apply_round(&mut self, id: u64, date: Date, round: SyncRound) -> RoundFailures {
+        let SyncRound {
+            calendars,
+            outcomes,
+        } = round;
         let now = self.clock.now();
+        let mut failures = RoundFailures::default();
         let mut next = self.day.clone();
+        let mut cursors = self.cursors.clone();
+        let mut touched: Vec<ItemId> = Vec::new();
+        let mut fetched = 0;
+        let mut dead: Vec<String> = Vec::new();
         let ids = self.ids.clone();
-        let touched = match merge(&mut next, &changes, now, || ids.new_item_id()) {
-            Ok(touched) => touched,
-            Err(e) => {
-                tracing::warn!(id, %date, kind = domain_kind(&e), "calendar merge rejected");
-                self.status
-                    .insert(StatusKey::Sync, format!("Calendar import failed: {e}"));
-                return false;
+        for CalendarOutcome {
+            calendar_id,
+            incremental,
+            result,
+        } in outcomes
+        {
+            match result {
+                Ok(SyncBatch {
+                    calendar_id: _,
+                    changes,
+                    next_token,
+                }) => {
+                    let mut merged = next.clone();
+                    match merge(&mut merged, &changes, now, || ids.new_item_id()) {
+                        Ok(t) => {
+                            next = merged;
+                            fetched += changes.len();
+                            for item_id in t {
+                                if !touched.contains(&item_id) {
+                                    touched.push(item_id);
+                                }
+                            }
+                            match next_token {
+                                Some(token) => {
+                                    let cursor = SyncCursor {
+                                        calendar_id: calendar_id.clone(),
+                                        token,
+                                        date,
+                                    };
+                                    cursors.insert(calendar_id, cursor);
+                                }
+                                None => {
+                                    cursors.remove(&calendar_id);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                id,
+                                %date,
+                                kind = domain_kind(&e),
+                                "calendar merge rejected"
+                            );
+                            failures.other.get_or_insert_with(|| e.to_string());
+                        }
+                    }
+                }
+                Err(e) if e.kind == CalendarErrorKind::Gone && incremental => {
+                    cursors.remove(&calendar_id);
+                    dead.push(calendar_id);
+                    failures.gone = true;
+                }
+                Err(e) if e.kind == CalendarErrorKind::RateLimited => {
+                    failures.rate_limited = true;
+                }
+                Err(e) => {
+                    tracing::warn!(id, kind = error_kind(&e), "calendar sync failed");
+                    failures.other.get_or_insert(e.message);
+                }
             }
-        };
+        }
+        // A calendar no longer listed keeps no cursor; its items stay (AD-9).
+        cursors.retain(|calendar_id, _| calendars.iter().any(|c| &c.id == calendar_id));
         tracing::info!(
             id,
             %date,
-            fetched = changes.len(),
+            calendars = calendars.len(),
+            fetched,
             count = touched.len(),
-            "calendar sync merged"
+            "calendar sync round merged"
         );
-        let cursor = next_token.map(|token| SyncCursor {
-            calendar_id: calendar_id.clone(),
-            token,
-            date,
-        });
-        let cursor_op = match &cursor {
-            Some(c) if self.cursors.get(&calendar_id) != Some(c) => {
-                Some(StoreOp::PutSyncCursor { cursor: c.clone() })
-            }
-            Some(_) => None,
-            None => self
-                .cursors
-                .contains_key(&calendar_id)
-                .then(|| StoreOp::ClearSyncCursor {
-                    calendar_id: calendar_id.clone(),
-                }),
-        };
         let day_changed = next != self.day;
-        if !day_changed && cursor_op.is_none() {
-            return false;
-        }
+        let table_changed = calendars != self.calendars;
         let mut ops = if day_changed {
             diff(&self.day, &next)
         } else {
             StoreBatch::new()
         };
+        if table_changed {
+            ops.push(StoreOp::SetCalendars {
+                calendars: calendars.clone(),
+            });
+        }
         ops.extend(
             touched.iter().map(|&item_id| {
                 commands::log_op(date, now, DayLogKind::CalendarChanged { item_id })
             }),
         );
-        ops.extend(cursor_op);
-        if !self.swap_after_commit(next, self.work_end, ops).await {
-            return false;
-        }
-        match cursor {
-            Some(c) => {
-                self.cursors.insert(calendar_id, c);
-            }
-            None => {
+        ops.extend(cursor_ops(&self.cursors, &cursors));
+        let committed =
+            !ops.ops().is_empty() && self.swap_after_commit(next, self.work_end, ops).await;
+        if committed {
+            self.calendars = calendars;
+            self.cursors = cursors;
+            failures.changed = day_changed || table_changed;
+        } else {
+            // Even if the clear failed to commit, never reuse a dead token.
+            for calendar_id in dead {
                 self.cursors.remove(&calendar_id);
             }
         }
-        day_changed
+        failures
+    }
+
+    /// Includes exactly `calendar_ids` of the table (R2), ignoring unknown ids.
+    /// The same selection changes nothing: no commit, round, or publish.
+    /// Otherwise commits in one batch the new table, today's untracked pending
+    /// items of each newly un-included calendar hidden (a `CalendarChanged`
+    /// entry each), and those calendars' cursors cleared, so a re-include always
+    /// fetches in full; then publishes and starts a new round at once,
+    /// superseding any in flight. A failed commit changes nothing and publishes
+    /// the `Store` status. Logs counts only (AD-14).
+    async fn set_included_calendars(&mut self, calendar_ids: &[String]) {
+        let calendars: Vec<CalendarEntry> = self
+            .calendars
+            .iter()
+            .map(|c| CalendarEntry {
+                included: calendar_ids.contains(&c.id),
+                ..c.clone()
+            })
+            .collect();
+        if calendars == self.calendars {
+            tracing::debug!("calendar selection unchanged");
+            return;
+        }
+        let now = self.clock.now();
+        let date = self.day.date();
+        let mut next = self.day.clone();
+        let mut cursors = self.cursors.clone();
+        let mut hidden: Vec<ItemId> = Vec::new();
+        let dropped = self
+            .calendars
+            .iter()
+            .zip(&calendars)
+            .filter(|(old, new)| old.included && !new.included)
+            .map(|(old, _)| old.id.clone());
+        for calendar_id in dropped {
+            match hide_calendar(&mut next, &calendar_id, now) {
+                Ok(ids) => hidden.extend(ids),
+                Err(e) => {
+                    tracing::warn!(kind = domain_kind(&e), "calendar hide rejected");
+                    self.status
+                        .insert(StatusKey::Sync, format!("Calendar selection failed: {e}"));
+                    self.publish();
+                    return;
+                }
+            }
+            cursors.remove(&calendar_id);
+        }
+        let mut ops = if next == self.day {
+            StoreBatch::new()
+        } else {
+            diff(&self.day, &next)
+        };
+        ops.push(StoreOp::SetCalendars {
+            calendars: calendars.clone(),
+        });
+        ops.extend(
+            hidden.iter().map(|&item_id| {
+                commands::log_op(date, now, DayLogKind::CalendarChanged { item_id })
+            }),
+        );
+        ops.extend(cursor_ops(&self.cursors, &cursors));
+        if !self.swap_after_commit(next, self.work_end, ops).await {
+            self.publish();
+            return;
+        }
+        let included = calendars.iter().filter(|c| c.included).count();
+        tracing::info!(
+            included,
+            hidden = hidden.len(),
+            "calendar selection changed"
+        );
+        self.calendars = calendars;
+        self.cursors = cursors;
+        self.publish();
+        self.start_import();
     }
 
     /// Schedules the next poll after a sync result: `POLL_EVERY`, or after `n`
@@ -745,6 +884,10 @@ impl Actor {
             }
             EngineMsg::SignIn => {
                 self.sign_in();
+                false
+            }
+            EngineMsg::SetIncludedCalendars { calendar_ids } => {
+                self.set_included_calendars(&calendar_ids).await;
                 false
             }
             msg => self.handle_plan(msg).await,
@@ -1139,6 +1282,7 @@ impl Actor {
             overflow: self.overflow.clone(),
             known_tags: self.known_tags.clone(),
             google: self.google,
+            calendars: self.calendars.clone(),
             status: self
                 .status
                 .iter()
@@ -1153,6 +1297,68 @@ impl Actor {
         self.snapshots.send_replace(snapshot);
         self.overflow_effects();
     }
+}
+
+/// What went wrong in a round's per-calendar syncs, and whether the applied
+/// part changed anything visible.
+#[derive(Default)]
+struct RoundFailures {
+    /// The day or the calendar table changed and was committed.
+    changed: bool,
+    /// An incremental sync hit a `410`.
+    gone: bool,
+    /// A sync was rate limited (403/429).
+    rate_limited: bool,
+    /// The first other failure's message.
+    other: Option<String>,
+}
+
+/// One sync round (AD-17), run off the actor: lists the calendars (a failure
+/// fails the round), reconciles them with `stored`, then syncs each included
+/// calendar in table order, resuming from its token in `tokens` when it has one.
+async fn sync_round(
+    calendar: &dyn CalendarSource,
+    stored: &[CalendarEntry],
+    tokens: &BTreeMap<String, String>,
+    from: Timestamp,
+    to: Timestamp,
+) -> Result<SyncRound, CalendarError> {
+    let listed = calendar.list_calendars().await?;
+    let calendars = reconcile(stored, &listed);
+    let mut outcomes = Vec::new();
+    for c in calendars.iter().filter(|c| c.included) {
+        let token = tokens.get(&c.id).cloned();
+        let incremental = token.is_some();
+        let result = calendar.sync_calendar(c.id.clone(), token, from, to).await;
+        outcomes.push(CalendarOutcome {
+            calendar_id: c.id.clone(),
+            incremental,
+            result,
+        });
+    }
+    Ok(SyncRound {
+        calendars,
+        outcomes,
+    })
+}
+
+/// The store ops that turn the cursors `before` into `after`: a put for each new
+/// or changed cursor and a clear for each one gone.
+fn cursor_ops(
+    before: &BTreeMap<String, SyncCursor>,
+    after: &BTreeMap<String, SyncCursor>,
+) -> Vec<StoreOp> {
+    let cleared = before
+        .keys()
+        .filter(|id| !after.contains_key(*id))
+        .map(|calendar_id| StoreOp::ClearSyncCursor {
+            calendar_id: calendar_id.clone(),
+        });
+    let put = after
+        .values()
+        .filter(|c| before.get(&c.calendar_id) != Some(*c))
+        .map(|c| StoreOp::PutSyncCursor { cursor: c.clone() });
+    cleared.chain(put).collect()
 }
 
 /// The report of `date`: from `today` when given, else from the stored day

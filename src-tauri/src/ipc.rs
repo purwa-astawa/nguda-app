@@ -275,6 +275,18 @@ pub fn sign_in(engine: State<'_, EngineHandle>) -> Result<(), String> {
     send(&engine, Ok(sign_in_msg()))
 }
 
+/// Includes exactly `calendar_ids` in today's plan (R2), un-including every other
+/// listed calendar. Fire-and-forget: the new flags show in the snapshot's
+/// `calendars`. Unknown ids are ignored.
+#[tauri::command]
+#[specta::specta]
+pub fn set_included_calendars(
+    engine: State<'_, EngineHandle>,
+    calendar_ids: Vec<String>,
+) -> Result<(), String> {
+    send(&engine, Ok(set_included_calendars_msg(calendar_ids)))
+}
+
 /// The planned-versus-actual report of `date` (`YYYY-MM-DD`), or `null` when no
 /// such day is stored. Read-only (AD-16). A malformed date is an `Err` and sends
 /// nothing.
@@ -529,6 +541,10 @@ fn sign_in_msg() -> EngineMsg {
     EngineMsg::SignIn
 }
 
+fn set_included_calendars_msg(calendar_ids: Vec<String>) -> EngineMsg {
+    EngineMsg::SetIncludedCalendars { calendar_ids }
+}
+
 fn carry_over_to_tomorrow_msg(expected_rev: u32) -> EngineMsg {
     EngineMsg::CarryOverToTomorrow {
         expected_rev: expected_rev.into(),
@@ -605,6 +621,23 @@ pub struct SnapshotEvent {
     pub known_tags: Vec<String>,
     /// The Google account state. Never an address or a token.
     pub google: GoogleAccountView,
+    /// The account's calendars as last listed, in Google's order. Empty before
+    /// the first listing.
+    pub calendars: Vec<CalendarView>,
+}
+
+/// One calendar of the account and whether it feeds today's plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarView {
+    /// Google's calendar id.
+    pub id: String,
+    /// The name to show.
+    pub name: String,
+    /// The account's primary calendar.
+    pub primary: bool,
+    /// Its events feed today's plan.
+    pub included: bool,
 }
 
 /// What the app knows about the Google account.
@@ -1055,6 +1088,16 @@ impl From<&Snapshot> for SnapshotEvent {
             overflow: s.overflow.iter().map(ToString::to_string).collect(),
             known_tags: s.known_tags.clone(),
             google: s.google.into(),
+            calendars: s
+                .calendars
+                .iter()
+                .map(|c| CalendarView {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    primary: c.primary,
+                    included: c.included,
+                })
+                .collect(),
             status: s
                 .status
                 .iter()
@@ -1118,6 +1161,7 @@ pub fn specta_builder() -> Builder<Wry> {
             set_work_end,
             carry_over_to_tomorrow,
             sign_in,
+            set_included_calendars,
             current_snapshot,
             query_day,
             query_week,
@@ -1341,6 +1385,12 @@ mod tests {
             EngineMsg::CarryOverToTomorrow { expected_rev: 7 }
         );
         assert_eq!(sign_in_msg(), EngineMsg::SignIn);
+        assert_eq!(
+            set_included_calendars_msg(vec!["a@x".into(), "b#c@y".into()]),
+            EngineMsg::SetIncludedCalendars {
+                calendar_ids: vec!["a@x".into(), "b#c@y".into()]
+            }
+        );
         let anchor = |place, id: Option<&str>| InsertAnchorArg {
             place,
             item_id: id.map(Into::into),
@@ -1451,6 +1501,7 @@ mod tests {
             tags: Vec::new(),
             source: None,
             removed_by_source_at: None,
+            hidden_at: None,
         }
     }
 
@@ -1511,10 +1562,41 @@ mod tests {
             }],
             known_tags: vec!["meeting".into(), "old".into(), "Team".into()],
             google: GoogleAccount::SignedIn,
+            calendars: vec![
+                nguda_core::CalendarEntry {
+                    id: "me@example.com".into(),
+                    name: "Me".into(),
+                    primary: true,
+                    included: true,
+                },
+                nguda_core::CalendarEntry {
+                    id: "team@group".into(),
+                    name: "Team".into(),
+                    primary: false,
+                    included: false,
+                },
+            ],
         };
         let ev = SnapshotEvent::from(&snap);
         assert_eq!(ev.rev, 5);
         assert_eq!(ev.google, GoogleAccountView::SignedIn);
+        assert_eq!(
+            ev.calendars,
+            vec![
+                CalendarView {
+                    id: "me@example.com".into(),
+                    name: "Me".into(),
+                    primary: true,
+                    included: true,
+                },
+                CalendarView {
+                    id: "team@group".into(),
+                    name: "Team".into(),
+                    primary: false,
+                    included: false,
+                },
+            ]
+        );
         assert_eq!(ev.known_tags, ["meeting", "old", "Team"]);
         assert_eq!(ev.work_end, "18:05");
         assert_eq!(ev.overflow, [B]);
@@ -1661,6 +1743,7 @@ mod tests {
                 status: vec![],
                 known_tags: vec![],
                 google: GoogleAccountView::Unknown,
+                calendars: vec![],
             }
         );
     }

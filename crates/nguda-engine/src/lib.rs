@@ -80,20 +80,31 @@
 //! Calendar sync (CAP-2, AD-9, AD-17): the engine never awaits the calendar in
 //! a handler. [`EngineMsg::SignIn`] marks the account
 //! [`GoogleAccount::SigningIn`], publishes, and spawns the interactive sign-in.
-//! Syncs of the primary calendar are spawned at startup, after a successful
-//! sign-in, at rollover, when the poll deadline is due, and on wake. Each spawned
-//! task posts its result back through a weak inbox sender under a request id, and
-//! the actor drops any result whose id is not the latest it issued for that kind,
-//! and a sync result whose date is no longer today.
+//! Sync rounds are spawned at startup, after a successful sign-in, at rollover,
+//! when the poll deadline is due, on wake, and when
+//! [`EngineMsg::SetIncludedCalendars`] changes the selection. One round lists
+//! the account's calendars, reconciles them with the stored calendar table
+//! ([`nguda_core::reconcile`]: stored flags win, a new calendar is included iff
+//! it is primary, an unlisted one leaves the table), then syncs each included
+//! calendar in turn. Each spawned task posts its result back through a weak
+//! inbox sender under a request id, and the actor drops any result whose id is
+//! not the latest it issued for that kind, and a round whose date is no longer
+//! today. One round is in flight at most.
 //!
 //! The engine keeps one persisted [`nguda_core::SyncCursor`] per calendar (a
-//! Google sync token and the day it was issued for). A sync with a cursor from
-//! today is incremental; with none, or one from another day, it is a full fetch
-//! of today's window. An applied sync merges its changes into a copy of today
-//! with [`nguda_core::merge`] and commits, in one batch, the plan diff, one
-//! `CalendarChanged` day-log entry per touched item, and the new cursor (or its
-//! removal when Google sent no token). An unchanged plan and cursor commit and
-//! publish nothing. A `410` clears that calendar's cursor and re-fetches at once.
+//! Google sync token and the day it was issued for). A calendar with a cursor
+//! from today syncs incrementally; with none, or one from another day, it is a
+//! full fetch of today's window. An applied round merges each calendar's changes
+//! into a copy of today with [`nguda_core::merge`] and commits, in one batch, the
+//! calendar table, the plan diff, one `CalendarChanged` day-log entry per touched
+//! item, and every cursor change (a new token, or a removal when Google sent
+//! none or the calendar left the list). Nothing changed commits and publishes
+//! nothing. A `410` on one calendar clears its cursor and starts a new round at
+//! once.
+//!
+//! Un-including a calendar hides today's items of it that are pending with no
+//! time recorded ([`nguda_core::hide_calendar`]) and clears its cursor;
+//! re-including it fetches it in full, which revives them.
 //!
 //! Polling: while signed in and no sync is in flight, the next poll is a
 //! deadline [`POLL_EVERY`] ±[`JITTER`] after the last result, drawn from the
@@ -119,9 +130,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    CalendarError, CalendarSource, Clock, Date, Day, DayReport, ExportRange, FileSink, IdGen,
-    IsoWeek, ItemId, LockChoice, PromptId, PromptKind, Random, Running, Schedule, Store,
-    StoreError, SyncBatch, TimeZone, Timestamp, WeekReport, WorkEnd,
+    CalendarEntry, CalendarError, CalendarSource, Clock, Date, Day, DayReport, ExportRange,
+    FileSink, IdGen, IsoWeek, ItemId, LockChoice, PromptId, PromptKind, Random, Running, Schedule,
+    Store, StoreError, SyncBatch, TimeZone, Timestamp, WeekReport, WorkEnd,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -245,6 +256,12 @@ pub enum EngineMsg {
     /// events, failure sets [`StatusKey::Sync`]. A newer `SignIn` supersedes an
     /// older one still waiting. Not rev-checked.
     SignIn,
+    /// Includes exactly the listed calendars in the plan (R2); every other
+    /// calendar of the table is un-included. Ids not in the table are ignored.
+    /// A change commits the flags (un-included calendars' untracked pending items
+    /// of today hidden, their cursors cleared) in one batch and starts a new sync
+    /// round at once; the same selection changes nothing. Not rev-checked.
+    SetIncludedCalendars { calendar_ids: Vec<String> },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -333,6 +350,9 @@ pub struct Snapshot {
     pub known_tags: Vec<String>,
     /// The Google account state.
     pub google: GoogleAccount,
+    /// The account's calendars as last listed, in Google's order, with whether
+    /// each feeds the plan. Empty before the first listing.
+    pub calendars: Vec<CalendarEntry>,
 }
 
 /// The item the tray shows while nothing runs.
@@ -444,16 +464,30 @@ pub(crate) enum Inbox {
         id: u64,
         result: Result<(), CalendarError>,
     },
-    /// A sync task's result for `date`, tagged with its request id.
-    /// `incremental` names the calendar whose cursor the request used (`None`
-    /// for a full fetch). Only the latest sync's result applies, and only while
+    /// A sync round's result for `date`, tagged with its request id: the
+    /// listing failure, or the reconciled calendar table and each included
+    /// calendar's outcome. Only the latest round's result applies, and only while
     /// `date` is still today (AD-17).
     ImportFinished {
         id: u64,
         date: Date,
-        incremental: Option<String>,
-        result: Result<SyncBatch, CalendarError>,
+        result: Result<SyncRound, CalendarError>,
     },
+}
+
+/// One sync round's results: the calendar table after the listing, and the
+/// sync of each included calendar, in table order.
+pub(crate) struct SyncRound {
+    pub(crate) calendars: Vec<CalendarEntry>,
+    pub(crate) outcomes: Vec<CalendarOutcome>,
+}
+
+/// One calendar's sync in a round. `incremental` says whether it resumed from a
+/// cursor.
+pub(crate) struct CalendarOutcome {
+    pub(crate) calendar_id: String,
+    pub(crate) incremental: bool,
+    pub(crate) result: Result<SyncBatch, CalendarError>,
 }
 
 /// Cheap to clone: a sender for inputs and a receiver for snapshots.

@@ -14,9 +14,10 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use nguda_core::{
-    Baseline, BaselineItem, CalendarRef, Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus,
-    LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Segment, Settings, Span,
-    Store, StoreBatch, StoreError, StoreFuture, StoreOp, SyncCursor, Timestamp, Uuid, WorkEnd,
+    Baseline, BaselineItem, CalendarEntry, CalendarRef, Date, Day, DayLogEntry, DayLogKind, ItemId,
+    ItemStatus, LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Segment,
+    Settings, Span, Store, StoreBatch, StoreError, StoreFuture, StoreOp, SyncCursor, Timestamp,
+    Uuid, WorkEnd,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Params, Row, Transaction, params};
 use rusqlite_migration::{Migrations, SchemaVersion};
@@ -69,6 +70,7 @@ enum Request {
     LoadTagNames(oneshot::Sender<Result<Vec<String>, StoreError>>),
     StoredDates(oneshot::Sender<Result<Vec<Date>, StoreError>>),
     LoadSyncCursors(oneshot::Sender<Result<Vec<SyncCursor>, StoreError>>),
+    LoadCalendars(oneshot::Sender<Result<Vec<CalendarEntry>, StoreError>>),
 }
 
 /// The SQLite implementation of the [`Store`] port.
@@ -174,6 +176,11 @@ impl Store for SqliteStore {
     fn load_sync_cursors(&self) -> StoreFuture<Vec<SyncCursor>> {
         let (tx, rx) = oneshot::channel();
         self.call(Request::LoadSyncCursors(tx), rx)
+    }
+
+    fn load_calendars(&self) -> StoreFuture<Vec<CalendarEntry>> {
+        let (tx, rx) = oneshot::channel();
+        self.call(Request::LoadCalendars(tx), rx)
     }
 }
 
@@ -294,6 +301,9 @@ fn serve(mut conn: Connection, rx: mpsc::Receiver<Request>) {
             Request::LoadSyncCursors(reply) => {
                 let _ = reply.send(load_sync_cursors(&conn));
             }
+            Request::LoadCalendars(reply) => {
+                let _ = reply.send(load_calendars(&conn));
+            }
         }
     }
 }
@@ -353,9 +363,9 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                     r#"INSERT INTO plan_item
                          (id, day_date, title, planned_secs, "order", fixed, pinned_start,
                           status, removed_at, carried_from, calendar_id, source_id,
-                          instance_start, source_secs, removed_by_source_at)
+                          instance_start, source_secs, removed_by_source_at, hidden_at)
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                               ?15)
+                               ?15, ?16)
                        ON CONFLICT (id) DO UPDATE SET
                          title = excluded.title,
                          planned_secs = excluded.planned_secs,
@@ -369,7 +379,8 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                          source_id = excluded.source_id,
                          instance_start = excluded.instance_start,
                          source_secs = excluded.source_secs,
-                         removed_by_source_at = excluded.removed_by_source_at
+                         removed_by_source_at = excluded.removed_by_source_at,
+                         hidden_at = excluded.hidden_at
                        WHERE day_date = excluded.day_date"#,
                     params![
                         id.to_string(),
@@ -399,6 +410,7 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                         item.removed_by_source_at()
                             .map(|t| to_nanos(t, &ctx))
                             .transpose()?,
+                        item.hidden_at().map(|t| to_nanos(t, &ctx)).transpose()?,
                     ],
                 )
                 .map_err(sql_err(&ctx))?;
@@ -560,8 +572,42 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
             )
             .map_err(sql_err(&ctx))?;
         }
+        StoreOp::SetCalendars { calendars } => {
+            let ctx = "set calendars";
+            tx.execute("DELETE FROM calendar", [])
+                .map_err(sql_err(ctx))?;
+            for (position, c) in calendars.iter().enumerate() {
+                let position = i64::try_from(position)
+                    .map_err(|_| StoreError::new(format!("{ctx}: position out of range")))?;
+                tx.execute(
+                    "INSERT INTO calendar (calendar_id, name, is_primary, included, position)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![c.id, c.name, c.primary, c.included, position],
+                )
+                .map_err(sql_err(format!("{ctx}: calendar at position {position}")))?;
+            }
+        }
     }
     Ok(())
+}
+
+/// The stored calendar table in stored order. Errors never carry calendar ids or
+/// names (AD-14).
+fn load_calendars(conn: &Connection) -> Result<Vec<CalendarEntry>, StoreError> {
+    query_all(
+        conn,
+        "SELECT calendar_id, name, is_primary, included FROM calendar ORDER BY position",
+        [],
+        "load calendars",
+        |r| {
+            Ok(CalendarEntry {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                primary: r.get(2)?,
+                included: r.get(3)?,
+            })
+        },
+    )
 }
 
 /// Every stored sync cursor, by calendar id. Errors carry calendar ids only,
@@ -945,6 +991,7 @@ struct ItemRow {
     instance_start: Option<i64>,
     source_secs: Option<i64>,
     removed_by_source_at: Option<i64>,
+    hidden_at: Option<i64>,
 }
 
 fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
@@ -968,7 +1015,7 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
         conn,
         r#"SELECT id, title, planned_secs, "order", fixed, pinned_start, status, removed_at,
                   carried_from, calendar_id, source_id, instance_start, source_secs,
-                  removed_by_source_at
+                  removed_by_source_at, hidden_at
            FROM plan_item WHERE day_date = ?1 ORDER BY rowid"#,
         [&date_text],
         &ctx,
@@ -988,6 +1035,7 @@ fn load_day(conn: &Connection, date: Date) -> Result<Option<Day>, StoreError> {
                 instance_start: r.get(11)?,
                 source_secs: r.get(12)?,
                 removed_by_source_at: r.get(13)?,
+                hidden_at: r.get(14)?,
             })
         },
     )?;
@@ -1099,6 +1147,7 @@ fn restore_item(
             .removed_by_source_at
             .map(|n| from_nanos(n, &ctx))
             .transpose()?,
+        hidden_at: row.hidden_at.map(|n| from_nanos(n, &ctx)).transpose()?,
     };
     PlanItem::restore(record).map_err(|e| StoreError::new(e.to_string()))
 }

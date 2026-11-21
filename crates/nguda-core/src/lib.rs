@@ -29,8 +29,8 @@ mod test_support;
 
 pub use baseline::{Baseline, BaselineItem, LockChoice, LockDecision, baseline};
 pub use calendar::{
-    CalendarChange, CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource, EventKey,
-    FetchedEvent, SyncBatch, SyncCursor, merge,
+    CalendarChange, CalendarEntry, CalendarError, CalendarErrorKind, CalendarFuture, CalendarInfo,
+    CalendarSource, EventKey, FetchedEvent, SyncBatch, SyncCursor, hide_calendar, merge, reconcile,
 };
 pub use clock::{Clock, SleepFuture};
 pub use day_log::{DayLogEntry, DayLogKind};

@@ -12,6 +12,7 @@ import {
   lockDayCommand,
   mergeSnapshot,
   overflowItems,
+  includeCalendarCommand,
   signInCommand,
   withLock,
   workEndCommand,
@@ -72,6 +73,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
       break;
     case "signIn":
       res = await commands.signIn();
+      break;
+    case "setIncludedCalendars":
+      res = await commands.setIncludedCalendars(...cmd.args);
       break;
   }
   return res.status === "error" ? res.error : null;
@@ -245,6 +249,21 @@ function App() {
           <button type="button" disabled={google.busy} onClick={() => send(signInCommand())}>
             Sign in
           </button>
+        )}
+        {google.calendars.length > 0 && (
+          <fieldset className="calendars">
+            <legend>Calendars in today's plan</legend>
+            {google.calendars.map((c) => (
+              <label key={c.id}>
+                <input
+                  type="checkbox"
+                  checked={c.included}
+                  onChange={(e) => send(includeCalendarCommand(snap, c.id, e.target.checked))}
+                />
+                {c.name}
+              </label>
+            ))}
+          </fieldset>
         )}
       </section>
 

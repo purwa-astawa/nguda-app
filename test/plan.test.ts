@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   googleSection,
+  includeCalendarCommand,
   signInCommand,
   addCommand,
   asksLockChoice,
@@ -71,6 +72,7 @@ function snap(rev: number, items: Item[] = [F, A, B], running: Snapshot["running
     status: [],
     knownTags: [],
     google: "signedOut",
+    calendars: [],
   };
 }
 
@@ -406,9 +408,49 @@ test("tag suggestions are the known tags the item lacks, case-insensitively", ()
 
 test("the Google section follows the account state", () => {
   const at = (google: Snapshot["google"]) => googleSection({ ...snap(1), google });
-  assert.deepEqual(at("unknown"), { label: "Checking…", signIn: false, busy: false });
-  assert.deepEqual(at("signedOut"), { label: "Not signed in", signIn: true, busy: false });
-  assert.deepEqual(at("signingIn"), { label: "Waiting for browser…", signIn: true, busy: true });
-  assert.deepEqual(at("signedIn"), { label: "Signed in", signIn: false, busy: false });
+  const none = { calendars: [] };
+  assert.deepEqual(at("unknown"), { label: "Checking…", signIn: false, busy: false, ...none });
+  assert.deepEqual(at("signedOut"), { label: "Not signed in", signIn: true, busy: false, ...none });
+  assert.deepEqual(at("signingIn"), {
+    label: "Waiting for browser…",
+    signIn: true,
+    busy: true,
+    ...none,
+  });
+  assert.deepEqual(at("signedIn"), { label: "Signed in", signIn: false, busy: false, ...none });
   assert.deepEqual(signInCommand(), { name: "signIn", args: [] });
+});
+
+const calendars: Snapshot["calendars"] = [
+  { id: "me@example.com", name: "Me", primary: true, included: true },
+  { id: "team@group", name: "Team", primary: false, included: false },
+  { id: "x#holiday@group", name: "Holidays", primary: false, included: true },
+];
+
+test("the Google section lists the calendars only while signed in", () => {
+  const at = (google: Snapshot["google"]) => googleSection({ ...snap(1), google, calendars });
+  assert.deepEqual(at("signedIn").calendars, calendars);
+  assert.deepEqual(at("signedOut").calendars, []);
+  assert.deepEqual(at("unknown").calendars, []);
+  assert.deepEqual(at("signingIn").calendars, []);
+});
+
+test("toggling a calendar sends the full new included set in snapshot order", () => {
+  const s = { ...snap(1), google: "signedIn" as const, calendars };
+  assert.deepEqual(includeCalendarCommand(s, "team@group", true), {
+    name: "setIncludedCalendars",
+    args: [["me@example.com", "team@group", "x#holiday@group"]],
+  });
+  assert.deepEqual(includeCalendarCommand(s, "me@example.com", false), {
+    name: "setIncludedCalendars",
+    args: [["x#holiday@group"]],
+  });
+  assert.deepEqual(includeCalendarCommand(s, "x#holiday@group", false), {
+    name: "setIncludedCalendars",
+    args: [["me@example.com"]],
+  });
+  assert.deepEqual(includeCalendarCommand({ ...s, calendars: [] }, "me@example.com", true), {
+    name: "setIncludedCalendars",
+    args: [[]],
+  });
 });

@@ -5,6 +5,7 @@
 // Erasable TS only, so `node --test` runs this file directly.
 
 import type {
+  CalendarView,
   InsertAnchorArg_Serialize,
   ItemView_Serialize,
   LockChoiceArg,
@@ -46,7 +47,8 @@ export type Command =
     }
   | { name: "setWorkEnd"; args: [minutes: number] }
   | { name: "carryOverToTomorrow"; args: [expectedRev: number] }
-  | { name: "signIn"; args: [] };
+  | { name: "signIn"; args: [] }
+  | { name: "setIncludedCalendars"; args: [calendarIds: string[]] };
 
 /** Where an inserted task goes, as `insertTask` takes it. Never a numeric index. */
 export type InsertAnchor = InsertAnchorArg_Serialize;
@@ -328,20 +330,39 @@ export function scheduleLabel(item: Item, tz: string): string | null {
 }
 
 /** What the Google section shows for the snapshot's account state: its label,
- * whether a Sign in button shows, and whether that button is disabled. */
-export type GoogleSection = { label: string; signIn: boolean; busy: boolean };
+ * whether a Sign in button shows, whether that button is disabled, and the
+ * calendars to offer as checkboxes (signed in only, in the snapshot's order). */
+export type GoogleSection = {
+  label: string;
+  signIn: boolean;
+  busy: boolean;
+  calendars: CalendarView[];
+};
 
 export function googleSection(snap: Snapshot): GoogleSection {
   switch (snap.google) {
     case "unknown":
-      return { label: "Checking…", signIn: false, busy: false };
+      return { label: "Checking…", signIn: false, busy: false, calendars: [] };
     case "signedOut":
-      return { label: "Not signed in", signIn: true, busy: false };
+      return { label: "Not signed in", signIn: true, busy: false, calendars: [] };
     case "signingIn":
-      return { label: "Waiting for browser…", signIn: true, busy: true };
+      return { label: "Waiting for browser…", signIn: true, busy: true, calendars: [] };
     case "signedIn":
-      return { label: "Signed in", signIn: false, busy: false };
+      return { label: "Signed in", signIn: false, busy: false, calendars: snap.calendars };
   }
+}
+
+/** Ticks (`included`) or unticks calendar `calendarId`: sends the full set of
+ * included ids after the change, in the snapshot's order. */
+export function includeCalendarCommand(
+  snap: Snapshot,
+  calendarId: string,
+  included: boolean,
+): Command {
+  const ids = snap.calendars
+    .filter((c) => (c.id === calendarId ? included : c.included))
+    .map((c) => c.id);
+  return { name: "setIncludedCalendars", args: [ids] };
 }
 
 /** Signs in to Google; progress comes back in `snapshot.google`. */
