@@ -239,7 +239,7 @@ pub async fn consume(
 mod tests {
     use std::time::Duration;
 
-    use nguda_adapters::{FsFileSink, SqliteStore, SystemClock, UuidV7Ids};
+    use nguda_adapters::{FsFileSink, SqliteStore, StdRandom, SystemClock, UuidV7Ids};
     use nguda_core::{
         Date, Day, ItemStatus, LockChoice, NotifierError, OrderKey, PlanItem, Running, TimeZone,
         Timestamp, Uuid,
@@ -601,6 +601,7 @@ mod tests {
             ids: Arc::new(UuidV7Ids),
             files: Arc::new(FsFileSink),
             calendar: Arc::new(crate::IdleCalendar),
+            random: Arc::new(StdRandom::default()),
             tz: TimeZone::UTC,
         });
         let wait = Duration::from_secs(10);

@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nguda_core::{
-    CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource, FetchedEvent, SecretStore,
-    Timestamp,
+    CalendarChange, CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource, EventKey,
+    FetchedEvent, SecretStore, SyncBatch, Timestamp,
 };
 use oauth2::basic::{BasicClient, BasicRequestTokenError};
 use oauth2::{
@@ -158,13 +158,14 @@ impl CalendarSource for GcalSource {
         Box::pin(async move { inner.sign_in().await })
     }
 
-    fn fetch_primary(
+    fn sync_primary(
         &self,
+        cursor: Option<(String, String)>,
         window_start: Timestamp,
         window_end: Timestamp,
-    ) -> CalendarFuture<Vec<FetchedEvent>> {
+    ) -> CalendarFuture<SyncBatch> {
         let inner = self.inner.clone();
-        Box::pin(async move { inner.fetch_primary(window_start, window_end).await })
+        Box::pin(async move { inner.sync_primary(cursor, window_start, window_end).await })
     }
 }
 
@@ -365,6 +366,20 @@ impl Inner {
             *self.access.lock().unwrap() = None;
             return Err(auth("Google rejected the access token"));
         }
+        if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            return Err(CalendarError::new(
+                CalendarErrorKind::RateLimited,
+                format!("Google is limiting requests (HTTP {})", status.as_u16()),
+            ));
+        }
+        if status == reqwest::StatusCode::GONE {
+            return Err(CalendarError::new(
+                CalendarErrorKind::Gone,
+                "the calendar sync token expired (HTTP 410)",
+            ));
+        }
         if !status.is_success() {
             return Err(other(format!("Calendar API HTTP {}", status.as_u16())));
         }
@@ -384,47 +399,71 @@ impl Inner {
         Ok(url)
     }
 
-    async fn fetch_primary(
+    /// One sync of the primary calendar (see [`CalendarSource::sync_primary`]).
+    /// A full fetch looks the primary calendar's id up and lists the window's
+    /// events; an incremental one uses the cursor's calendar id and sync token
+    /// only. Both send `singleEvents` and `showDeleted`, never `orderBy`, follow
+    /// every page, and read `nextSyncToken` from the last one. GET only.
+    async fn sync_primary(
         &self,
+        cursor: Option<(String, String)>,
         window_start: Timestamp,
         window_end: Timestamp,
-    ) -> Result<Vec<FetchedEvent>, CalendarError> {
+    ) -> Result<SyncBatch, CalendarError> {
         let token = self.access_token().await?;
-        let primary: CalendarListEntry = self
-            .get(
-                self.api_url(&["users", "me", "calendarList", "primary"])?,
-                &token,
-            )
-            .await?;
-        let mut events = Vec::new();
+        let (calendar_id, sync_token) = match cursor {
+            Some((calendar_id, sync_token)) => (calendar_id, Some(sync_token)),
+            None => {
+                let primary: CalendarListEntry = self
+                    .get(
+                        self.api_url(&["users", "me", "calendarList", "primary"])?,
+                        &token,
+                    )
+                    .await?;
+                (primary.id, None)
+            }
+        };
+        let mut changes = Vec::new();
         let mut page_token: Option<String> = None;
-        loop {
+        let next_token = loop {
             // Path segments are percent-encoded, so any calendar id is safe.
-            let mut url = self.api_url(&["calendars", &primary.id, "events"])?;
+            let mut url = self.api_url(&["calendars", &calendar_id, "events"])?;
             {
                 let mut query = url.query_pairs_mut();
+                match &sync_token {
+                    Some(sync) => {
+                        query.append_pair("syncToken", sync);
+                    }
+                    None => {
+                        query
+                            .append_pair("timeMin", &window_start.to_string())
+                            .append_pair("timeMax", &window_end.to_string());
+                    }
+                }
                 query
-                    .append_pair("timeMin", &window_start.to_string())
-                    .append_pair("timeMax", &window_end.to_string())
                     .append_pair("singleEvents", "true")
-                    .append_pair("orderBy", "startTime")
+                    .append_pair("showDeleted", "true")
                     .append_pair("maxResults", "250");
                 if let Some(page) = &page_token {
                     query.append_pair("pageToken", page);
                 }
             }
             let page: EventsPage = self.get(url, &token).await?;
-            events.extend(
+            changes.extend(
                 page.items
                     .into_iter()
-                    .filter_map(|e| e.timed(&primary.id, window_start)),
+                    .filter_map(|e| e.change(&calendar_id, window_start, window_end)),
             );
             match page.next_page_token {
                 Some(next) if !next.is_empty() => page_token = Some(next),
-                _ => break,
+                _ => break page.next_sync_token.filter(|t| !t.is_empty()),
             }
-        }
-        Ok(events)
+        };
+        Ok(SyncBatch {
+            calendar_id,
+            changes,
+            next_token,
+        })
     }
 }
 
@@ -544,6 +583,7 @@ struct EventsPage {
     #[serde(default)]
     items: Vec<Event>,
     next_page_token: Option<String>,
+    next_sync_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -580,14 +620,40 @@ struct Attendee {
 }
 
 impl Event {
-    /// This event as a timed [`FetchedEvent`] of `calendar_id`, or `None` when it
-    /// is cancelled, all-day, declined by the account, does not end after it
-    /// starts, or starts before `window_start` (an event crossing midnight belongs
-    /// to the day it starts on, AD-6).
-    fn timed(self, calendar_id: &str, window_start: Timestamp) -> Option<FetchedEvent> {
+    /// This event as a change of `calendar_id`: a cancellation (keyed on its id and
+    /// a recurring instance's original start, whatever its time) or a timed upsert
+    /// (see [`Event::timed`]), or `None` when it is skipped.
+    fn change(
+        self,
+        calendar_id: &str,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> Option<CalendarChange> {
         if self.status.as_deref() == Some("cancelled") {
-            return None;
+            return Some(CalendarChange::Cancelled(EventKey {
+                calendar_id: calendar_id.to_owned(),
+                instance_start: self
+                    .original_start_time
+                    .as_ref()
+                    .and_then(EventTime::instant),
+                source_id: self.id,
+            }));
         }
+        self.timed(calendar_id, window_start, window_end)
+            .map(CalendarChange::Upsert)
+    }
+
+    /// This live event as a timed [`FetchedEvent`] of `calendar_id`, or `None` when
+    /// it is all-day, declined by the account, does not end after it starts, or
+    /// starts outside `[window_start, window_end)` (an event crossing midnight
+    /// belongs to the day it starts on, AD-6; one moved to another day is not
+    /// today's).
+    fn timed(
+        self,
+        calendar_id: &str,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> Option<FetchedEvent> {
         let declined = self
             .attendees
             .iter()
@@ -597,7 +663,7 @@ impl Event {
         }
         let start = self.start.as_ref()?.instant()?;
         let end = self.end.as_ref()?.instant()?;
-        if end <= start || start < window_start {
+        if end <= start || start < window_start || start >= window_end {
             return None;
         }
         Some(FetchedEvent {

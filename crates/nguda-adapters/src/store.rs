@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use nguda_core::{
     Baseline, BaselineItem, CalendarRef, Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus,
     LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Segment, Settings, Span,
-    Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
+    Store, StoreBatch, StoreError, StoreFuture, StoreOp, SyncCursor, Timestamp, Uuid, WorkEnd,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Params, Row, Transaction, params};
 use rusqlite_migration::{Migrations, SchemaVersion};
@@ -68,6 +68,7 @@ enum Request {
     LoadBaseline(Date, oneshot::Sender<Result<Option<Baseline>, StoreError>>),
     LoadTagNames(oneshot::Sender<Result<Vec<String>, StoreError>>),
     StoredDates(oneshot::Sender<Result<Vec<Date>, StoreError>>),
+    LoadSyncCursors(oneshot::Sender<Result<Vec<SyncCursor>, StoreError>>),
 }
 
 /// The SQLite implementation of the [`Store`] port.
@@ -168,6 +169,11 @@ impl Store for SqliteStore {
     fn stored_dates(&self) -> StoreFuture<Vec<Date>> {
         let (tx, rx) = oneshot::channel();
         self.call(Request::StoredDates(tx), rx)
+    }
+
+    fn load_sync_cursors(&self) -> StoreFuture<Vec<SyncCursor>> {
+        let (tx, rx) = oneshot::channel();
+        self.call(Request::LoadSyncCursors(tx), rx)
     }
 }
 
@@ -284,6 +290,9 @@ fn serve(mut conn: Connection, rx: mpsc::Receiver<Request>) {
             }
             Request::StoredDates(reply) => {
                 let _ = reply.send(stored_dates(&conn));
+            }
+            Request::LoadSyncCursors(reply) => {
+                let _ = reply.send(load_sync_cursors(&conn));
             }
         }
     }
@@ -456,6 +465,9 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
                 DayLogKind::CarriedOver { item_id, to } => {
                     (KIND_CARRIED_OVER, item_id, Some(*to), None)
                 }
+                DayLogKind::CalendarChanged { item_id } => {
+                    (KIND_CALENDAR_CHANGED, item_id, None, None)
+                }
             };
             tx.execute(
                 "INSERT INTO day_log (day_date, at, kind, item_id, to_item_id, secs)
@@ -528,8 +540,61 @@ fn apply(tx: &Transaction<'_>, op: &StoreOp) -> Result<(), StoreError> {
             }
         }
         StoreOp::PutBaseline { baseline } => put_baseline(tx, baseline)?,
+        StoreOp::PutSyncCursor { cursor } => {
+            let ctx = format!("put sync cursor for calendar {}", cursor.calendar_id);
+            tx.execute(
+                "INSERT INTO calendar_sync (calendar_id, sync_token, day_date)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (calendar_id) DO UPDATE SET
+                   sync_token = excluded.sync_token,
+                   day_date = excluded.day_date",
+                params![cursor.calendar_id, cursor.token, cursor.date.to_string()],
+            )
+            .map_err(sql_err(&ctx))?;
+        }
+        StoreOp::ClearSyncCursor { calendar_id } => {
+            let ctx = format!("clear sync cursor for calendar {calendar_id}");
+            tx.execute(
+                "DELETE FROM calendar_sync WHERE calendar_id = ?1",
+                [calendar_id],
+            )
+            .map_err(sql_err(&ctx))?;
+        }
     }
     Ok(())
+}
+
+/// Every stored sync cursor, by calendar id. Errors carry calendar ids only,
+/// never tokens (AD-13).
+fn load_sync_cursors(conn: &Connection) -> Result<Vec<SyncCursor>, StoreError> {
+    let ctx = "load sync cursors";
+    let rows = query_all(
+        conn,
+        "SELECT calendar_id, sync_token, day_date FROM calendar_sync ORDER BY calendar_id",
+        [],
+        ctx,
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
+    )?;
+    rows.into_iter()
+        .map(|(calendar_id, token, date)| {
+            let date = date.parse::<Date>().map_err(|_| {
+                StoreError::new(format!(
+                    "{ctx}: invalid stored date for calendar {calendar_id}"
+                ))
+            })?;
+            Ok(SyncCursor {
+                calendar_id,
+                token,
+                date,
+            })
+        })
+        .collect()
 }
 
 /// Plain INSERTs, so a second baseline for the date fails on its primary key and
@@ -679,6 +744,7 @@ const KIND_SWITCHED: &str = "switched";
 const KIND_EXTENDED: &str = "extended";
 const KIND_INSERTED: &str = "inserted";
 const KIND_CARRIED_OVER: &str = "carried_over";
+const KIND_CALENDAR_CHANGED: &str = "calendar_changed";
 
 fn last_alive_at(conn: &Connection) -> Result<Option<Timestamp>, StoreError> {
     let ctx = "load last alive";
@@ -779,9 +845,17 @@ fn load_day_log(conn: &Connection, date: Date) -> Result<Vec<DayLogEntry>, Store
                         .transpose()?
                         .ok_or_else(|| StoreError::new(format!("{ctx}: missing to_item_id")))?,
                 },
+                (KIND_CALENDAR_CHANGED, Some(item_id)) => DayLogKind::CalendarChanged {
+                    item_id: parse_id(&item_id)?,
+                },
                 (
-                    KIND_RECOVERED | KIND_REMOVED | KIND_SWITCHED | KIND_EXTENDED | KIND_INSERTED
-                    | KIND_CARRIED_OVER,
+                    KIND_RECOVERED
+                    | KIND_REMOVED
+                    | KIND_SWITCHED
+                    | KIND_EXTENDED
+                    | KIND_INSERTED
+                    | KIND_CARRIED_OVER
+                    | KIND_CALENDAR_CHANGED,
                     None,
                 ) => {
                     return Err(StoreError::new(format!("{ctx}: missing item id")));

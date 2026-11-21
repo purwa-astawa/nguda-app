@@ -6,7 +6,11 @@ mod notifier;
 mod secrets;
 mod store;
 
-use nguda_core::{Clock, IdGen, ItemId, PromptId, SleepFuture, Timestamp, Uuid};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use nguda_core::{Clock, IdGen, ItemId, PromptId, Random, SleepFuture, Timestamp, Uuid};
 
 pub use file_sink::FsFileSink;
 pub use gcal::{GcalConfig, GcalSource, OpenUrl, REFRESH_TOKEN_KEY, SCOPES};
@@ -46,6 +50,26 @@ impl IdGen for UuidV7Ids {
     }
 }
 
+/// Uniform randomness for the engine's poll jitter, from std's randomly keyed
+/// SipHash (`RandomState`) over a counter: no RNG crate. Not for secrets.
+#[derive(Debug, Default)]
+pub struct StdRandom {
+    counter: AtomicU64,
+}
+
+impl Random for StdRandom {
+    fn unit(&self) -> f64 {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(n);
+        // The top 53 bits fill an f64 mantissa exactly, so the result is in [0, 1).
+        let bits = hasher.finish() >> 11;
+        #[allow(clippy::cast_precision_loss)]
+        let unit = bits as f64 / (1u64 << 53) as f64;
+        unit
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +87,15 @@ mod tests {
             .sleep_until(start + std::time::Duration::from_millis(30))
             .await;
         assert!(Timestamp::now().duration_since(start).as_millis() >= 25);
+    }
+
+    #[test]
+    fn std_random_stays_in_the_unit_interval_and_varies() {
+        let random = StdRandom::default();
+        let draws: Vec<f64> = (0..1_000).map(|_| random.unit()).collect();
+        assert!(draws.iter().all(|u| (0.0..1.0).contains(u)));
+        let low = draws.iter().filter(|u| **u < 0.5).count();
+        assert!((300..700).contains(&low), "{low}");
     }
 
     #[test]

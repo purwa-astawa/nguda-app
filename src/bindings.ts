@@ -355,7 +355,7 @@ export type LockChoiceArg =
 
 export type LockDecisionView = "none" | "locked" | "noLock";
 
-export type MarkerKindView = "recovered" | "removed" | "switched" | "extended" | "inserted" | "carriedOver";
+export type MarkerKindView = "recovered" | "removed" | "switched" | "extended" | "inserted" | "carriedOver" | "calendarChanged";
 
 /**  One day-log entry. */
 export type MarkerView = MarkerView_Serialize | MarkerView_Deserialize;

@@ -16,6 +16,7 @@ mod next_task;
 mod notifier;
 mod order;
 mod plan;
+mod random;
 mod reflow;
 mod report;
 mod secrets;
@@ -28,7 +29,8 @@ mod test_support;
 
 pub use baseline::{Baseline, BaselineItem, LockChoice, LockDecision, baseline};
 pub use calendar::{
-    CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource, FetchedEvent, merge,
+    CalendarChange, CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource, EventKey,
+    FetchedEvent, SyncBatch, SyncCursor, merge,
 };
 pub use clock::{Clock, SleepFuture};
 pub use day_log::{DayLogEntry, DayLogKind};
@@ -44,6 +46,7 @@ pub use next_task::next_task;
 pub use notifier::{Notification, Notifier, NotifierError, PromptAction, PromptKind};
 pub use order::OrderKey;
 pub use plan::{Action, CalendarRef, Day, ItemId, ItemStatus, PlanItem, PlanItemRecord};
+pub use random::Random;
 pub use reflow::{Schedule, Slot, SlotKind, Span, reflow};
 pub use report::{ActualSegment, DayReport, PlannedSource, ReportRow, report};
 pub use secrets::{SecretStore, SecretStoreError};

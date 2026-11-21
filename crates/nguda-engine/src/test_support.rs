@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nguda_core::{
-    Baseline, CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource, Clock, Date, Day,
-    DayLogEntry, FetchedEvent, FileSink, FileSinkError, IdGen, ItemId, LockChoice, LockDecision,
-    OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, PromptId, Segment, Settings, SleepFuture,
-    Store, StoreBatch, StoreError, StoreFuture, StoreOp, Timestamp, Uuid, WorkEnd,
+    Baseline, CalendarChange, CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource,
+    Clock, Date, Day, DayLogEntry, FetchedEvent, FileSink, FileSinkError, IdGen, ItemId,
+    LockChoice, LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, PromptId, Random,
+    Segment, Settings, SleepFuture, Store, StoreBatch, StoreError, StoreFuture, StoreOp, SyncBatch,
+    SyncCursor, Timestamp, Uuid, WorkEnd,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -150,6 +151,8 @@ struct Data {
     /// Every tag name ever stored, in first-stored order, unique ASCII
     /// case-insensitively like the SQLite `NOCASE` column.
     tag_names: Vec<String>,
+    /// calendar id → its sync cursor.
+    cursors: BTreeMap<String, SyncCursor>,
 }
 
 impl Data {
@@ -303,6 +306,13 @@ impl Data {
                 }
                 self.baselines.insert(date, baseline.clone());
             }
+            StoreOp::PutSyncCursor { cursor } => {
+                self.cursors
+                    .insert(cursor.calendar_id.clone(), cursor.clone());
+            }
+            StoreOp::ClearSyncCursor { calendar_id } => {
+                self.cursors.remove(calendar_id);
+            }
         }
         Ok(())
     }
@@ -441,6 +451,26 @@ impl MemoryStore {
         data.day_log.extend(entries.into_iter().map(|e| (date, e)));
     }
 
+    /// Stores `cursor` as its calendar's sync cursor as is, bypassing batches.
+    pub(crate) fn seed_cursor(&self, cursor: SyncCursor) {
+        self.data
+            .lock()
+            .unwrap()
+            .cursors
+            .insert(cursor.calendar_id.clone(), cursor);
+    }
+
+    /// Every stored sync cursor, by calendar id.
+    pub(crate) fn stored_cursors(&self) -> Vec<SyncCursor> {
+        self.data
+            .lock()
+            .unwrap()
+            .cursors
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn seed_last_alive(&self, at: Option<Timestamp>) {
         self.data.lock().unwrap().last_alive = at;
     }
@@ -542,6 +572,10 @@ impl Store for MemoryStore {
     fn stored_dates(&self) -> StoreFuture<Vec<Date>> {
         self.read(|d| Ok(d.days.keys().copied().collect()))
     }
+
+    fn load_sync_cursors(&self) -> StoreFuture<Vec<SyncCursor>> {
+        self.read(|d| Ok(d.cursors.values().cloned().collect()))
+    }
 }
 
 pub(crate) const SINK_FAILURE: &str = "injected sink failure";
@@ -582,10 +616,15 @@ impl FileSink for FakeFileSink {
     }
 }
 
-type FetchReply = oneshot::Sender<Result<Vec<FetchedEvent>, CalendarError>>;
+/// The calendar id the fake's batches use.
+pub(crate) const CALENDAR: &str = "me@example.com";
+
+type FetchReply = oneshot::Sender<Result<SyncBatch, CalendarError>>;
 type SignInReply = oneshot::Sender<Result<(), CalendarError>>;
-/// A fetch's window and its pending reply (taken once resolved).
-type PendingFetch = ((Timestamp, Timestamp), Option<FetchReply>);
+/// What one sync call was given: the cursor `(calendar_id, token)` and the window.
+pub(crate) type SyncCall = (Option<(String, String)>, (Timestamp, Timestamp));
+/// A sync's inputs and its pending reply (taken once resolved).
+type PendingFetch = (SyncCall, Option<FetchReply>);
 
 /// A [`CalendarSource`] whose calls the test answers explicitly, one by one and
 /// in any order: each call waits on its own oneshot until resolved.
@@ -608,18 +647,41 @@ impl FakeCalendar {
         self.sign_ins.lock().unwrap().len()
     }
 
-    /// The window of fetch `n` (0-based).
+    /// The window of sync `n` (0-based).
     pub(crate) fn fetch_window(&self, n: usize) -> (Timestamp, Timestamp) {
-        self.fetches.lock().unwrap()[n].0
+        self.fetches.lock().unwrap()[n].0.1
     }
 
-    /// Answers fetch `n` (0-based) with `result`.
-    pub(crate) fn resolve_fetch(&self, n: usize, result: Result<Vec<FetchedEvent>, CalendarError>) {
+    /// The cursor `(calendar_id, token)` sync `n` (0-based) was given, `None` for
+    /// a full fetch.
+    pub(crate) fn fetch_cursor(&self, n: usize) -> Option<(String, String)> {
+        self.fetches.lock().unwrap()[n].0.0.clone()
+    }
+
+    /// Answers sync `n` (0-based) with `result`.
+    pub(crate) fn resolve_fetch(&self, n: usize, result: Result<SyncBatch, CalendarError>) {
         let reply = self.fetches.lock().unwrap()[n]
             .1
             .take()
             .expect("fetch already resolved");
         let _ = reply.send(result);
+    }
+
+    /// Answers sync `n` (0-based) with `events` as upserts of "me@example.com"
+    /// and no next token, or with the error.
+    pub(crate) fn resolve_events(
+        &self,
+        n: usize,
+        result: Result<Vec<FetchedEvent>, CalendarError>,
+    ) {
+        self.resolve_fetch(
+            n,
+            result.map(|events| SyncBatch {
+                calendar_id: CALENDAR.into(),
+                changes: events.into_iter().map(CalendarChange::Upsert).collect(),
+                next_token: None,
+            }),
+        );
     }
 
     /// Answers sign-in `n` (0-based) with `result`.
@@ -642,16 +704,36 @@ impl CalendarSource for FakeCalendar {
         Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
     }
 
-    fn fetch_primary(
+    fn sync_primary(
         &self,
+        cursor: Option<(String, String)>,
         window_start: Timestamp,
         window_end: Timestamp,
-    ) -> CalendarFuture<Vec<FetchedEvent>> {
+    ) -> CalendarFuture<SyncBatch> {
         let (tx, rx) = oneshot::channel();
         self.fetches
             .lock()
             .unwrap()
-            .push(((window_start, window_end), Some(tx)));
+            .push(((cursor, (window_start, window_end)), Some(tx)));
         Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
+    }
+}
+
+/// A [`Random`] answering a settable value, `0.5` (no jitter) by default.
+pub(crate) struct FixedRandom(Mutex<f64>);
+
+impl FixedRandom {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(0.5)))
+    }
+
+    pub(crate) fn set(&self, unit: f64) {
+        *self.0.lock().unwrap() = unit;
+    }
+}
+
+impl Random for FixedRandom {
+    fn unit(&self) -> f64 {
+        *self.0.lock().unwrap()
     }
 }

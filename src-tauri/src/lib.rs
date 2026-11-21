@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use nguda_adapters::{
     ActionCallback, FsFileSink, GcalConfig, GcalSource, KeyringSecretStore, OpenUrl, SqliteStore,
-    SystemClock, SystemNotifier, UuidV7Ids,
+    StdRandom, SystemClock, SystemNotifier, UuidV7Ids,
 };
 use nguda_core::{CalendarSource, Clock, Notifier, SecretStore, Store, TimeZone};
 use nguda_engine::{EngineDeps, EngineHandle};
@@ -85,6 +85,7 @@ pub fn run() {
                 ids: Arc::new(UuidV7Ids),
                 files: Arc::new(FsFileSink),
                 calendar,
+                random: Arc::new(StdRandom::default()),
                 tz: system_time_zone(),
             };
             // `nguda_engine::spawn` uses `tokio::spawn`, so enter Tauri's runtime first.
@@ -161,11 +162,12 @@ impl CalendarSource for IdleCalendar {
         Box::pin(std::future::pending())
     }
 
-    fn fetch_primary(
+    fn sync_primary(
         &self,
+        _cursor: Option<(String, String)>,
         _window_start: nguda_core::Timestamp,
         _window_end: nguda_core::Timestamp,
-    ) -> nguda_core::CalendarFuture<Vec<nguda_core::FetchedEvent>> {
+    ) -> nguda_core::CalendarFuture<nguda_core::SyncBatch> {
         Box::pin(std::future::pending())
     }
 }
