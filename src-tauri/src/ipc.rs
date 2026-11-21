@@ -39,9 +39,9 @@
 //! `"stale"`, which the view ignores.
 
 use nguda_core::{
-    BaselineItem, Date, Day, DayLogEntry, DayLogKind, DayReport, ExportRange, GapFigure, IsoWeek,
-    ItemId, ItemStatus, LockChoice, LockDecision, OAuthClient, PlanItem, PlannedSource, ReportRow,
-    Span, Timestamp, Uuid, WeekReport, closed_secs,
+    BaselineItem, CalendarEntry, CalendarErrorKind, Date, Day, DayLogEntry, DayLogKind, DayReport,
+    ExportRange, GapFigure, IsoWeek, ItemId, ItemStatus, LockChoice, LockDecision, OAuthClient,
+    PlanItem, PlannedSource, ReportRow, Span, Timestamp, Uuid, WeekReport, closed_secs,
 };
 use nguda_engine::{
     CalendarEvent, EngineHandle, EngineMsg, GoogleAccount, GoogleClient, InsertAnchor, QueryError,
@@ -382,10 +382,10 @@ pub async fn query_calendar_events(
 fn query_error_text(e: &QueryError) -> String {
     match e {
         QueryError::Stale => "stale".to_owned(),
-        QueryError::Calendar(nguda_core::CalendarErrorKind::RateLimited) => {
+        QueryError::Calendar(CalendarErrorKind::RateLimited) => {
             "Google is limiting requests; try again later".to_owned()
         }
-        QueryError::Calendar(nguda_core::CalendarErrorKind::NotSignedIn) => {
+        QueryError::Calendar(CalendarErrorKind::NotSignedIn) => {
             "not signed in to Google".to_owned()
         }
         QueryError::Calendar(_) => "could not list the calendar's events".to_owned(),
@@ -831,6 +831,17 @@ pub struct CalendarView {
     pub primary: bool,
     /// Its events feed today's plan.
     pub included: bool,
+}
+
+impl From<&CalendarEntry> for CalendarView {
+    fn from(c: &CalendarEntry) -> Self {
+        Self {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            primary: c.primary,
+            included: c.included,
+        }
+    }
 }
 
 /// What the app knows about the Google account.
@@ -1307,16 +1318,7 @@ impl From<&Snapshot> for SnapshotEvent {
             known_tags: s.known_tags.clone(),
             google: s.google.into(),
             google_client: (&s.google_client).into(),
-            calendars: s
-                .calendars
-                .iter()
-                .map(|c| CalendarView {
-                    id: c.id.clone(),
-                    name: c.name.clone(),
-                    primary: c.primary,
-                    included: c.included,
-                })
-                .collect(),
+            calendars: s.calendars.iter().map(CalendarView::from).collect(),
             status: s
                 .status
                 .iter()
@@ -1408,12 +1410,11 @@ pub fn export_bindings(builder: &Builder<Wry>, path: &str) -> Result<(), specta_
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use nguda_adapters::{FsFileSink, SqliteStore, StdRandom, SystemClock, UuidV7Ids};
-    use nguda_core::{CalendarRef, OrderKey, PlanItemRecord, Running, Segment, TimeZone, WorkEnd};
-    use nguda_engine::{EngineDeps, StatusEntry};
+    use nguda_adapters::SqliteStore;
+    use nguda_core::{CalendarRef, OrderKey, PlanItemRecord, Running, Segment, WorkEnd};
+    use nguda_engine::StatusEntry;
     use tokio::time::timeout;
 
     use super::*;
@@ -1784,18 +1785,23 @@ mod tests {
     const F: &str = "0192f3a0-0000-7000-8000-00000000000f";
     const R: &str = "0192f3a0-0000-7000-8000-000000000009";
 
+    /// An event `source_id` of "me@example.com", 1500 s long.
+    fn me_ref(source_id: &str) -> CalendarRef {
+        CalendarRef {
+            calendar_id: "me@example.com".into(),
+            source_id: source_id.into(),
+            instance_start: None,
+            source_secs: 1500,
+        }
+    }
+
     /// Fixed F (pinned), flexible A (running, 60 s banked) and B, and removed R.
     fn sample_day() -> Day {
         let f = PlanItemRecord {
             fixed: true,
             pinned_start: Some(ts("2026-11-11T08:00:00Z")),
             tags: vec!["meeting".into(), "Team".into()],
-            source: Some(CalendarRef {
-                calendar_id: "me@example.com".into(),
-                source_id: "standup".into(),
-                instance_start: None,
-                source_secs: 1500,
-            }),
+            source: Some(me_ref("standup")),
             ..record(F, "Standup", "V")
         };
         let a = PlanItemRecord {
@@ -1843,13 +1849,13 @@ mod tests {
                 available: true,
             },
             calendars: vec![
-                nguda_core::CalendarEntry {
+                CalendarEntry {
                     id: "me@example.com".into(),
                     name: "Me".into(),
                     primary: true,
                     included: true,
                 },
-                nguda_core::CalendarEntry {
+                CalendarEntry {
                     id: "team@group".into(),
                     name: "Team".into(),
                     primary: false,
@@ -2405,12 +2411,7 @@ mod tests {
         PlanItemRecord {
             fixed: true,
             pinned_start: Some(ts(pin)),
-            source: Some(CalendarRef {
-                calendar_id: "me@example.com".into(),
-                source_id: source_id.into(),
-                instance_start: None,
-                source_secs: 1500,
-            }),
+            source: Some(me_ref(source_id)),
             excluded: true,
             ..record(id, "Skipped", "V")
         }
@@ -2489,7 +2490,7 @@ mod tests {
             query_error_text(&QueryError::EngineClosed),
             "engine is not running"
         );
-        let other = query_error_text(&QueryError::Calendar(nguda_core::CalendarErrorKind::Other));
+        let other = query_error_text(&QueryError::Calendar(CalendarErrorKind::Other));
         assert_ne!(other, "stale");
         let marker = |kind| {
             marker_view(&DayLogEntry {
@@ -2526,16 +2527,7 @@ mod tests {
         let path = dir.path().join("nguda.sqlite3");
         let spawn = || {
             let store = SqliteStore::open(&path).unwrap();
-            nguda_engine::spawn(EngineDeps {
-                clock: Arc::new(SystemClock),
-                store: Arc::new(store),
-                ids: Arc::new(UuidV7Ids),
-                files: Arc::new(FsFileSink),
-                calendar: Arc::new(crate::IdleCalendar),
-                random: Arc::new(StdRandom::default()),
-                tz: TimeZone::UTC,
-            })
-            .0
+            nguda_engine::spawn(crate::test_deps(store)).0
         };
         let wait = Duration::from_secs(10);
 

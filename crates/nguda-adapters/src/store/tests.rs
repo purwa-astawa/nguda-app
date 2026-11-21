@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use nguda_core::{
     Baseline, BaselineItem, CalendarEntry, CalendarRef, Day, DayLogEntry, DayLogKind, ItemId,
-    LockDecision, OAuthClient, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, Settings, Span,
-    Store, StoreBatch, StoreOp, SyncCursor, Timestamp, Uuid, WorkEnd,
+    ItemStatus, LockDecision, OAuthClient, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord,
+    Settings, Span, Store, StoreBatch, StoreOp, SyncCursor, Timestamp, Uuid, WorkEnd,
+    hide_calendar,
 };
 use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
@@ -1386,15 +1387,20 @@ async fn stored_dates_lists_every_day_ascending() {
 
 /// An imported fixed item `n` from event `source_id`, pinned at 3_600 s.
 fn imported(n: u128, source_id: &str, instance_start: Option<Timestamp>) -> PlanItem {
+    PlanItem::restore(imported_record(n, source_id, instance_start)).unwrap()
+}
+
+/// The record of [`imported`].
+fn imported_record(n: u128, source_id: &str, instance_start: Option<Timestamp>) -> PlanItemRecord {
     let base = item(n, "V");
-    PlanItem::restore(PlanItemRecord {
+    PlanItemRecord {
         id: base.id(),
         title: base.title().to_owned(),
         planned_secs: 2_400,
         order: base.order().clone(),
         fixed: true,
         pinned_start: Some(ts(3_600)),
-        status: nguda_core::ItemStatus::Pending,
+        status: ItemStatus::Pending,
         removed_at: None,
         segments: Vec::new(),
         carried_from: None,
@@ -1409,8 +1415,7 @@ fn imported(n: u128, source_id: &str, instance_start: Option<Timestamp>) -> Plan
         hidden_at: None,
         excluded: false,
         added: false,
-    })
-    .unwrap()
+    }
 }
 
 #[tokio::test]
@@ -1733,7 +1738,7 @@ async fn a_hidden_item_round_trips_across_a_reopen() {
     let mut day = Day::new(other_date(), "UTC");
     day.add(imported(30, "ev1", None)).unwrap();
     day.add(imported(31, "ev2", None)).unwrap();
-    let hidden = nguda_core::hide_calendar(&mut day, "me@example.com", ts(5_000)).unwrap();
+    let hidden = hide_calendar(&mut day, "me@example.com", ts(5_000)).unwrap();
     assert_eq!(hidden, vec![id(30), id(31)]);
     store.commit(batch_for(&day)).await.unwrap();
     drop(store);
@@ -1765,24 +1770,10 @@ async fn excluded_and_added_flags_round_trip_and_update_across_a_reopen() {
     let store = seeded(&path).await;
     let mut day = Day::new(other_date(), "UTC");
     let flagged = |n, source_id, excluded, added| {
-        let i = imported(n, source_id, None);
         PlanItem::restore(PlanItemRecord {
-            id: i.id(),
-            title: i.title().to_owned(),
-            planned_secs: i.planned_secs(),
-            order: i.order().clone(),
-            fixed: i.fixed(),
-            pinned_start: i.pinned_start(),
-            status: i.status(),
-            removed_at: None,
-            segments: Vec::new(),
-            carried_from: None,
-            tags: i.tags().to_vec(),
-            source: i.source().cloned(),
-            removed_by_source_at: None,
-            hidden_at: None,
             excluded,
             added,
+            ..imported_record(n, source_id, None)
         })
         .unwrap()
     };

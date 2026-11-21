@@ -30,6 +30,11 @@ use nguda_adapters::{
     ActionCallback, FsFileSink, GcalConfig, GcalSource, KeyringSecretStore, OpenUrl, SqliteStore,
     StdRandom, SystemClock, SystemNotifier, UuidV7Ids,
 };
+#[cfg(test)]
+use nguda_core::{
+    CalendarChange, CalendarFuture, CalendarInfo, FetchedEvent, OAuthClient, SessionStore,
+    SyncBatch, Timestamp,
+};
 use nguda_core::{CalendarSource, Clock, Notifier, SecretStore, Store, TimeZone};
 use nguda_engine::{EngineDeps, EngineHandle};
 use tauri::{AppHandle, Manager};
@@ -154,25 +159,25 @@ fn open_url(app: AppHandle) -> OpenUrl {
 /// A calendar source that never answers, for shell tests that start a real
 /// engine: no import result ever bumps the rev under a test's feet.
 #[cfg(test)]
-pub(crate) struct IdleCalendar;
+struct IdleCalendar;
 
 #[cfg(test)]
 impl CalendarSource for IdleCalendar {
-    fn sign_in(&self) -> nguda_core::CalendarFuture<nguda_core::SessionStore> {
+    fn sign_in(&self) -> CalendarFuture<SessionStore> {
         Box::pin(std::future::pending())
     }
 
-    fn sign_out(&self) -> nguda_core::CalendarFuture<()> {
+    fn sign_out(&self) -> CalendarFuture<()> {
         Box::pin(std::future::pending())
     }
 
-    fn set_client(&self, _client: Option<nguda_core::OAuthClient>) {}
+    fn set_client(&self, _client: Option<OAuthClient>) {}
 
     fn has_client(&self) -> bool {
         false
     }
 
-    fn list_calendars(&self) -> nguda_core::CalendarFuture<Vec<nguda_core::CalendarInfo>> {
+    fn list_calendars(&self) -> CalendarFuture<Vec<CalendarInfo>> {
         Box::pin(std::future::pending())
     }
 
@@ -180,18 +185,18 @@ impl CalendarSource for IdleCalendar {
         &self,
         _calendar_id: String,
         _token: Option<String>,
-        _window_start: nguda_core::Timestamp,
-        _window_end: nguda_core::Timestamp,
-    ) -> nguda_core::CalendarFuture<nguda_core::SyncBatch> {
+        _window_start: Timestamp,
+        _window_end: Timestamp,
+    ) -> CalendarFuture<SyncBatch> {
         Box::pin(std::future::pending())
     }
 
     fn list_events(
         &self,
         _calendar_id: String,
-        _window_start: nguda_core::Timestamp,
-        _window_end: nguda_core::Timestamp,
-    ) -> nguda_core::CalendarFuture<Vec<nguda_core::FetchedEvent>> {
+        _window_start: Timestamp,
+        _window_end: Timestamp,
+    ) -> CalendarFuture<Vec<FetchedEvent>> {
         Box::pin(std::future::pending())
     }
 
@@ -199,10 +204,25 @@ impl CalendarSource for IdleCalendar {
         &self,
         _calendar_id: String,
         _event_id: String,
-        _window_start: nguda_core::Timestamp,
-        _window_end: nguda_core::Timestamp,
-    ) -> nguda_core::CalendarFuture<Option<nguda_core::CalendarChange>> {
+        _window_start: Timestamp,
+        _window_end: Timestamp,
+    ) -> CalendarFuture<Option<CalendarChange>> {
         Box::pin(std::future::pending())
+    }
+}
+
+/// The deps of a real engine on `store` for shell tests: the system clock, UTC,
+/// and a calendar source that never answers.
+#[cfg(test)]
+pub(crate) fn test_deps(store: SqliteStore) -> EngineDeps {
+    EngineDeps {
+        clock: Arc::new(SystemClock),
+        store: Arc::new(store),
+        ids: Arc::new(UuidV7Ids),
+        files: Arc::new(FsFileSink),
+        calendar: Arc::new(IdleCalendar),
+        random: Arc::new(StdRandom::default()),
+        tz: TimeZone::UTC,
     }
 }
 

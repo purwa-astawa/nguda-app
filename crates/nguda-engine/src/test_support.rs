@@ -375,6 +375,14 @@ impl Data {
 
 fn record_of(item: &PlanItem) -> PlanItemRecord {
     PlanItemRecord {
+        segments: Vec::new(),
+        ..full_record_of(item)
+    }
+}
+
+/// Every field of `item`, segments included.
+pub(crate) fn full_record_of(item: &PlanItem) -> PlanItemRecord {
+    PlanItemRecord {
         id: item.id(),
         title: item.title().to_owned(),
         planned_secs: item.planned_secs(),
@@ -383,7 +391,7 @@ fn record_of(item: &PlanItem) -> PlanItemRecord {
         pinned_start: item.pinned_start(),
         status: item.status(),
         removed_at: item.removed_at(),
-        segments: Vec::new(),
+        segments: item.segments().to_vec(),
         carried_from: item.carried_from(),
         tags: item.tags().to_vec(),
         source: item.source().cloned(),
@@ -787,7 +795,7 @@ impl FakeCalendar {
         let _ = reply.send(result);
     }
 
-    /// Answers sync `n` (0-based) with `events` as upserts of "me@example.com"
+    /// Answers sync `n` (0-based) with `events` as upserts of [`CALENDAR`]
     /// and no next token, or with the error.
     pub(crate) fn resolve_events(
         &self,

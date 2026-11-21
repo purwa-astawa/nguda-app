@@ -469,19 +469,14 @@ test("signed out with no client, Sign in is disabled with the explanation", () =
 });
 
 test("the OAuth client form trims, drops a blank secret, and clears on a blank id", () => {
-  assert.deepEqual(googleClientCommand(" abc ", " shh "), {
+  const client = (id: string | null, secret: string | null) => ({
     name: "setGoogleClient",
-    args: ["abc", "shh"],
+    args: [id, secret],
   });
-  assert.deepEqual(googleClientCommand("abc", "  "), {
-    name: "setGoogleClient",
-    args: ["abc", null],
-  });
-  assert.deepEqual(googleClientCommand("  ", "shh"), {
-    name: "setGoogleClient",
-    args: [null, null],
-  });
-  assert.deepEqual(clearGoogleClientCommand(), { name: "setGoogleClient", args: [null, null] });
+  assert.deepEqual(googleClientCommand(" abc ", " shh "), client("abc", "shh"));
+  assert.deepEqual(googleClientCommand("abc", "  "), client("abc", null));
+  assert.deepEqual(googleClientCommand("  ", "shh"), client(null, null));
+  assert.deepEqual(clearGoogleClientCommand(), client(null, null));
 });
 
 const calendars: Snapshot["calendars"] = [
@@ -500,22 +495,23 @@ test("the Google section lists the calendars only while signed in", () => {
 
 test("toggling a calendar sends the full new included set in snapshot order", () => {
   const s = { ...snap(1), google: "signedIn" as const, calendars };
-  assert.deepEqual(includeCalendarCommand(s, "team@group", true), {
-    name: "setIncludedCalendars",
-    args: [["me@example.com", "team@group", "x#holiday@group"]],
-  });
-  assert.deepEqual(includeCalendarCommand(s, "me@example.com", false), {
-    name: "setIncludedCalendars",
-    args: [["x#holiday@group"]],
-  });
-  assert.deepEqual(includeCalendarCommand(s, "x#holiday@group", false), {
-    name: "setIncludedCalendars",
-    args: [["me@example.com"]],
-  });
-  assert.deepEqual(includeCalendarCommand({ ...s, calendars: [] }, "me@example.com", true), {
-    name: "setIncludedCalendars",
-    args: [[]],
-  });
+  const included = (...ids: string[]) => ({ name: "setIncludedCalendars", args: [ids] });
+  assert.deepEqual(
+    includeCalendarCommand(s, "team@group", true),
+    included("me@example.com", "team@group", "x#holiday@group"),
+  );
+  assert.deepEqual(
+    includeCalendarCommand(s, "me@example.com", false),
+    included("x#holiday@group"),
+  );
+  assert.deepEqual(
+    includeCalendarCommand(s, "x#holiday@group", false),
+    included("me@example.com"),
+  );
+  assert.deepEqual(
+    includeCalendarCommand({ ...s, calendars: [] }, "me@example.com", true),
+    included(),
+  );
 });
 
 test("the picker offers the non-included calendars only while signed in", () => {

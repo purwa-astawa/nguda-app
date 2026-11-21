@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nguda_core::{Clock, IdGen, ItemId, PromptId, Random, SleepFuture, Timestamp, Uuid};
 
 pub use file_sink::FsFileSink;
-pub use gcal::{GcalConfig, GcalSource, OpenUrl, REFRESH_TOKEN_KEY, SCOPES};
+pub use gcal::{GcalConfig, GcalSource, OpenUrl};
 pub use notifier::{ActionCallback, SystemNotifier};
 pub use secrets::KeyringSecretStore;
 pub use store::{OpenError, SqliteStore};

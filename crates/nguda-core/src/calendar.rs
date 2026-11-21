@@ -4,11 +4,12 @@
 //! Field ownership: Google owns an imported item's `title`, its pin (only while the
 //! item is still fixed), its source length, and cancellation. `planned_secs` moves
 //! by the change in the source length, so a local extension stays. The user owns
-//! `fixed`, `tags`, and `order`, which the merge never touches; `status` changes
-//! only when Google explicitly cancels a pending or paused item. An imported item
-//! the user removed stays removed and is never re-added. An event missing from a
-//! sync is never removed or changed. The merge changes the plan only, never a
-//! baseline.
+//! `fixed`, `tags`, and `order`, which the merge never touches; the merge changes
+//! `status` only when Google explicitly cancels a pending or paused item, or when a
+//! re-import revives an item hidden by un-including its calendar ([`hide_calendar`]).
+//! An imported item the user removed stays removed through any merge; only an
+//! explicit [`add_event`] revives it. An event missing from a sync is never removed
+//! or changed. The merge changes the plan only, never a baseline.
 
 use std::fmt;
 use std::future::Future;
@@ -130,7 +131,7 @@ impl fmt::Debug for SyncBatch {
 pub enum CalendarErrorKind {
     /// No account is signed in (no refresh token stored).
     NotSignedIn,
-    /// The build has no OAuth client to sign in with.
+    /// No OAuth client (neither the user's own nor a built-in one) to sign in with.
     NoClient,
     /// Signing in or refreshing the access token failed.
     Auth,
@@ -451,7 +452,7 @@ pub fn merge(
                 }
             }
             CalendarChange::Cancelled(key) => {
-                if let Some(id) = known(day, key).map(|(id, _)| id)
+                if let Some(id) = known_item(day, key).map(PlanItem::id)
                     && day.remove_by_source(id, now)?
                 {
                     touch(id);
@@ -460,11 +461,6 @@ pub fn merge(
         }
     }
     Ok(touched)
-}
-
-/// The id and status of the item imported from `key`, if any.
-fn known(day: &Day, key: &EventKey) -> Option<(ItemId, ItemStatus)> {
-    known_item(day, key).map(|i| (i.id(), i.status()))
 }
 
 /// The item imported from `key`, if any.
@@ -567,12 +563,15 @@ fn last_order(day: &Day) -> Option<&OrderKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::PlanItemRecord;
     use crate::test_support::{id, key, ts};
     use jiff::civil::date;
 
+    const ME: &str = "me@example.com";
+
     fn event(source_id: &str, title: &str, start: i64, end: i64) -> FetchedEvent {
         FetchedEvent {
-            calendar_id: "me@example.com".into(),
+            calendar_id: ME.into(),
             source_id: source_id.into(),
             instance_start: None,
             title: title.into(),
@@ -635,7 +634,7 @@ mod tests {
         assert_eq!(i.planned_secs(), 1_800);
         let source = i.source().unwrap();
         assert_eq!(source.source_secs, 1_800);
-        assert_eq!(source.calendar_id, "me@example.com");
+        assert_eq!(source.calendar_id, ME);
         assert_eq!(source.source_id, "e1");
         assert_eq!(source.instance_start, None);
         assert_eq!(i.removed_by_source_at(), None);
@@ -769,7 +768,7 @@ mod tests {
 
     fn cancel(source_id: &str) -> CalendarChange {
         CalendarChange::Cancelled(EventKey {
-            calendar_id: "me@example.com".into(),
+            calendar_id: ME.into(),
             source_id: source_id.into(),
             instance_start: None,
         })
@@ -806,8 +805,8 @@ mod tests {
         d
     }
 
-    fn record_of(i: &PlanItem) -> crate::plan::PlanItemRecord {
-        crate::plan::PlanItemRecord {
+    fn record_of(i: &PlanItem) -> PlanItemRecord {
+        PlanItemRecord {
             id: i.id(),
             title: i.title().to_owned(),
             planned_secs: i.planned_secs(),
@@ -922,7 +921,7 @@ mod tests {
         let mut d = imported_with(ItemStatus::Pending);
         let before = d.clone();
         let mut other_instance = EventKey {
-            calendar_id: "me@example.com".into(),
+            calendar_id: ME.into(),
             source_id: "e1".into(),
             instance_start: Some(ts(3_600)),
         };
@@ -959,7 +958,7 @@ mod tests {
         b.instance_start = Some(ts(90_000));
         merge_events(&mut d, &[a, b], ids()).unwrap();
         let key = EventKey {
-            calendar_id: "me@example.com".into(),
+            calendar_id: ME.into(),
             source_id: "r1".into(),
             instance_start: Some(ts(90_000)),
         };
@@ -1354,7 +1353,7 @@ mod tests {
         d.remove(id(1001), ts(10)).unwrap();
         let calendars = [
             entry("other@example.com", false, false),
-            entry("me@example.com", true, true),
+            entry(ME, true, true),
         ];
         assert_eq!(
             added_refs(&d, &calendars),
@@ -1364,7 +1363,7 @@ mod tests {
             added_refs(&d, &[]),
             vec![
                 ("other@example.com".to_owned(), "o1".to_owned()),
-                ("me@example.com".to_owned(), "e1".to_owned()),
+                (ME.to_owned(), "e1".to_owned()),
             ]
         );
     }
@@ -1372,28 +1371,28 @@ mod tests {
     #[test]
     fn a_sync_batch_debug_never_prints_the_token() {
         let batch = SyncBatch {
-            calendar_id: "me@example.com".into(),
+            calendar_id: ME.into(),
             changes: Vec::new(),
             next_token: Some("secret-sync-token".into()),
         };
         let printed = format!("{batch:?}");
-        assert!(printed.contains("me@example.com"));
+        assert!(printed.contains(ME));
         assert!(!printed.contains("secret-sync-token"));
     }
 
     #[test]
     fn a_sync_cursor_debug_never_prints_the_token() {
         let cursor = SyncCursor {
-            calendar_id: "me@example.com".into(),
+            calendar_id: ME.into(),
             token: "secret-sync-token".into(),
             date: date(2026, 11, 21),
         };
         let printed = format!("{cursor:?}");
-        assert!(printed.contains("me@example.com"));
+        assert!(printed.contains(ME));
         assert!(printed.contains("2026-11-21"));
         assert!(!printed.contains("secret-sync-token"));
         let op = format!("{:?}", crate::store::StoreOp::PutSyncCursor { cursor });
-        assert!(op.contains("me@example.com"));
+        assert!(op.contains(ME));
         assert!(!op.contains("secret-sync-token"));
     }
 

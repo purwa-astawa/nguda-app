@@ -239,12 +239,12 @@ pub async fn consume(
 mod tests {
     use std::time::Duration;
 
-    use nguda_adapters::{FsFileSink, SqliteStore, StdRandom, SystemClock, UuidV7Ids};
+    use nguda_adapters::SqliteStore;
     use nguda_core::{
-        Date, Day, ItemStatus, LockChoice, NotifierError, OrderKey, PlanItem, Running, TimeZone,
-        Timestamp, Uuid,
+        Date, Day, ItemStatus, LockChoice, NotifierError, OrderKey, PlanItem, Running, Timestamp,
+        Uuid,
     };
-    use nguda_engine::{EngineDeps, StatusKey};
+    use nguda_engine::StatusKey;
     use tokio::time::timeout;
 
     use super::*;
@@ -595,15 +595,7 @@ mod tests {
     async fn a_click_after_a_later_commit_is_rejected_as_stale() {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(dir.path().join("nguda.sqlite3")).unwrap();
-        let (engine, _effects) = nguda_engine::spawn(EngineDeps {
-            clock: Arc::new(SystemClock),
-            store: Arc::new(store),
-            ids: Arc::new(UuidV7Ids),
-            files: Arc::new(FsFileSink),
-            calendar: Arc::new(crate::IdleCalendar),
-            random: Arc::new(StdRandom::default()),
-            tz: TimeZone::UTC,
-        });
+        let (engine, _effects) = nguda_engine::spawn(crate::test_deps(store));
         let wait = Duration::from_secs(10);
         let mut rx = engine.subscribe();
 
