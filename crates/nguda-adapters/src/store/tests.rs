@@ -1007,11 +1007,8 @@ async fn a_carried_over_entry_without_a_target_fails_the_load() {
 
 // --- Day lock and baseline ---
 
-fn set_decision(decision: LockDecision) -> StoreOp {
-    StoreOp::SetLockDecision {
-        date: date(),
-        decision,
-    }
+fn set_decision(date: nguda_core::Date, decision: LockDecision) -> StoreOp {
+    StoreOp::SetLockDecision { date, decision }
 }
 
 /// A baseline of `sample_day` at `locked_at`: the running item with a span, then
@@ -1046,7 +1043,7 @@ async fn the_lock_decision_and_baseline_round_trip_across_a_reopen() {
     assert_eq!(store.load_baseline(date()).await.unwrap(), None);
     store
         .commit(batch([
-            set_decision(LockDecision::Locked),
+            set_decision(date(), LockDecision::Locked),
             StoreOp::PutBaseline {
                 baseline: sample_baseline(700),
             },
@@ -1073,10 +1070,7 @@ async fn the_lock_decision_and_baseline_round_trip_across_a_reopen() {
     let other = store.load_day(other_date()).await.unwrap().unwrap();
     assert_eq!(other.lock_decision(), LockDecision::None);
     store
-        .commit(batch([StoreOp::SetLockDecision {
-            date: other_date(),
-            decision: LockDecision::NoLock,
-        }]))
+        .commit(batch([set_decision(other_date(), LockDecision::NoLock)]))
         .await
         .unwrap();
     let other = store.load_day(other_date()).await.unwrap().unwrap();
@@ -1096,7 +1090,7 @@ async fn a_second_baseline_for_a_date_rolls_back_the_whole_batch() {
         .unwrap();
     let err = store
         .commit(batch([
-            set_decision(LockDecision::Locked),
+            set_decision(date(), LockDecision::Locked),
             StoreOp::PutBaseline {
                 baseline: sample_baseline(900),
             },
@@ -1133,10 +1127,7 @@ async fn a_baseline_of_an_unknown_day_or_item_rolls_back() {
     assert_eq!(store.load_baseline(date()).await.unwrap(), None);
     // A decision for an unknown day is refused too.
     let err = store
-        .commit(batch([StoreOp::SetLockDecision {
-            date: other_date(),
-            decision: LockDecision::Locked,
-        }]))
+        .commit(batch([set_decision(other_date(), LockDecision::Locked)]))
         .await
         .unwrap_err();
     assert!(err.message.contains("no such day"), "{err}");
@@ -1210,12 +1201,12 @@ async fn a_second_lock_decision_fails_and_rolls_back_its_batch() {
     let path = db(&dir);
     let store = seeded(&path).await;
     store
-        .commit(batch([set_decision(LockDecision::NoLock)]))
+        .commit(batch([set_decision(date(), LockDecision::NoLock)]))
         .await
         .unwrap();
     let err = store
         .commit(batch([
-            set_decision(LockDecision::Locked),
+            set_decision(date(), LockDecision::Locked),
             StoreOp::PutBaseline {
                 baseline: sample_baseline(700),
             },

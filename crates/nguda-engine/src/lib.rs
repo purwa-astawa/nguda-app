@@ -56,9 +56,10 @@
 //! clones its committed day, then spawns a task that loads what else it needs
 //! (the day itself for any other date, the baseline of a locked day, and the day
 //! log), builds [`nguda_core::report`] for each date, and replies. A week query
-//! builds the reports of its seven dates in order (a date with no stored day is
-//! skipped, and the first store error fails the whole query), then folds them
-//! with [`nguda_core::week_report`]. A query is read-only: no commit, no rev
+//! builds the reports of its dates up to today in order (a later date, such as a
+//! carried-over tomorrow, is skipped, as is a date with no stored day; the first
+//! store error fails the whole query), then folds them with
+//! [`nguda_core::week_report`]. A query is read-only: no commit, no rev
 //! bump, no publish, and no status change.
 //!
 //! Export (AD-16, CAP-9): [`EngineMsg::ExportCsv`] is fire-and-forget like any

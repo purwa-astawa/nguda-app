@@ -80,9 +80,9 @@ const TABS: { value: Tab; label: string }[] = [
   { value: "week", label: "Week" },
 ];
 
-// Thin view (AD-5): it keeps only the newest snapshot, the shown summary's and
-// week's query results, and local form state; it shows items in the order given
-// and sends every change as a command.
+// Thin view (AD-5): it keeps only the newest snapshot, the Summary and Week tabs'
+// picked dates, and local form state; it shows items in the order given and sends
+// every change as a command.
 function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);

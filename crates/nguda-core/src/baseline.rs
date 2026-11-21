@@ -32,7 +32,7 @@ pub enum LockChoice {
 
 impl LockChoice {
     /// The decision this choice makes.
-    pub fn decision(self) -> LockDecision {
+    pub(crate) fn decision(self) -> LockDecision {
         match self {
             Self::Lock => LockDecision::Locked,
             Self::NoLock => LockDecision::NoLock,
@@ -86,23 +86,7 @@ mod tests {
     use super::*;
     use crate::error::DomainError;
     use crate::plan::{ItemStatus, PlanItem, PlanItemRecord};
-    use crate::test_support::{closed, id, key, ts};
-
-    fn record(n: u128, planned_secs: u64, order: &str) -> PlanItemRecord {
-        PlanItemRecord {
-            id: id(n),
-            title: format!("item {n}"),
-            planned_secs,
-            order: key(order),
-            fixed: false,
-            pinned_start: None,
-            status: ItemStatus::Pending,
-            removed_at: None,
-            segments: Vec::new(),
-            carried_from: None,
-            tags: Vec::new(),
-        }
-    }
+    use crate::test_support::{closed, id, record, ts};
 
     fn day(records: Vec<PlanItemRecord>) -> Day {
         let items = records.into_iter().map(|r| PlanItem::restore(r).unwrap());

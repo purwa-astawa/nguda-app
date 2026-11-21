@@ -91,8 +91,9 @@ impl IsoWeek {
         Self::containing(self.end().checked_add(1.day()).ok()?)
     }
 
-    /// `new` checked that every weekday exists, so this cannot fail; it falls
-    /// back to the Monday rather than panic.
+    /// `new` checked the Monday and the Sunday exist, so every weekday between
+    /// does too; this cannot fail, and falls back to the Monday rather than
+    /// panic.
     fn date(self, weekday: Weekday) -> Date {
         ISOWeekDate::new(self.year, self.week, weekday)
             .or_else(|_| ISOWeekDate::new(self.year, self.week, Weekday::Monday))

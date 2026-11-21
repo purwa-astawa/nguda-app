@@ -2,21 +2,24 @@
 //! commands, the work-end setting and overflow, and the day and week queries), and the
 //! exactly-once effect check. All run against `MemoryStore` in UTC.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    Baseline, BaselineItem, Date, Day, DayLogEntry, DayLogKind, ItemId, ItemStatus, LockChoice,
-    LockDecision, OrderKey, PlanItem, PromptKind, Segment, SlotKind, StoreOp, TimeZone, WorkEnd,
+    ActualSegment, Baseline, BaselineItem, Date, Day, DayLogEntry, DayLogKind, ExportRange,
+    GapFigure, IsoWeek, ItemId, ItemStatus, LockChoice, LockDecision, OrderKey, PlanItem,
+    PlannedSource, PromptKind, ReportRow, Segment, SlotKind, Span, StoreError, StoreOp, TagGap,
+    TimeZone, WorkEnd, export_csv,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::test_support::{
-    FakeClock, FakeFileSink, INJECTED, MemoryStore, SeqIds, day_running_other, day1, day2, id,
-    item, key, no_lock, prompt, ts,
+    FakeClock, FakeFileSink, INJECTED, MemoryStore, SINK_FAILURE, SeqIds, day_running_other, day1,
+    day2, id, item, key, locked, no_lock, prompt, ts,
 };
 use crate::{
-    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, InsertAnchor, NextItem,
+    Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, InsertAnchor, NextItem, QueryError,
     ReorderAnchor, Snapshot, StatusEntry, StatusKey, spawn,
 };
 
@@ -227,11 +230,7 @@ async fn create_task_with_a_blank_title_or_zero_secs_is_rejected() {
 }
 
 fn abc_day() -> Day {
-    let mut day = no_lock(Day::new(day1(), "UTC"));
-    day.add(item(100, "A", "U")).unwrap();
-    day.add(item(101, "B", "V")).unwrap();
-    day.add(item(102, "C", "W")).unwrap();
-    day
+    no_lock(undecided_abc())
 }
 
 fn edit(n: u128, title: Option<&str>, planned_secs: Option<u64>) -> EngineMsg {
@@ -2292,16 +2291,11 @@ fn undecided_abc() -> Day {
     day
 }
 
-fn locked(mut day: Day) -> Day {
-    day.decide_lock(LockChoice::Lock).unwrap();
-    day
-}
-
 fn frozen(n: u128, planned_secs: u64, from: i64, to: i64) -> BaselineItem {
     BaselineItem {
         item_id: id(n),
         planned_secs,
-        span: Some(nguda_core::Span {
+        span: Some(Span {
             start: ts(from),
             end: ts(to),
         }),
@@ -2638,10 +2632,6 @@ async fn a_second_baseline_for_a_date_fails_and_rolls_back_its_batch() {
 
 // --- Day query (AD-4, AD-16) ---
 
-use nguda_core::{ActualSegment, PlannedSource, ReportRow};
-
-use crate::QueryError;
-
 /// A report row's id, status, planned, source, actual and difference.
 type RowFigures = (
     ItemId,
@@ -2839,7 +2829,7 @@ async fn a_failed_load_is_a_store_error_and_leaves_state_and_status_untouched() 
     let batches = store.batches().len();
 
     store.fail_load_day(true);
-    let err = QueryError::Store(nguda_core::StoreError::new(INJECTED));
+    let err = QueryError::Store(StoreError::new(INJECTED));
     assert_eq!(h.engine.query_day(day1()).await, Err(err.clone()));
     store.fail_load_day(false);
     // Today comes from memory, but its log still has to be read.
@@ -2855,8 +2845,6 @@ async fn a_failed_load_is_a_store_error_and_leaves_state_and_status_untouched() 
 }
 
 // --- Week query (AD-4, AD-6, AD-16) ---
-
-use nguda_core::{GapFigure, IsoWeek, TagGap};
 
 /// 1970-W01: Monday 1969-12-29 to Sunday 1970-01-04, holding day 1 and day 2.
 fn week1() -> IsoWeek {
@@ -2963,7 +2951,7 @@ async fn a_failed_load_fails_the_week_and_leaves_state_and_status_untouched() {
     h.rev(1).await;
     let batches = store.batches().len();
 
-    let err = QueryError::Store(nguda_core::StoreError::new(INJECTED));
+    let err = QueryError::Store(StoreError::new(INJECTED));
     store.fail_load_day(true);
     assert_eq!(h.engine.query_week(week1()).await, Err(err.clone()));
     store.fail_load_day(false);
@@ -2974,12 +2962,6 @@ async fn a_failed_load_fails_the_week_and_leaves_state_and_status_untouched() {
 }
 
 // --- CSV export (AD-16, CAP-9) ---
-
-use std::path::PathBuf;
-
-use nguda_core::{ExportRange, export_csv};
-
-use crate::test_support::SINK_FAILURE;
 
 const CSV_HEAD: &str = "\u{feff}date,title,tags,planned_secs,planned_source,actual_secs\r\n";
 
@@ -3117,21 +3099,16 @@ async fn a_failed_store_read_sets_the_export_status_and_writes_nothing() {
     let batches = store.batches().len();
     store.fail_load_day(true);
     h.send(export("/tmp/out.csv", ExportRange::Week(week1())));
+    let failed = format!("Export failed: {INJECTED}");
     let snap = h.rev(2).await;
-    assert_eq!(
-        export_status(&snap),
-        Some(format!("Export failed: {INJECTED}").as_str())
-    );
+    assert_eq!(export_status(&snap), Some(failed.as_str()));
     assert_eq!(snap.status.len(), 1, "no Store or CommandRejected status");
     store.fail_load_day(false);
 
     store.fail_loads(true);
     h.send(export("/tmp/out.csv", ExportRange::All));
     let snap = h.rev(3).await;
-    assert_eq!(
-        export_status(&snap),
-        Some(format!("Export failed: {INJECTED}").as_str())
-    );
+    assert_eq!(export_status(&snap), Some(failed.as_str()));
     store.fail_loads(false);
     h.expect_no_effect().await;
     assert!(h.files.writes().is_empty());

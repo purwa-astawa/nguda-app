@@ -221,23 +221,7 @@ mod tests {
     use crate::clock::Clock;
     use crate::plan::PlanItemRecord;
     use crate::segment::Segment;
-    use crate::test_support::{FakeClock, closed, id, key, ts};
-
-    fn record(n: u128, planned_secs: u64, order: &str) -> PlanItemRecord {
-        PlanItemRecord {
-            id: id(n),
-            title: format!("item {n}"),
-            planned_secs,
-            order: key(order),
-            fixed: false,
-            pinned_start: None,
-            status: ItemStatus::Pending,
-            removed_at: None,
-            segments: Vec::new(),
-            carried_from: None,
-            tags: Vec::new(),
-        }
-    }
+    use crate::test_support::{FakeClock, closed, id, record, ts};
 
     fn flexible(n: u128, planned_secs: u64, order: &str) -> PlanItemRecord {
         record(n, planned_secs, order)

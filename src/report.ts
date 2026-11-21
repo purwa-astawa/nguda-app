@@ -3,14 +3,19 @@
 // `nguda_core::report`, and nothing here recomputes a plan rule.
 // Erasable TS only, so `node --test` runs this file directly.
 
-import type { DayReportView_Serialize, ReportRowView_Serialize } from "./bindings.ts";
+import type {
+  DayReportView_Serialize,
+  MarkerKindView,
+  MarkerView_Serialize,
+  ReportRowView_Serialize,
+} from "./bindings.ts";
 import { formatElapsed } from "./elapsed.ts";
 
 export type DayReport = DayReportView_Serialize;
 export type ReportRow = ReportRowView_Serialize;
 
 /** How a row is marked next to its title. */
-export type RowMark = "unplanned" | "removed" | "carried over" | "carried in";
+type RowMark = "unplanned" | "removed" | "carried over" | "carried in";
 
 /** A duration like the tray shows it (`MM:SS`, `H:MM:SS`), or `—` for none. */
 export function formatSecs(secs: number | null): string {
@@ -52,11 +57,8 @@ export function diffClass(secs: number | null): "over" | "under" | "" {
 // segments as recorded, markers as logged. Nothing here schedules anything (AD-5).
 // Output is timezone-free epoch ms plus fractions of one shared span.
 
-type MarkerView = DayReport["markers"][number];
-type MarkerKind = MarkerView["kind"];
-
 /** One bar of a lane: an item's span, positioned as fractions of the timeline span. */
-export type TimelineBar = {
+type TimelineBar = {
   itemId: string;
   title: string;
   startMs: number;
@@ -75,8 +77,8 @@ export type TimelineBar = {
 export type TimelineLane = { bars: TimelineBar[]; rows: number };
 
 /** A labelled day-log entry on the shared axis. */
-export type TimelineMarker = {
-  kind: MarkerKind;
+type TimelineMarker = {
+  kind: MarkerKindView;
   label: string;
   title: string;
   atMs: number;
@@ -84,7 +86,7 @@ export type TimelineMarker = {
 };
 
 /** The day's shape: planned (baseline) and actual lanes on one axis, plus markers. */
-export type Timeline = {
+type Timeline = {
   startMs: number;
   endMs: number;
   baseline: TimelineLane;
@@ -97,10 +99,10 @@ export type Timeline = {
 const HOUR_MS = 3_600_000;
 
 /** A marker's label by kind; `extended` carries the added time. */
-export function markerLabel(marker: Pick<MarkerView, "kind" | "secs">): string {
+export function markerLabel(marker: Pick<MarkerView_Serialize, "kind" | "secs">): string {
   switch (marker.kind) {
     case "extended":
-      return `Extended +${formatElapsed(Math.max(0, marker.secs ?? 0))}`;
+      return `Extended +${formatSecs(marker.secs ?? 0)}`;
     case "inserted":
       return "Inserted";
     case "switched":
@@ -126,6 +128,11 @@ export function hourTicks(startMs: number, endMs: number, offsetMinutes: number)
 
 type Span = { itemId: string; startMs: number; endMs: number; open: boolean };
 
+/** Where `ms` falls in the span from `startMs`, as a fraction clamped to [0, 1]. */
+function spanFraction(ms: number, startMs: number, spanMs: number): number {
+  return Math.min(1, Math.max(0, (ms - startMs) / spanMs));
+}
+
 /** Positions spans on a lane, first-fit in start order so no sub-row overlaps. */
 function layLane(
   spans: Span[],
@@ -133,7 +140,6 @@ function layLane(
   spanMs: number,
   titleOf: (id: string) => string,
 ): TimelineLane {
-  const frac = (ms: number) => Math.min(1, Math.max(0, (ms - startMs) / spanMs));
   const rowEnds: number[] = [];
   const bars = [...spans]
     .sort((a, b) => a.startMs - b.startMs)
@@ -141,7 +147,7 @@ function layLane(
       let row = rowEnds.findIndex((end) => end <= s.startMs);
       if (row === -1) row = rowEnds.length;
       rowEnds[row] = Math.max(s.startMs, s.endMs);
-      const left = frac(s.startMs);
+      const left = spanFraction(s.startMs, startMs, spanMs);
       return {
         itemId: s.itemId,
         title: titleOf(s.itemId),
@@ -202,7 +208,7 @@ export function layoutTimeline(report: DayReport): Timeline | null {
       label: markerLabel(m),
       title: titleOf(m.itemId),
       atMs,
-      left: Math.min(1, Math.max(0, (atMs - startMs) / spanMs)),
+      left: spanFraction(atMs, startMs, spanMs),
     })),
   };
 }

@@ -102,8 +102,8 @@ fn push_field(out: &mut String, field: &str) {
     }
 }
 
-/// A file sink failure. The message carries the OS error only, never the path's
-/// contents (AD-14).
+/// A file sink failure. The message is the OS error or a fixed reason, never
+/// the file's contents (AD-14).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileSinkError {
     pub message: String,

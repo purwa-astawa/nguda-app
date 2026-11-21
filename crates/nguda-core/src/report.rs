@@ -160,23 +160,7 @@ mod tests {
     use crate::plan::PlanItemRecord;
     use crate::reflow::Span;
     use crate::segment::Segment;
-    use crate::test_support::{closed, id, key, ts};
-
-    fn record(n: u128, planned_secs: u64, order: &str) -> PlanItemRecord {
-        PlanItemRecord {
-            id: id(n),
-            title: format!("item {n}"),
-            planned_secs,
-            order: key(order),
-            fixed: false,
-            pinned_start: None,
-            status: ItemStatus::Pending,
-            removed_at: None,
-            segments: Vec::new(),
-            carried_from: None,
-            tags: Vec::new(),
-        }
-    }
+    use crate::test_support::{closed, id, record, ts};
 
     fn day(decision: LockDecision, records: Vec<PlanItemRecord>) -> Day {
         let items = records.into_iter().map(|r| PlanItem::restore(r).unwrap());

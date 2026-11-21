@@ -58,7 +58,7 @@ export function Timeline({ report }: { report: DayReport }) {
             className="tl-tick"
             style={{
               left: pct((ms - t.startMs) / span),
-              transform: `translateX(-${((ms - t.startMs) / span) * 100}%)`,
+              transform: `translateX(-${pct((ms - t.startMs) / span)})`,
             }}
           >
             {clock(ms)}
@@ -96,7 +96,7 @@ export function Timeline({ report }: { report: DayReport }) {
             style={{
               left: pct(m.left),
               top: `${i * MARKER_REM}rem`,
-              transform: `translateX(-${m.left * 100}%)`,
+              transform: `translateX(-${pct(m.left)})`,
             }}
             title={`${m.label} · ${m.title} · ${clock(m.atMs)}`}
           >
