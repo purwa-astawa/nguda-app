@@ -208,6 +208,43 @@ body {
   margin: 0;
 }
 
+.item.excluded .facts,
+.item.excluded .tags {
+  opacity: 0.5;
+}
+
+.item.excluded .title {
+  text-decoration: line-through;
+}
+
+.excluded-badge {
+  font-size: 0.7em;
+  margin-left: 0.4rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  color: #666;
+}
+
+.google .picker {
+  display: flex;
+  flex-direction: column;
+  flex-basis: 100%;
+  gap: 0.3rem;
+}
+
+.google .picker ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.google .picker li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .imported {
   font-size: 0.7em;
   margin-left: 0.4rem;

@@ -105,6 +105,9 @@ pub(crate) const CARRY_OVER: &str = "CarryOverToTomorrow";
 const EXPORT_CSV: &str = "ExportCsv";
 const SIGN_IN: &str = "SignIn";
 const SET_INCLUDED_CALENDARS: &str = "SetIncludedCalendars";
+const EXCLUDE_EVENT: &str = "ExcludeEvent";
+const INCLUDE_EVENT: &str = "IncludeEvent";
+const ADD_CALENDAR_EVENT: &str = "AddCalendarEvent";
 
 /// Why a carry-over with no leftovers is rejected.
 pub(crate) const NOTHING_TO_CARRY_OVER: &str = "nothing to carry over";
@@ -129,6 +132,9 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::ExportCsv { .. } => EXPORT_CSV,
         EngineMsg::SignIn => SIGN_IN,
         EngineMsg::SetIncludedCalendars { .. } => SET_INCLUDED_CALENDARS,
+        EngineMsg::ExcludeEvent { .. } => EXCLUDE_EVENT,
+        EngineMsg::IncludeEvent { .. } => INCLUDE_EVENT,
+        EngineMsg::AddCalendarEvent { .. } => ADD_CALENDAR_EVENT,
     }
 }
 
@@ -141,7 +147,8 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
         | EngineMsg::CarryOverToTomorrow { .. }
         | EngineMsg::ExportCsv { .. }
         | EngineMsg::SignIn
-        | EngineMsg::SetIncludedCalendars { .. } => None,
+        | EngineMsg::SetIncludedCalendars { .. }
+        | EngineMsg::AddCalendarEvent { .. } => None,
         EngineMsg::InsertTask { anchor, .. } => match anchor {
             InsertAnchor::After(id) | InsertAnchor::Before(id) => Some(*id),
             InsertAnchor::Now | InsertAnchor::End => None,
@@ -154,7 +161,9 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
         | EngineMsg::Pause { item_id }
         | EngineMsg::Switch { item_id, .. }
         | EngineMsg::ExtendTask { item_id, .. }
-        | EngineMsg::SetTags { item_id, .. } => Some(*item_id),
+        | EngineMsg::SetTags { item_id, .. }
+        | EngineMsg::ExcludeEvent { item_id, .. }
+        | EngineMsg::IncludeEvent { item_id, .. } => Some(*item_id),
     }
 }
 
@@ -281,6 +290,24 @@ pub(crate) fn apply(
             SET_INCLUDED_CALENDARS,
             "not a plan command",
         )),
+        EngineMsg::ExcludeEvent {
+            item_id,
+            expected_rev,
+        } => {
+            check(expected_rev)?;
+            exclude_event(day, now, item_id)
+        }
+        EngineMsg::IncludeEvent {
+            item_id,
+            expected_rev,
+        } => {
+            check(expected_rev)?;
+            include_event(day, now, item_id)
+        }
+        // The actor routes it to `add_calendar_event`; never reached.
+        EngineMsg::AddCalendarEvent { .. } => {
+            Err(Reject::invalid(ADD_CALENDAR_EVENT, "not a plan command"))
+        }
     }
 }
 
@@ -616,6 +643,26 @@ fn extend_task(
         day.date(),
         now,
         DayLogKind::Extended { item_id, secs },
+    )])
+}
+
+/// The excluded flag and the `Excluded` entry, committed as one batch (R4).
+fn exclude_event(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
+    day.exclude(item_id).map_err(domain(EXCLUDE_EVENT))?;
+    Ok(vec![log_op(
+        day.date(),
+        now,
+        DayLogKind::Excluded { item_id },
+    )])
+}
+
+/// The cleared flag and the `Included` entry, committed as one batch (R4).
+fn include_event(day: &mut Day, now: Timestamp, item_id: ItemId) -> Result<Vec<StoreOp>, Reject> {
+    day.include(item_id).map_err(domain(INCLUDE_EVENT))?;
+    Ok(vec![log_op(
+        day.date(),
+        now,
+        DayLogKind::Included { item_id },
     )])
 }
 

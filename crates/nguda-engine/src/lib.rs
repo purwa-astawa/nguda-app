@@ -115,6 +115,19 @@
 //! [`StatusKey::Sync`], which the next successful sync or sign-in clears; "not
 //! signed in" sets no status, only [`GoogleAccount::SignedOut`], and schedules
 //! no poll. Tokens and event titles are never logged.
+//!
+//! Single events (R4): [`EngineMsg::ExcludeEvent`] and
+//! [`EngineMsg::IncludeEvent`] toggle a user-owned flag on a pending imported
+//! item with no time recorded. An excluded item stays pending and in the plan
+//! (and in every merge), but re-flow skips it, so it is out of `next_item`, the
+//! overflow list, and any baseline frozen later.
+//! [`EngineHandle::query_calendar_events`] lists one calendar's events of today
+//! off the actor (an older query, or one for a day that is no longer today, is
+//! answered [`QueryError::Stale`]), and [`EngineMsg::AddCalendarEvent`] fetches
+//! one event off the actor and imports it marked `added`
+//! ([`nguda_core::add_event`]). Each sync round also re-fetches today's live
+//! added items whose calendar is not included, and merges them in the same
+//! batch; un-including a calendar never hides them.
 
 mod actor;
 mod batch;
@@ -130,9 +143,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    CalendarEntry, CalendarError, CalendarSource, Clock, Date, Day, DayReport, ExportRange,
-    FileSink, IdGen, IsoWeek, ItemId, LockChoice, PromptId, PromptKind, Random, Running, Schedule,
-    Store, StoreError, SyncBatch, TimeZone, Timestamp, WeekReport, WorkEnd,
+    CalendarChange, CalendarEntry, CalendarError, CalendarErrorKind, CalendarSource, Clock, Date,
+    Day, DayReport, ExportRange, FetchedEvent, FileSink, IdGen, IsoWeek, ItemId, LockChoice,
+    PromptId, PromptKind, Random, Running, Schedule, Store, StoreError, SyncBatch, TimeZone,
+    Timestamp, WeekReport, WorkEnd,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -262,6 +276,23 @@ pub enum EngineMsg {
     /// of today hidden, their cursors cleared) in one batch and starts a new sync
     /// round at once; the same selection changes nothing. Not rev-checked.
     SetIncludedCalendars { calendar_ids: Vec<String> },
+    /// Leaves today's imported item `item_id` out of the schedule (R4): only a
+    /// pending imported item with no time recorded. It stays pending and in the
+    /// plan, leaves the interrupt stack, and is logged `Excluded`, in one batch.
+    /// Rev-checked; any other target is rejected.
+    ExcludeEvent { item_id: ItemId, expected_rev: u64 },
+    /// Takes the excluded item `item_id` back into the schedule, logged
+    /// `Included`. Rev-checked; an item that is not excluded is rejected.
+    IncludeEvent { item_id: ItemId, expected_rev: u64 },
+    /// Adds the single event `event_id` of calendar `calendar_id` to today (R4):
+    /// fetched off the actor (AD-17), then imported as a fixed item marked
+    /// `added` with a `CalendarChanged` entry, in one batch. A failure sets
+    /// [`StatusKey::Sync`] and changes nothing; a result arriving after today
+    /// rolled over is dropped. Not rev-checked.
+    AddCalendarEvent {
+        calendar_id: String,
+        event_id: String,
+    },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -412,14 +443,17 @@ impl fmt::Display for EngineClosed {
 
 impl std::error::Error for EngineClosed {}
 
-/// A [`EngineHandle::query_day`] or [`EngineHandle::query_week`] that got no
-/// report.
+/// A query that got no answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueryError {
     /// The engine task has stopped, or dropped the request.
     EngineClosed,
     /// A store read failed. Engine state is untouched.
     Store(StoreError),
+    /// A newer query superseded this one, or its date is not today (any more).
+    Stale,
+    /// The calendar request failed with this kind.
+    Calendar(CalendarErrorKind),
 }
 
 impl fmt::Display for QueryError {
@@ -427,7 +461,35 @@ impl fmt::Display for QueryError {
         match self {
             Self::EngineClosed => EngineClosed.fmt(f),
             Self::Store(e) => write!(f, "store read failed: {e}"),
+            Self::Stale => f.write_str("stale query"),
+            Self::Calendar(kind) => write!(f, "calendar request failed: {kind:?}"),
         }
+    }
+}
+
+/// One of today's events of a calendar, as listed for the picker (R4).
+/// `Debug` never prints the title (AD-14).
+#[derive(Clone, PartialEq, Eq)]
+pub struct CalendarEvent {
+    pub calendar_id: String,
+    pub event_id: String,
+    pub title: String,
+    pub start: Timestamp,
+    pub end: Timestamp,
+    /// Whether today's plan already has it: an item with its merge key that is
+    /// not removed, or that Google cancelled.
+    pub in_plan: bool,
+}
+
+impl fmt::Debug for CalendarEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CalendarEvent")
+            .field("calendar_id", &self.calendar_id)
+            .field("event_id", &self.event_id)
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("in_plan", &self.in_plan)
+            .finish_non_exhaustive()
     }
 }
 
@@ -438,6 +500,9 @@ pub(crate) type DayReply = Result<Option<DayReport>, StoreError>;
 
 /// The reply of a week query.
 pub(crate) type WeekReply = Result<WeekReport, StoreError>;
+
+/// The reply of a calendar-events query.
+pub(crate) type EventsReply = Result<Vec<CalendarEvent>, QueryError>;
 
 /// What arrives on the engine's channel. Kept apart from [`EngineMsg`] so the
 /// reply sender never needs its derives.
@@ -473,6 +538,27 @@ pub(crate) enum Inbox {
         date: Date,
         result: Result<SyncRound, CalendarError>,
     },
+    /// A request for `calendar_id`'s events of `date` (R4).
+    QueryCalendarEvents {
+        calendar_id: String,
+        date: Date,
+        reply: oneshot::Sender<EventsReply>,
+    },
+    /// A calendar-events listing's result for `date`, tagged with its request
+    /// id, and the reply it answers. Only the latest query's result is answered
+    /// with events, and only while `date` is still today; any other is answered
+    /// [`QueryError::Stale`].
+    CalendarEventsFetched {
+        id: u64,
+        date: Date,
+        result: Result<Vec<FetchedEvent>, CalendarError>,
+        reply: oneshot::Sender<EventsReply>,
+    },
+    /// An added event's fetch for `date`; dropped when `date` is no longer today.
+    EventAdded {
+        date: Date,
+        result: Result<Option<CalendarChange>, CalendarError>,
+    },
 }
 
 /// One sync round's results: the calendar table after the listing, and the
@@ -480,6 +566,15 @@ pub(crate) enum Inbox {
 pub(crate) struct SyncRound {
     pub(crate) calendars: Vec<CalendarEntry>,
     pub(crate) outcomes: Vec<CalendarOutcome>,
+    /// The re-fetch of each live added item whose calendar is not included.
+    pub(crate) added: Vec<AddedOutcome>,
+}
+
+/// One added event's re-fetch in a round (R4).
+pub(crate) struct AddedOutcome {
+    pub(crate) calendar_id: String,
+    pub(crate) event_id: String,
+    pub(crate) result: Result<Option<CalendarChange>, CalendarError>,
 }
 
 /// One calendar's sync in a round. `incremental` says whether it resumed from a
@@ -527,6 +622,27 @@ impl EngineHandle {
         rx.await
             .map_err(|_| QueryError::EngineClosed)?
             .map_err(QueryError::Store)
+    }
+
+    /// Today's timed events of calendar `calendar_id`, sorted by start, each
+    /// marked whether today's plan has it (R4). Listed off the actor (AD-17). A
+    /// `date` other than today, or a query superseded by a newer one before it
+    /// returns, is answered [`QueryError::Stale`]. Read-only. Await it only off
+    /// the main thread (AD-4).
+    pub async fn query_calendar_events(
+        &self,
+        calendar_id: String,
+        date: Date,
+    ) -> Result<Vec<CalendarEvent>, QueryError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Inbox::QueryCalendarEvents {
+                calendar_id,
+                date,
+                reply,
+            })
+            .map_err(|_| QueryError::EngineClosed)?;
+        rx.await.map_err(|_| QueryError::EngineClosed)?
     }
 
     /// A receiver that starts at the latest snapshot.

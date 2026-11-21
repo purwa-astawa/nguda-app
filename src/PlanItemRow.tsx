@@ -76,7 +76,7 @@ export function PlanItemRow({ snap, item, now, send, start, focusExtend }: Props
   };
 
   return (
-    <li className={`item ${item.status}`}>
+    <li className={`item ${item.status}${item.excluded ? " excluded" : ""}`}>
       {editing ? (
         <form
           noValidate
@@ -108,6 +108,11 @@ export function PlanItemRow({ snap, item, now, send, start, focusExtend }: Props
           {item.imported && (
             <span className="imported" title="Imported from Google Calendar">
               Google
+            </span>
+          )}
+          {item.excluded && (
+            <span className="excluded-badge" title="Left out of today's schedule">
+              excluded
             </span>
           )}
           <span className="meta">
@@ -218,6 +223,8 @@ export function PlanItemRow({ snap, item, now, send, start, focusExtend }: Props
           </>
         )}
         {actions.unpin && <button onClick={() => send(actions.unpin!)}>Unpin</button>}
+        {actions.exclude && <button onClick={() => send(actions.exclude!)}>Exclude</button>}
+        {actions.include && <button onClick={() => send(actions.include!)}>Include</button>}
         {actions.remove && <button onClick={() => send(actions.remove!)}>Remove</button>}
       </div>
     </li>

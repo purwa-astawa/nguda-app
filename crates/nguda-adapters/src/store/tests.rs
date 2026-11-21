@@ -192,7 +192,7 @@ async fn fresh_open_creates_the_latest_schema_without_a_backup() {
     assert!(!path.exists());
     drop(SqliteStore::open(&path).unwrap());
     assert!(path.exists());
-    assert_eq!(user_version(&path), 12);
+    assert_eq!(user_version(&path), 13);
     assert!(has_table(&path, "time_segment"));
     assert!(has_table(&path, "engine_meta"));
     assert!(has_table(&path, "day_log"));
@@ -281,7 +281,7 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     // connection: a read-write open closing it would checkpoint them.
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-    raw.pragma_update(None, "user_version", 13).unwrap();
+    raw.pragma_update(None, "user_version", 14).unwrap();
     let copy = dir.path().join("newer.db");
     let wal = |p: &Path| PathBuf::from(format!("{}-wal", p.display()));
     std::fs::copy(&path, &copy).unwrap();
@@ -296,14 +296,14 @@ async fn newer_schema_is_refused_without_touching_the_file() {
     assert_eq!(
         err,
         OpenError::NewerSchema {
-            found: 13,
-            supported: 12
+            found: 14,
+            supported: 13
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read(wal(&path)).unwrap(), wal_before);
     assert!(backups(&dir).is_empty());
-    assert_eq!(user_version(&path), 13);
+    assert_eq!(user_version(&path), 14);
 }
 
 #[tokio::test]
@@ -505,7 +505,7 @@ async fn a_real_v1_database_upgrades_to_v2_with_a_backup_and_its_data() {
     assert_eq!(backups(&dir), vec![bak.clone()]);
     assert_eq!(user_version(&bak), 1);
     assert!(!has_table(&bak, "day_log"));
-    assert_eq!(user_version(&path), 12);
+    assert_eq!(user_version(&path), 13);
     assert!(has_table(&path, "engine_meta"));
 }
 
@@ -1195,7 +1195,7 @@ async fn v8_decides_days_with_time_no_lock_and_leaves_the_rest_undecided() {
     assert_eq!(untouched.lock_decision(), LockDecision::None);
     assert_eq!(store.load_baseline(date()).await.unwrap(), None);
     drop(store);
-    assert_eq!(user_version(&path), 12);
+    assert_eq!(user_version(&path), 13);
     assert_eq!(backups(&dir), vec![backup_path(&path, 7)]);
 }
 
@@ -1364,6 +1364,8 @@ fn imported(n: u128, source_id: &str, instance_start: Option<Timestamp>) -> Plan
         }),
         removed_by_source_at: None,
         hidden_at: None,
+        excluded: false,
+        added: false,
     })
     .unwrap()
 }
@@ -1443,7 +1445,7 @@ async fn v10_leaves_existing_items_local() {
             .all(|i| i.removed_by_source_at().is_none())
     );
     drop(store);
-    assert_eq!(user_version(&path), 12);
+    assert_eq!(user_version(&path), 13);
     assert_eq!(backups(&dir), vec![backup_path(&path, 9)]);
 }
 
@@ -1568,26 +1570,27 @@ async fn a_failing_batch_rolls_back_its_cursor_op() {
 }
 
 /// Writes `sample_day` into a database at `path` built with the first `n`
-/// migrations (10 or 11: the same plan-item columns). The adapter writes columns
-/// those lack, so the rows go through a current-schema scratch database and are
-/// copied over with v10's plan-item columns only.
+/// migrations (10, 11 or 12). The adapter writes columns those lack, so the rows
+/// go through a current-schema scratch database and are copied over with v10's
+/// plan-item columns only, plus `hidden_at` from v12 on.
 async fn seed_v10_columns(dir: &TempDir, path: &Path, n: usize) {
+    let hidden = if n >= 12 { ", hidden_at" } else { "" };
     drop(SqliteStore::open_with(path, &migrations_through(n)).unwrap());
     let scratch = dir.path().join("scratch.sqlite");
     drop(seeded(&scratch).await);
     let conn = Connection::open(path).unwrap();
     conn.execute("ATTACH DATABASE ?1 AS src", [scratch.to_str().unwrap()])
         .unwrap();
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         r#"INSERT INTO day SELECT * FROM src.day ORDER BY rowid;
            INSERT INTO plan_item
              SELECT id, day_date, title, planned_secs, "order", fixed, pinned_start,
                     status, removed_at, carried_from, calendar_id, source_id,
-                    instance_start, source_secs, removed_by_source_at
+                    instance_start, source_secs, removed_by_source_at{hidden}
              FROM src.plan_item ORDER BY rowid;
            INSERT INTO time_segment SELECT * FROM src.time_segment ORDER BY id;
-           DETACH DATABASE src;"#,
-    )
+           DETACH DATABASE src;"#
+    ))
     .unwrap();
     drop(conn);
     std::fs::remove_file(&scratch).unwrap();
@@ -1602,7 +1605,7 @@ async fn v11_adds_an_empty_cursor_table_and_keeps_the_plan() {
     assert!(!has_table(&path, "calendar_sync"));
 
     let store = SqliteStore::open(&path).unwrap();
-    assert_eq!(user_version(&path), 12);
+    assert_eq!(user_version(&path), 13);
     assert!(has_table(&path, "calendar_sync"));
     assert_eq!(store.load_day(date()).await.unwrap().unwrap(), sample_day());
     assert!(store.load_sync_cursors().await.unwrap().is_empty());
@@ -1618,7 +1621,7 @@ async fn v12_adds_an_empty_calendar_table_and_keeps_the_plan_unhidden() {
     assert!(!has_table(&path, "calendar"));
 
     let store = SqliteStore::open(&path).unwrap();
-    assert_eq!(user_version(&path), 12);
+    assert_eq!(user_version(&path), 13);
     assert!(has_table(&path, "calendar"));
     let loaded = store.load_day(date()).await.unwrap().unwrap();
     assert_eq!(loaded, sample_day());
@@ -1695,4 +1698,106 @@ async fn a_hidden_item_round_trips_across_a_reopen() {
     let loaded = store.load_day(other_date()).await.unwrap().unwrap();
     assert_eq!(loaded, day);
     assert_eq!(loaded.item(id(30)).unwrap().hidden_at(), Some(ts(5_000)));
+}
+
+#[tokio::test]
+async fn v13_keeps_the_plan_with_no_item_excluded_or_added() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    seed_v10_columns(&dir, &path, 12).await;
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(user_version(&path), 13);
+    let loaded = store.load_day(date()).await.unwrap().unwrap();
+    assert_eq!(loaded, sample_day());
+    assert!(loaded.items().iter().all(|i| !i.excluded() && !i.added()));
+    drop(store);
+    assert_eq!(backups(&dir), vec![backup_path(&path, 12)]);
+}
+
+#[tokio::test]
+async fn excluded_and_added_flags_round_trip_and_update_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let mut day = Day::new(other_date(), "UTC");
+    let flagged = |n, source_id, excluded, added| {
+        let i = imported(n, source_id, None);
+        PlanItem::restore(PlanItemRecord {
+            id: i.id(),
+            title: i.title().to_owned(),
+            planned_secs: i.planned_secs(),
+            order: i.order().clone(),
+            fixed: i.fixed(),
+            pinned_start: i.pinned_start(),
+            status: i.status(),
+            removed_at: None,
+            segments: Vec::new(),
+            carried_from: None,
+            tags: i.tags().to_vec(),
+            source: i.source().cloned(),
+            removed_by_source_at: None,
+            hidden_at: None,
+            excluded,
+            added,
+        })
+        .unwrap()
+    };
+    day.add(flagged(30, "ev1", true, false)).unwrap();
+    day.add(flagged(31, "ev2", false, true)).unwrap();
+    day.add(flagged(32, "ev3", true, true)).unwrap();
+    store.commit(batch_for(&day)).await.unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let loaded = store.load_day(other_date()).await.unwrap().unwrap();
+    assert_eq!(loaded, day);
+    assert!(loaded.item(id(30)).unwrap().excluded());
+    assert!(loaded.item(id(31)).unwrap().added());
+    // An upsert of the same item clears a flag.
+    day.include(id(30)).unwrap();
+    store.commit(batch_for(&day)).await.unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let loaded = store.load_day(other_date()).await.unwrap().unwrap();
+    assert!(!loaded.item(id(30)).unwrap().excluded());
+    assert_eq!(loaded, day);
+}
+
+#[tokio::test]
+async fn a_flag_on_a_local_item_is_refused_by_the_schema() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    drop(seeded(&path).await);
+    let conn = Connection::open(&path).unwrap();
+    for column in ["excluded", "added"] {
+        let err = conn.execute(&format!("UPDATE plan_item SET {column} = 1"), []);
+        assert!(err.is_err(), "{column}");
+    }
+}
+
+#[tokio::test]
+async fn excluded_and_included_day_log_entries_round_trip_across_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = db(&dir);
+    let store = seeded(&path).await;
+    let entries = [
+        DayLogEntry {
+            at: ts(1_300),
+            kind: DayLogKind::Excluded { item_id: id(1) },
+        },
+        DayLogEntry {
+            at: ts(1_400),
+            kind: DayLogKind::Included { item_id: id(1) },
+        },
+    ];
+    store
+        .commit(batch(entries.iter().map(|entry| StoreOp::AppendDayLog {
+            date: date(),
+            entry: entry.clone(),
+        })))
+        .await
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.load_day_log(date()).await.unwrap(), entries);
 }

@@ -30,4 +30,8 @@ pub enum DayLogKind {
     /// A calendar sync added, changed, or cancelled the imported item `item_id`
     /// (AD-9).
     CalendarChanged { item_id: ItemId },
+    /// The user left the imported item `item_id` out of the day's schedule.
+    Excluded { item_id: ItemId },
+    /// The user took the excluded item `item_id` back into the schedule.
+    Included { item_id: ItemId },
 }

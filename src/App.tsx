@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
-import { events, commands } from "./bindings";
+import { useEffect, useRef, useState } from "react";
+import { events, commands, type CalendarEventView } from "./bindings";
 import { nowNs } from "./elapsed";
 import {
+  addCalendarEventCommand,
   addCommand,
   asksLockChoice,
   carryOverCommand,
@@ -13,6 +14,8 @@ import {
   mergeSnapshot,
   overflowItems,
   includeCalendarCommand,
+  pickerCalendars,
+  scheduleLabel,
   signInCommand,
   withLock,
   workEndCommand,
@@ -77,8 +80,115 @@ async function dispatch(cmd: Command): Promise<string | null> {
     case "setIncludedCalendars":
       res = await commands.setIncludedCalendars(...cmd.args);
       break;
+    case "excludeEvent":
+      res = await commands.excludeEvent(...cmd.args);
+      break;
+    case "includeEvent":
+      res = await commands.includeEvent(...cmd.args);
+      break;
+    case "addCalendarEvent":
+      res = await commands.addCalendarEvent(...cmd.args);
+      break;
   }
   return res.status === "error" ? res.error : null;
+}
+
+/** The picker's last reply, with the calendar it lists. */
+type Listed = { calendarId: string } & (
+  { kind: "error"; message: string } | { kind: "events"; events: CalendarEventView[] }
+);
+
+/** Adds single events of today from a calendar that is not included (R4). The
+ * events come from the engine's `queryCalendarEvents`; only the newest request
+ * may set the list, and a `"stale"` reply is ignored. */
+function EventPicker({ snap, send }: { snap: Snapshot; send: (cmd: Command) => void }) {
+  const calendars = pickerCalendars(snap);
+  const [chosen, setChosen] = useState("");
+  const [listed, setListed] = useState<Listed | null>(null);
+  // Events sent to be added since the list was shown: not offered again.
+  const [sent, setSent] = useState<ReadonlySet<string>>(new Set());
+  const latest = useRef(0);
+  const date = snap.day?.date ?? "";
+  // A choice that left the list (now included, or gone) falls back to the first.
+  const calendarId = calendars.some((c) => c.id === chosen) ? chosen : (calendars[0]?.id ?? "");
+
+  // A new day or calendar drops the old list.
+  useEffect(() => {
+    latest.current++;
+    setListed(null);
+    setSent(new Set());
+  }, [date, calendarId]);
+
+  if (calendars.length === 0 || !date) return null;
+
+  const show = () => {
+    const mine = ++latest.current;
+    commands
+      .queryCalendarEvents(calendarId, date)
+      .then((res) => {
+        if (mine !== latest.current) return;
+        if (res.status === "error") {
+          if (res.error !== "stale") setListed({ calendarId, kind: "error", message: res.error });
+        } else {
+          setListed({ calendarId, kind: "events", events: res.data });
+          setSent(new Set());
+        }
+      })
+      .catch((e) => {
+        if (mine === latest.current) setListed({ calendarId, kind: "error", message: String(e) });
+      });
+  };
+
+  const tz = snap.day?.tz ?? "UTC";
+
+  return (
+    <div className="picker">
+      <label>
+        Add one event from{" "}
+        <select value={calendarId} onChange={(e) => setChosen(e.target.value)}>
+          {calendars.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button type="button" onClick={show}>
+        Show today's events
+      </button>
+      {listed?.calendarId === calendarId && listed.kind === "error" && (
+        <p className="status" role="alert">
+          {listed.message}
+        </p>
+      )}
+      {listed?.calendarId === calendarId && listed.kind === "events" && (
+        listed.events.length === 0 ? (
+          <p>No timed events today.</p>
+        ) : (
+          <ul>
+            {listed.events.map((e) => (
+              <li key={e.eventId}>
+                <span className="when">
+                  {scheduleLabel({ scheduledStart: e.start, scheduledEnd: e.end }, tz)}
+                </span>
+                <span className="title">{e.title}</span>
+                <button
+                  type="button"
+                  disabled={e.inPlan || sent.has(e.eventId)}
+                  onClick={() => {
+                    send(addCalendarEventCommand(e.calendarId, e.eventId));
+                    setSent((s) => new Set(s).add(e.eventId));
+                  }}
+                >
+                  {e.inPlan ? "In plan" : sent.has(e.eventId) ? "Added" : "Add"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )
+      )}
+    </div>
+  );
 }
 
 type Tab = "plan" | "summary" | "week";
@@ -265,6 +375,7 @@ function App() {
             ))}
           </fieldset>
         )}
+        <EventPicker snap={snap} send={send} />
       </section>
 
       {lockDay && (

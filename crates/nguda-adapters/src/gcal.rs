@@ -177,6 +177,35 @@ impl CalendarSource for GcalSource {
                 .await
         })
     }
+
+    fn list_events(
+        &self,
+        calendar_id: String,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> CalendarFuture<Vec<FetchedEvent>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            inner
+                .list_events(calendar_id, window_start, window_end)
+                .await
+        })
+    }
+
+    fn get_event(
+        &self,
+        calendar_id: String,
+        event_id: String,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> CalendarFuture<Option<CalendarChange>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            inner
+                .get_event(calendar_id, event_id, window_start, window_end)
+                .await
+        })
+    }
 }
 
 fn auth(message: impl Into<String>) -> CalendarError {
@@ -364,6 +393,19 @@ impl Inner {
         url: Url,
         token: &str,
     ) -> Result<T, CalendarError> {
+        self.fetch(url, token, false)
+            .await?
+            .ok_or_else(|| other("Calendar API HTTP 404"))
+    }
+
+    /// A GET to the Calendar API, parsed as `T`; with `not_found_ok`, an HTTP 404
+    /// is `Ok(None)` instead of an error.
+    async fn fetch<T: for<'de> Deserialize<'de>>(
+        &self,
+        url: Url,
+        token: &str,
+        not_found_ok: bool,
+    ) -> Result<Option<T>, CalendarError> {
         let response = self
             .http
             .get(url)
@@ -372,6 +414,9 @@ impl Inner {
             .await
             .map_err(transport)?;
         let status = response.status();
+        if not_found_ok && status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if status == reqwest::StatusCode::UNAUTHORIZED {
             *self.access.lock().unwrap() = None;
             return Err(auth("Google rejected the access token"));
@@ -396,6 +441,7 @@ impl Inner {
         response
             .json::<T>()
             .await
+            .map(Some)
             .map_err(|_| other("the Calendar API response could not be read"))
     }
 
@@ -450,15 +496,67 @@ impl Inner {
         window_start: Timestamp,
         window_end: Timestamp,
     ) -> Result<SyncBatch, CalendarError> {
+        let (events, next_token) = self
+            .events(
+                &calendar_id,
+                sync_token.as_deref(),
+                true,
+                window_start,
+                window_end,
+            )
+            .await?;
+        let changes = events
+            .into_iter()
+            .filter_map(|e| e.change(&calendar_id, window_start, window_end))
+            .collect();
+        Ok(SyncBatch {
+            calendar_id,
+            changes,
+            next_token,
+        })
+    }
+
+    /// The window's timed events of `calendar_id` (see
+    /// [`CalendarSource::list_events`]): the full fetch's query without
+    /// `showDeleted` or a sync token, every page followed, cancellations and
+    /// skipped events dropped. GET only.
+    async fn list_events(
+        &self,
+        calendar_id: String,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> Result<Vec<FetchedEvent>, CalendarError> {
+        let (events, _) = self
+            .events(&calendar_id, None, false, window_start, window_end)
+            .await?;
+        Ok(events
+            .into_iter()
+            .filter(|e| e.status.as_deref() != Some("cancelled"))
+            .filter_map(|e| e.timed(&calendar_id, window_start, window_end))
+            .collect())
+    }
+
+    /// The events of `calendar_id`, every page followed, and the `nextSyncToken`
+    /// of the last page. With `sync_token` only that token is sent, else the
+    /// window; both send `singleEvents`, `showDeleted` only when `show_deleted`,
+    /// and never `orderBy`. GET only.
+    async fn events(
+        &self,
+        calendar_id: &str,
+        sync_token: Option<&str>,
+        show_deleted: bool,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> Result<(Vec<Event>, Option<String>), CalendarError> {
         let token = self.access_token().await?;
-        let mut changes = Vec::new();
+        let mut events = Vec::new();
         let mut page_token: Option<String> = None;
         let next_token = loop {
             // Path segments are percent-encoded, so any calendar id is safe.
-            let mut url = self.api_url(&["calendars", &calendar_id, "events"])?;
+            let mut url = self.api_url(&["calendars", calendar_id, "events"])?;
             {
                 let mut query = url.query_pairs_mut();
-                match &sync_token {
+                match sync_token {
                     Some(sync) => {
                         query.append_pair("syncToken", sync);
                     }
@@ -468,30 +566,39 @@ impl Inner {
                             .append_pair("timeMax", &window_end.to_string());
                     }
                 }
-                query
-                    .append_pair("singleEvents", "true")
-                    .append_pair("showDeleted", "true")
-                    .append_pair("maxResults", "250");
+                query.append_pair("singleEvents", "true");
+                if show_deleted {
+                    query.append_pair("showDeleted", "true");
+                }
+                query.append_pair("maxResults", "250");
                 if let Some(page) = &page_token {
                     query.append_pair("pageToken", page);
                 }
             }
             let page: EventsPage = self.get(url, &token).await?;
-            changes.extend(
-                page.items
-                    .into_iter()
-                    .filter_map(|e| e.change(&calendar_id, window_start, window_end)),
-            );
+            events.extend(page.items);
             match page.next_page_token {
                 Some(next) if !next.is_empty() => page_token = Some(next),
                 _ => break page.next_sync_token.filter(|t| !t.is_empty()),
             }
         };
-        Ok(SyncBatch {
-            calendar_id,
-            changes,
-            next_token,
-        })
+        Ok((events, next_token))
+    }
+
+    /// The single event `event_id` of `calendar_id` (see
+    /// [`CalendarSource::get_event`]): `calendars/{id}/events/{eventId}`, both
+    /// percent-encoded path segments. A 404 is `Ok(None)`. GET only.
+    async fn get_event(
+        &self,
+        calendar_id: String,
+        event_id: String,
+        window_start: Timestamp,
+        window_end: Timestamp,
+    ) -> Result<Option<CalendarChange>, CalendarError> {
+        let token = self.access_token().await?;
+        let url = self.api_url(&["calendars", &calendar_id, "events", &event_id])?;
+        let event: Option<Event> = self.fetch(url, &token, true).await?;
+        Ok(event.and_then(|e| e.change(&calendar_id, window_start, window_end)))
     }
 }
 

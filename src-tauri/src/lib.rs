@@ -175,6 +175,25 @@ impl CalendarSource for IdleCalendar {
     ) -> nguda_core::CalendarFuture<nguda_core::SyncBatch> {
         Box::pin(std::future::pending())
     }
+
+    fn list_events(
+        &self,
+        _calendar_id: String,
+        _window_start: nguda_core::Timestamp,
+        _window_end: nguda_core::Timestamp,
+    ) -> nguda_core::CalendarFuture<Vec<nguda_core::FetchedEvent>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn get_event(
+        &self,
+        _calendar_id: String,
+        _event_id: String,
+        _window_start: nguda_core::Timestamp,
+        _window_end: nguda_core::Timestamp,
+    ) -> nguda_core::CalendarFuture<Option<nguda_core::CalendarChange>> {
+        Box::pin(std::future::pending())
+    }
 }
 
 /// The notifier's action callback: resolves a click against the recorded prompt
