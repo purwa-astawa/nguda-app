@@ -109,6 +109,7 @@ pub struct PlanItem {
     /// Boxed: most items are local, and an item travels inside store ops.
     source: Option<Box<CalendarRef>>,
     removed_by_source_at: Option<Timestamp>,
+    hidden_at: Option<Timestamp>,
 }
 
 /// Where an imported item came from (AD-9): its merge key
@@ -156,13 +157,17 @@ pub struct PlanItemRecord {
     pub source: Option<CalendarRef>,
     /// When Google cancelled the event (AD-9). Requires `source`.
     pub removed_by_source_at: Option<Timestamp>,
+    /// When un-including the item's calendar hid it. Requires `source` and status
+    /// Removed.
+    pub hidden_at: Option<Timestamp>,
 }
 
 impl PlanItem {
     /// Rebuilds a stored item, rejecting a record that breaks an item invariant:
     /// fixed exactly when pinned, removed exactly when tombstoned, no inverted closed
     /// segment, at most one open segment, an open segment exactly when running, and
-    /// `removed_by_source_at` only on an imported item.
+    /// `removed_by_source_at` only on an imported item, and `hidden_at` only on a
+    /// removed imported item.
     pub fn restore(record: PlanItemRecord) -> Result<Self, DomainError> {
         let invalid = |reason| DomainError::InvalidRecord {
             id: record.id,
@@ -191,6 +196,11 @@ impl PlanItem {
         if record.removed_by_source_at.is_some() && record.source.is_none() {
             return Err(invalid("removed_by_source_at requires a source"));
         }
+        if record.hidden_at.is_some()
+            && (record.source.is_none() || record.status != ItemStatus::Removed)
+        {
+            return Err(invalid("hidden_at requires a source and status removed"));
+        }
         let PlanItemRecord {
             id,
             title,
@@ -205,6 +215,7 @@ impl PlanItem {
             tags,
             source,
             removed_by_source_at,
+            hidden_at,
         } = record;
         Ok(Self {
             id,
@@ -220,6 +231,7 @@ impl PlanItem {
             tags,
             source: source.map(Box::new),
             removed_by_source_at,
+            hidden_at,
         })
     }
 
@@ -239,6 +251,7 @@ impl PlanItem {
             tags: Vec::new(),
             source: None,
             removed_by_source_at: None,
+            hidden_at: None,
         }
     }
 
@@ -328,6 +341,12 @@ impl PlanItem {
     /// When Google cancelled the imported event, if it did (AD-9).
     pub fn removed_by_source_at(&self) -> Option<Timestamp> {
         self.removed_by_source_at
+    }
+
+    /// When un-including the item's calendar hid it, if it is hidden. A hidden item
+    /// is a removed tombstone that a re-import of its event revives.
+    pub fn hidden_at(&self) -> Option<Timestamp> {
+        self.hidden_at
     }
 
     /// Pins the item at `pinned_start`, making it fixed.
@@ -793,6 +812,41 @@ impl Day {
             self.unstack(id);
         }
         Ok(true)
+    }
+
+    /// Hides the imported item `id` at `now` because its calendar was un-included:
+    /// a pending item with no segments becomes a removed tombstone (`removed_at`
+    /// and `hidden_at` both `now`) and leaves the interrupt stack. Any other item
+    /// (with recorded time, in another state, or local) is left as is. Returns
+    /// whether the item changed.
+    pub(crate) fn hide(&mut self, id: ItemId, now: Timestamp) -> Result<bool, DomainError> {
+        let idx = self.index(id)?;
+        let item = &self.items[idx];
+        if item.status != ItemStatus::Pending || !item.segments.is_empty() || item.source.is_none()
+        {
+            return Ok(false);
+        }
+        let next = &mut self.items[idx];
+        next.status = ItemStatus::Removed;
+        next.removed_at = Some(now);
+        next.hidden_at = Some(now);
+        self.unstack(id);
+        Ok(true)
+    }
+
+    /// Revives the hidden item `id` as pending, clearing `removed_at` and
+    /// `hidden_at`. An item that is not hidden rejects it.
+    pub(crate) fn revive(&mut self, id: ItemId) -> Result<(), DomainError> {
+        let idx = self.index(id)?;
+        let item = &self.items[idx];
+        if item.status != ItemStatus::Removed || item.hidden_at.is_none() {
+            return Err(item.reject(Action::Edit));
+        }
+        let next = &mut self.items[idx];
+        next.status = ItemStatus::Pending;
+        next.removed_at = None;
+        next.hidden_at = None;
+        Ok(())
     }
 
     /// Adds `secs` to the running item `id`'s planned length (AD-6: the plan grows,
@@ -1336,6 +1390,7 @@ mod tests {
             tags: Vec::new(),
             source: None,
             removed_by_source_at: None,
+            hidden_at: None,
         }
     }
 
@@ -1373,6 +1428,7 @@ mod tests {
                 tags: i.tags().to_vec(),
                 source: i.source().cloned(),
                 removed_by_source_at: i.removed_by_source_at(),
+                hidden_at: i.hidden_at(),
             };
             assert_eq!(PlanItem::restore(r), Ok(i), "{s}");
         }
@@ -1398,6 +1454,35 @@ mod tests {
         let i = PlanItem::restore(r).unwrap();
         assert_eq!(i.source(), Some(&source));
         assert_eq!(i.removed_by_source_at(), Some(ts(10)));
+    }
+
+    #[test]
+    fn restore_requires_a_source_and_removed_status_for_hidden_at() {
+        let source = CalendarRef {
+            calendar_id: "cal".into(),
+            source_id: "ev".into(),
+            instance_start: None,
+            source_secs: 1500,
+        };
+        assert_invalid(PlanItemRecord {
+            status: ItemStatus::Removed,
+            removed_at: Some(ts(10)),
+            hidden_at: Some(ts(10)),
+            ..record(ItemStatus::Removed)
+        });
+        assert_invalid(PlanItemRecord {
+            source: Some(source.clone()),
+            hidden_at: Some(ts(10)),
+            ..record(ItemStatus::Pending)
+        });
+        let i = PlanItem::restore(PlanItemRecord {
+            source: Some(source),
+            removed_at: Some(ts(10)),
+            hidden_at: Some(ts(10)),
+            ..record(ItemStatus::Removed)
+        })
+        .unwrap();
+        assert_eq!(i.hidden_at(), Some(ts(10)));
     }
 
     #[test]

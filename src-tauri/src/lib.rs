@@ -162,9 +162,14 @@ impl CalendarSource for IdleCalendar {
         Box::pin(std::future::pending())
     }
 
-    fn sync_primary(
+    fn list_calendars(&self) -> nguda_core::CalendarFuture<Vec<nguda_core::CalendarInfo>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn sync_calendar(
         &self,
-        _cursor: Option<(String, String)>,
+        _calendar_id: String,
+        _token: Option<String>,
         _window_start: nguda_core::Timestamp,
         _window_end: nguda_core::Timestamp,
     ) -> nguda_core::CalendarFuture<nguda_core::SyncBatch> {

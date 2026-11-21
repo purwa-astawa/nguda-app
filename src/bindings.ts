@@ -54,6 +54,12 @@ export const commands = {
 	 */
 	signIn: () => typedError<null, string>(__TAURI_INVOKE("sign_in")),
 	/**
+	 *  Includes exactly `calendar_ids` in today's plan (R2), un-including every other
+	 *  listed calendar. Fire-and-forget: the new flags show in the snapshot's
+	 *  `calendars`. Unknown ids are ignored.
+	 */
+	setIncludedCalendars: (calendarIds: string[]) => typedError<null, string>(__TAURI_INVOKE("set_included_calendars", { calendarIds })),
+	/**
 	 *  The latest snapshot, read from the engine's `watch` receiver. Sends nothing to
 	 *  the engine (AD-4), so a window that loads after the last event still renders.
 	 */
@@ -115,6 +121,18 @@ export type BaselineSlotView_Serialize = {
 	scheduledStart: string | null,
 	/**  RFC 3339 UTC instant; set exactly when `scheduledStart` is. */
 	scheduledEnd: string | null,
+};
+
+/**  One calendar of the account and whether it feeds today's plan. */
+export type CalendarView = {
+	/**  Google's calendar id. */
+	id: string,
+	/**  The name to show. */
+	name: string,
+	/**  The account's primary calendar. */
+	primary: boolean,
+	/**  Its events feed today's plan. */
+	included: boolean,
 };
 
 /**  A day's planned-versus-actual report (AD-16), the reply of [`query_day`]. */
@@ -508,6 +526,11 @@ export type SnapshotEvent_Deserialize = {
 	knownTags: string[],
 	/**  The Google account state. Never an address or a token. */
 	google: GoogleAccountView,
+	/**
+	 *  The account's calendars as last listed, in Google's order. Empty before
+	 *  the first listing.
+	 */
+	calendars: CalendarView[],
 };
 
 /**
@@ -540,6 +563,11 @@ export type SnapshotEvent_Serialize = {
 	knownTags: string[],
 	/**  The Google account state. Never an address or a token. */
 	google: GoogleAccountView,
+	/**
+	 *  The account's calendars as last listed, in Google's order. Empty before
+	 *  the first listing.
+	 */
+	calendars: CalendarView[],
 };
 
 export type StatusKeyView = "store" | "commandRejected" | "overflow" | 

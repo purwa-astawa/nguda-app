@@ -11,7 +11,7 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 
 use crate::baseline::{Baseline, LockDecision};
-use crate::calendar::SyncCursor;
+use crate::calendar::{CalendarEntry, SyncCursor};
 use crate::day_log::DayLogEntry;
 use crate::plan::{Day, ItemId, PlanItem};
 use crate::settings::{Settings, WorkEnd};
@@ -56,6 +56,8 @@ pub enum StoreOp {
     PutSyncCursor { cursor: SyncCursor },
     /// Deletes the calendar's sync cursor. Deleting a missing one is not an error.
     ClearSyncCursor { calendar_id: String },
+    /// Replaces the whole calendar table with `calendars`, kept in this order.
+    SetCalendars { calendars: Vec<CalendarEntry> },
 }
 
 /// Where the one open segment is: its item's day, the item, and its start.
@@ -160,4 +162,7 @@ pub trait Store: Send + Sync + 'static {
 
     /// Every stored calendar sync cursor, in any order.
     fn load_sync_cursors(&self) -> StoreFuture<Vec<SyncCursor>>;
+
+    /// The stored calendar table, in stored order. Empty before any listing.
+    fn load_calendars(&self) -> StoreFuture<Vec<CalendarEntry>>;
 }

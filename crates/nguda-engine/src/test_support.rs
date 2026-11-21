@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nguda_core::{
-    Baseline, CalendarChange, CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource,
-    Clock, Date, Day, DayLogEntry, FetchedEvent, FileSink, FileSinkError, IdGen, ItemId,
-    LockChoice, LockDecision, OpenSegmentRef, OrderKey, PlanItem, PlanItemRecord, PromptId, Random,
-    Segment, Settings, SleepFuture, Store, StoreBatch, StoreError, StoreFuture, StoreOp, SyncBatch,
-    SyncCursor, Timestamp, Uuid, WorkEnd,
+    Baseline, CalendarChange, CalendarEntry, CalendarError, CalendarErrorKind, CalendarFuture,
+    CalendarInfo, CalendarSource, Clock, Date, Day, DayLogEntry, FetchedEvent, FileSink,
+    FileSinkError, IdGen, ItemId, LockChoice, LockDecision, OpenSegmentRef, OrderKey, PlanItem,
+    PlanItemRecord, PromptId, Random, Segment, Settings, SleepFuture, Store, StoreBatch,
+    StoreError, StoreFuture, StoreOp, SyncBatch, SyncCursor, Timestamp, Uuid, WorkEnd,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -153,6 +153,8 @@ struct Data {
     tag_names: Vec<String>,
     /// calendar id → its sync cursor.
     cursors: BTreeMap<String, SyncCursor>,
+    /// The calendar table, in stored order.
+    calendars: Vec<CalendarEntry>,
 }
 
 impl Data {
@@ -313,6 +315,13 @@ impl Data {
             StoreOp::ClearSyncCursor { calendar_id } => {
                 self.cursors.remove(calendar_id);
             }
+            StoreOp::SetCalendars { calendars } => {
+                let mut seen = std::collections::BTreeSet::new();
+                if !calendars.iter().all(|c| seen.insert(c.id.as_str())) {
+                    return Err(StoreError::new("set calendars: duplicate calendar id"));
+                }
+                self.calendars = calendars.clone();
+            }
         }
         Ok(())
     }
@@ -375,6 +384,7 @@ fn record_of(item: &PlanItem) -> PlanItemRecord {
         tags: item.tags().to_vec(),
         source: item.source().cloned(),
         removed_by_source_at: item.removed_by_source_at(),
+        hidden_at: item.hidden_at(),
     }
 }
 
@@ -469,6 +479,16 @@ impl MemoryStore {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Stores `calendars` as the calendar table as is, bypassing batches.
+    pub(crate) fn seed_calendars(&self, calendars: Vec<CalendarEntry>) {
+        self.data.lock().unwrap().calendars = calendars;
+    }
+
+    /// The stored calendar table, in stored order.
+    pub(crate) fn stored_calendars(&self) -> Vec<CalendarEntry> {
+        self.data.lock().unwrap().calendars.clone()
     }
 
     pub(crate) fn seed_last_alive(&self, at: Option<Timestamp>) {
@@ -576,6 +596,10 @@ impl Store for MemoryStore {
     fn load_sync_cursors(&self) -> StoreFuture<Vec<SyncCursor>> {
         self.read(|d| Ok(d.cursors.values().cloned().collect()))
     }
+
+    fn load_calendars(&self) -> StoreFuture<Vec<CalendarEntry>> {
+        self.read(|d| Ok(d.calendars.clone()))
+    }
 }
 
 pub(crate) const SINK_FAILURE: &str = "injected sink failure";
@@ -616,27 +640,61 @@ impl FileSink for FakeFileSink {
     }
 }
 
-/// The calendar id the fake's batches use.
+/// The calendar id the fake's batches use: the fake account's primary calendar.
 pub(crate) const CALENDAR: &str = "me@example.com";
 
 type FetchReply = oneshot::Sender<Result<SyncBatch, CalendarError>>;
 type SignInReply = oneshot::Sender<Result<(), CalendarError>>;
-/// What one sync call was given: the cursor `(calendar_id, token)` and the window.
-pub(crate) type SyncCall = (Option<(String, String)>, (Timestamp, Timestamp));
+/// What one sync call was given: the calendar id, the sync token (`None` for a
+/// full fetch), and the window.
+pub(crate) type SyncCall = (String, Option<String>, (Timestamp, Timestamp));
 /// A sync's inputs and its pending reply (taken once resolved).
 type PendingFetch = (SyncCall, Option<FetchReply>);
 
-/// A [`CalendarSource`] whose calls the test answers explicitly, one by one and
-/// in any order: each call waits on its own oneshot until resolved.
-#[derive(Default)]
+/// The fake account's primary calendar, as listed.
+pub(crate) fn primary_info() -> CalendarInfo {
+    CalendarInfo {
+        id: CALENDAR.into(),
+        name: "Me".into(),
+        primary: true,
+    }
+}
+
+/// A [`CalendarSource`] whose syncs and sign-ins the test answers explicitly,
+/// one by one and in any order: each call waits on its own oneshot until
+/// resolved. Listing answers at once with a settable list (by default the one
+/// primary calendar [`CALENDAR`]).
 pub(crate) struct FakeCalendar {
     fetches: Mutex<Vec<PendingFetch>>,
     sign_ins: Mutex<Vec<Option<SignInReply>>>,
+    listing: Mutex<Result<Vec<CalendarInfo>, CalendarError>>,
+    lists: AtomicU64,
+}
+
+impl Default for FakeCalendar {
+    fn default() -> Self {
+        Self {
+            fetches: Mutex::default(),
+            sign_ins: Mutex::default(),
+            listing: Mutex::new(Ok(vec![primary_info()])),
+            lists: AtomicU64::new(0),
+        }
+    }
 }
 
 impl FakeCalendar {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Sets what every later listing answers.
+    pub(crate) fn set_listing(&self, listing: Result<Vec<CalendarInfo>, CalendarError>) {
+        *self.listing.lock().unwrap() = listing;
+    }
+
+    /// How many listings were made.
+    pub(crate) fn list_count(&self) -> u64 {
+        self.lists.load(Ordering::SeqCst)
     }
 
     pub(crate) fn fetch_count(&self) -> usize {
@@ -649,13 +707,20 @@ impl FakeCalendar {
 
     /// The window of sync `n` (0-based).
     pub(crate) fn fetch_window(&self, n: usize) -> (Timestamp, Timestamp) {
-        self.fetches.lock().unwrap()[n].0.1
+        self.fetches.lock().unwrap()[n].0.2
     }
 
-    /// The cursor `(calendar_id, token)` sync `n` (0-based) was given, `None` for
-    /// a full fetch.
-    pub(crate) fn fetch_cursor(&self, n: usize) -> Option<(String, String)> {
+    /// The calendar id sync `n` (0-based) was given.
+    pub(crate) fn fetch_calendar(&self, n: usize) -> String {
         self.fetches.lock().unwrap()[n].0.0.clone()
+    }
+
+    /// The `(calendar_id, token)` sync `n` (0-based) resumed from, `None` for a
+    /// full fetch.
+    pub(crate) fn fetch_cursor(&self, n: usize) -> Option<(String, String)> {
+        let calls = self.fetches.lock().unwrap();
+        let (calendar_id, token, _) = &calls[n].0;
+        token.clone().map(|t| (calendar_id.clone(), t))
     }
 
     /// Answers sync `n` (0-based) with `result`.
@@ -704,9 +769,16 @@ impl CalendarSource for FakeCalendar {
         Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
     }
 
-    fn sync_primary(
+    fn list_calendars(&self) -> CalendarFuture<Vec<CalendarInfo>> {
+        self.lists.fetch_add(1, Ordering::SeqCst);
+        let listing = self.listing.lock().unwrap().clone();
+        Box::pin(async move { listing })
+    }
+
+    fn sync_calendar(
         &self,
-        cursor: Option<(String, String)>,
+        calendar_id: String,
+        token: Option<String>,
         window_start: Timestamp,
         window_end: Timestamp,
     ) -> CalendarFuture<SyncBatch> {
@@ -714,7 +786,7 @@ impl CalendarSource for FakeCalendar {
         self.fetches
             .lock()
             .unwrap()
-            .push(((cursor, (window_start, window_end)), Some(tx)));
+            .push(((calendar_id, token, (window_start, window_end)), Some(tx)));
         Box::pin(async move { rx.await.unwrap_or_else(|_| Err(dropped())) })
     }
 }

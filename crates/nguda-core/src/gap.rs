@@ -225,6 +225,7 @@ mod tests {
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             source: None,
             removed_by_source_at: None,
+            hidden_at: None,
         }
     }
 

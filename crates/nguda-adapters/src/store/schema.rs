@@ -189,8 +189,25 @@ CREATE TABLE calendar_sync (
 ) STRICT;
 "#;
 
+/// v12: the account's calendars and which feed the plan (R2), in listing order
+/// (`position`), and `hidden_at` on an imported item hidden because its calendar
+/// was un-included (a removed tombstone a re-import revives). Instants are UTC
+/// nanoseconds like every other instant column.
+const V12: &str = r#"
+CREATE TABLE calendar (
+    calendar_id TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    is_primary  INTEGER NOT NULL CHECK (is_primary IN (0, 1)),
+    included    INTEGER NOT NULL CHECK (included IN (0, 1)),
+    position    INTEGER NOT NULL
+) STRICT;
+
+ALTER TABLE plan_item ADD COLUMN hidden_at INTEGER
+    CHECK (hidden_at IS NULL OR (calendar_id IS NOT NULL AND status = 'removed'));
+"#;
+
 /// Every migration's SQL, oldest first.
-const ALL: [&str; 11] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
+const ALL: [&str; 12] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
 
 /// The app's migrations, oldest first. The schema version is their count.
 pub(super) fn migrations() -> Migrations<'static> {

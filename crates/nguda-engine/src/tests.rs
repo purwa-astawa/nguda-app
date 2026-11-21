@@ -7,17 +7,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nguda_core::{
-    ActualSegment, Baseline, BaselineItem, CalendarChange, CalendarError, CalendarErrorKind,
-    CalendarRef, Date, Day, DayLogEntry, DayLogKind, EventKey, ExportRange, FetchedEvent,
-    GapFigure, IsoWeek, ItemId, ItemStatus, LockChoice, LockDecision, OrderKey, PlanItem,
-    PlanItemRecord, PlannedSource, PromptKind, ReportRow, Segment, SlotKind, Span, StoreError,
-    StoreOp, SyncBatch, SyncCursor, TagGap, TimeZone, WorkEnd, export_csv,
+    ActualSegment, Baseline, BaselineItem, CalendarChange, CalendarEntry, CalendarError,
+    CalendarErrorKind, CalendarInfo, CalendarRef, Date, Day, DayLogEntry, DayLogKind, EventKey,
+    ExportRange, FetchedEvent, GapFigure, IsoWeek, ItemId, ItemStatus, LockChoice, LockDecision,
+    OrderKey, PlanItem, PlanItemRecord, PlannedSource, PromptKind, ReportRow, Segment, SlotKind,
+    Span, StoreError, StoreOp, SyncBatch, SyncCursor, TagGap, TimeZone, WorkEnd, export_csv,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::test_support::{
     FakeCalendar, FakeClock, FakeFileSink, FixedRandom, INJECTED, MemoryStore, SINK_FAILURE,
-    SeqIds, day_running_other, day1, day2, id, item, key, locked, no_lock, prompt, ts,
+    SeqIds, day_running_other, day1, day2, id, item, key, locked, no_lock, primary_info, prompt,
+    ts,
 };
 use crate::{
     Effect, EngineClosed, EngineDeps, EngineHandle, EngineMsg, GoogleAccount, InsertAnchor,
@@ -51,8 +52,16 @@ struct Harness {
 }
 
 fn start(clock: &Arc<FakeClock>, store: &Arc<MemoryStore>) -> Harness {
+    start_on(clock, store, FakeCalendar::new())
+}
+
+/// [`start`] with `calendar` as the account, so its listing can be set first.
+fn start_on(
+    clock: &Arc<FakeClock>,
+    store: &Arc<MemoryStore>,
+    calendar: Arc<FakeCalendar>,
+) -> Harness {
     let files = FakeFileSink::new();
-    let calendar = FakeCalendar::new();
     let random = FixedRandom::new();
     let (engine, effects) = spawn(EngineDeps {
         clock: clock.clone(),
@@ -3361,19 +3370,31 @@ async fn startup_imports_today_and_shows_the_account_unknown_until_it_answers() 
     assert_eq!(h.calendar.fetch_window(0), (ts(0), ts(DAY_SECS)));
 }
 
+/// A started engine at `at` whose account's listing fails with `kind`, at rev 2
+/// (the startup round's failure applied).
+async fn listing_fails_on(
+    at: i64,
+    kind: CalendarErrorKind,
+    message: &str,
+) -> (Harness, Arc<MemoryStore>, Snapshot) {
+    let (clock, store) = (FakeClock::at(at), MemoryStore::new());
+    let calendar = FakeCalendar::new();
+    calendar.set_listing(Err(cal_err(kind, message)));
+    let mut h = start_on(&clock, &store, calendar);
+    let snap = h.rev(2).await;
+    (h, store, snap)
+}
+
 #[tokio::test]
 async fn not_signed_in_at_startup_shows_signed_out_with_no_status() {
-    let (mut h, store) = running_on(1_000, None).await;
-    h.fetches(1).await;
-    let batches = store.batches().len();
-    h.calendar.resolve_events(
-        0,
-        Err(cal_err(CalendarErrorKind::NotSignedIn, "not signed in")),
-    );
-    let snap = h.rev(2).await;
+    let (h, store, snap) =
+        listing_fails_on(1_000, CalendarErrorKind::NotSignedIn, "not signed in").await;
     assert_eq!(snap.google, GoogleAccount::SignedOut);
     assert!(snap.status.is_empty());
-    assert_eq!(store.batches().len(), batches, "nothing committed");
+    assert!(snap.calendars.is_empty());
+    assert_eq!(store.batches().len(), 1, "only the startup heartbeat");
+    assert!(store.stored_calendars().is_empty());
+    assert_eq!(h.calendar.fetch_count(), 0, "no calendar synced");
 }
 
 #[tokio::test]
@@ -3532,28 +3553,29 @@ async fn an_import_from_before_a_rollover_is_dropped_and_the_new_day_is_imported
 
 #[tokio::test]
 async fn a_sign_in_failure_signs_out_and_sets_the_sync_status() {
-    let (mut h, _store) = running_on(1_000, None).await;
-    h.fetches(1).await;
+    let (mut h, _store, snap) =
+        listing_fails_on(1_000, CalendarErrorKind::NotSignedIn, "not signed in").await;
+    assert_eq!(snap.google, GoogleAccount::SignedOut);
     h.send(EngineMsg::SignIn);
-    assert_eq!(h.rev(2).await.google, GoogleAccount::SigningIn);
+    assert_eq!(h.rev(3).await.google, GoogleAccount::SigningIn);
     h.sign_ins(1).await;
     h.calendar.resolve_sign_in(
         0,
         Err(cal_err(CalendarErrorKind::Auth, "sign-in timed out")),
     );
-    let snap = h.rev(3).await;
+    let snap = h.rev(4).await;
     assert_eq!(snap.google, GoogleAccount::SignedOut);
     assert_eq!(
         sync_status(&snap),
         Some("Google sign-in failed: sign-in timed out")
     );
-    // The startup import answering "not signed in" now changes nothing visible.
-    h.calendar.resolve_events(
-        0,
-        Err(cal_err(CalendarErrorKind::NotSignedIn, "not signed in")),
-    );
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(h.rx.borrow().rev, 3);
+    assert_eq!(h.rx.borrow().rev, 4);
+    assert_eq!(
+        h.calendar.list_count(),
+        1,
+        "no round after a failed sign-in"
+    );
 }
 
 #[tokio::test]
@@ -3608,7 +3630,13 @@ async fn an_import_failure_keeps_the_plan_and_the_next_success_clears_sync() {
         Some("Calendar import failed: Calendar API HTTP 503")
     );
     assert!(day_of(&snap).items().is_empty());
-    assert_eq!(store.batches().len(), batches);
+    // The listing succeeded: only the calendar table is committed.
+    let committed = store.batches();
+    assert_eq!(committed.len(), batches + 1);
+    assert!(matches!(
+        committed[batches].ops(),
+        [StoreOp::SetCalendars { .. }]
+    ));
     h.send(EngineMsg::SignIn);
     h.rev(3).await;
     h.sign_ins(1).await;
@@ -3688,6 +3716,7 @@ fn imported_item(
             source_secs: len,
         }),
         removed_by_source_at: None,
+        hidden_at: None,
     })
     .unwrap()
 }
@@ -3941,22 +3970,20 @@ async fn a_wake_during_a_backoff_waits_for_the_backed_off_poll() {
 
 #[tokio::test]
 async fn no_client_signs_out_and_schedules_no_poll() {
-    let (mut h, _store) = syncing_on(1_000, None, None).await;
-    h.calendar.resolve_events(
-        0,
-        Err(cal_err(
-            CalendarErrorKind::NoClient,
-            "no Google OAuth client built in",
-        )),
-    );
-    let snap = h.rev(2).await;
+    let (h, _store, snap) = listing_fails_on(
+        1_000,
+        CalendarErrorKind::NoClient,
+        "no Google OAuth client built in",
+    )
+    .await;
     assert_eq!(snap.google, GoogleAccount::SignedOut);
     assert_eq!(
         sync_status(&snap),
         Some("Calendar import failed: no Google OAuth client built in")
     );
     h.tick_to(1_700).await;
-    assert_eq!(h.calendar.fetch_count(), 1);
+    assert_eq!(h.calendar.list_count(), 1);
+    assert_eq!(h.calendar.fetch_count(), 0);
 }
 
 #[tokio::test]
@@ -4016,11 +4043,13 @@ async fn a_410_clears_the_cursor_refetches_in_full_and_keeps_user_fields() {
         "the cursor clear committed"
     );
     assert_eq!(h.calendar.fetch_cursor(1), None, "a full fetch at once");
+    // The 410 round committed the calendar table with the cursor clear.
+    assert_eq!(h.rev(2).await.calendars.len(), 1);
     h.calendar.resolve_fetch(
         1,
         sync(vec![upsert("a", "Daily", 12_000, 12_900)], Some("t2")),
     );
-    let snap = h.rev(2).await;
+    let snap = h.rev(3).await;
     let today = day_of(&snap);
     assert_eq!(today.items().len(), 1, "re-merged by key, no duplicate");
     let item = today.item(id(100)).unwrap();
@@ -4269,20 +4298,18 @@ async fn a_sync_without_a_next_token_clears_the_cursor() {
 
 #[tokio::test]
 async fn not_signed_in_schedules_no_poll_until_a_sign_in() {
-    let (mut h, _store) = syncing_on(1_000, None, None).await;
-    h.calendar.resolve_events(
-        0,
-        Err(cal_err(CalendarErrorKind::NotSignedIn, "not signed in")),
-    );
-    h.rev(2).await;
+    let (mut h, _store, _) =
+        listing_fails_on(1_000, CalendarErrorKind::NotSignedIn, "not signed in").await;
     h.tick_to(1_700).await;
-    assert_eq!(h.calendar.fetch_count(), 1);
+    assert_eq!(h.calendar.list_count(), 1);
+    assert_eq!(h.calendar.fetch_count(), 0);
+    h.calendar.set_listing(Ok(vec![primary_info()]));
     h.send(EngineMsg::SignIn);
     h.rev(3).await;
     h.sign_ins(1).await;
     h.calendar.resolve_sign_in(0, Ok(()));
     h.rev(4).await;
-    h.fetches(2).await;
+    h.fetches(1).await;
 }
 
 #[tokio::test]
@@ -4303,4 +4330,605 @@ async fn a_failed_sync_keeps_the_plan_and_polls_on_the_normal_schedule() {
     h.tick_to(1_300).await;
     h.fetches(2).await;
     assert_eq!(h.calendar.fetch_cursor(1), cursor_arg("t1"));
+}
+
+// --- Calendar selection (R2, AD-9, AD-17) ---
+
+const OTHER: &str = "team#x@group.calendar.google.com";
+
+fn info(id: &str, primary: bool) -> CalendarInfo {
+    CalendarInfo {
+        id: id.into(),
+        name: format!("name of {id}"),
+        primary,
+    }
+}
+
+fn entry(id: &str, primary: bool, included: bool) -> CalendarEntry {
+    CalendarEntry {
+        id: id.into(),
+        name: format!("name of {id}"),
+        primary,
+        included,
+    }
+}
+
+fn both_listed() -> Vec<CalendarInfo> {
+    vec![info(CAL, true), info(OTHER, false)]
+}
+
+fn select(ids: &[&str]) -> EngineMsg {
+    EngineMsg::SetIncludedCalendars {
+        calendar_ids: ids.iter().map(|s| (*s).to_owned()).collect(),
+    }
+}
+
+/// `(id, included)` of each calendar of `snap`, in order.
+fn flags(snap: &Snapshot) -> Vec<(String, bool)> {
+    snap.calendars
+        .iter()
+        .map(|c| (c.id.clone(), c.included))
+        .collect()
+}
+
+fn flag(id: &str, included: bool) -> (String, bool) {
+    (id.to_owned(), included)
+}
+
+fn sync_of(
+    calendar_id: &str,
+    changes: Vec<CalendarChange>,
+    token: Option<&str>,
+) -> Result<SyncBatch, CalendarError> {
+    Ok(SyncBatch {
+        calendar_id: calendar_id.into(),
+        changes,
+        next_token: token.map(str::to_owned),
+    })
+}
+
+fn other_upsert(source_id: &str, start: i64, end: i64) -> CalendarChange {
+    CalendarChange::Upsert(FetchedEvent {
+        calendar_id: OTHER.into(),
+        ..event(source_id, &format!("event {source_id}"), start, end)
+    })
+}
+
+fn other_cursor(token: &str, date: Date) -> SyncCursor {
+    SyncCursor {
+        calendar_id: OTHER.into(),
+        token: token.into(),
+        date,
+    }
+}
+
+/// [`imported_item`] of calendar [`OTHER`].
+fn other_item(
+    n: u128,
+    source_id: &str,
+    start: i64,
+    segments: Vec<Segment>,
+    status: ItemStatus,
+) -> PlanItem {
+    let base = imported_item(n, source_id, start, 900, &["meet"], segments, status);
+    let mut source = base.source().unwrap().clone();
+    source.calendar_id = OTHER.into();
+    PlanItem::restore(PlanItemRecord {
+        id: base.id(),
+        title: base.title().to_owned(),
+        planned_secs: base.planned_secs(),
+        order: base.order().clone(),
+        fixed: base.fixed(),
+        pinned_start: base.pinned_start(),
+        status: base.status(),
+        removed_at: base.removed_at(),
+        segments: base.segments().to_vec(),
+        carried_from: None,
+        tags: base.tags().to_vec(),
+        source: Some(source),
+        removed_by_source_at: None,
+        hidden_at: None,
+    })
+    .unwrap()
+}
+
+/// A started engine at `at` on `day` (seeded if given), with `calendars` and
+/// `cursors` seeded and the account listing `listed`, at rev 1, its startup
+/// round's first sync issued.
+async fn selecting_on(
+    at: i64,
+    day: Option<&Day>,
+    calendars: Vec<CalendarEntry>,
+    cursors: Vec<SyncCursor>,
+    listed: Vec<CalendarInfo>,
+) -> (Harness, Arc<MemoryStore>) {
+    let (clock, store) = (FakeClock::at(at), MemoryStore::new());
+    if let Some(day) = day {
+        store.seed(day);
+    }
+    store.seed_calendars(calendars);
+    for c in cursors {
+        store.seed_cursor(c);
+    }
+    let calendar = FakeCalendar::new();
+    calendar.set_listing(Ok(listed));
+    let mut h = start_on(&clock, &store, calendar);
+    h.rev(1).await;
+    h.fetches(1).await;
+    (h, store)
+}
+
+#[tokio::test]
+async fn the_first_round_stores_every_calendar_with_only_the_primary_included() {
+    let (mut h, store) = selecting_on(1_000, None, vec![], vec![], both_listed()).await;
+    assert_eq!(h.calendar.fetch_calendar(0), CAL);
+    assert_eq!(h.calendar.fetch_cursor(0), None, "a full fetch");
+    let batches = store.batches().len();
+    h.calendar.resolve_fetch(
+        0,
+        sync(vec![upsert("a", "Standup", 9_000, 9_900)], Some("t1")),
+    );
+    let snap = h.rev(2).await;
+    assert_eq!(flags(&snap), vec![flag(CAL, true), flag(OTHER, false)]);
+    assert_eq!(snap.calendars[1].name, format!("name of {OTHER}"));
+    assert!(!snap.calendars[1].primary);
+    assert_eq!(store.stored_calendars(), snap.calendars);
+    let all = store.batches();
+    assert_eq!(all.len(), batches + 1, "one batch");
+    let ops = all.last().unwrap().ops();
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, StoreOp::SetCalendars { .. }))
+    );
+    assert!(ops.iter().any(|op| matches!(op, StoreOp::PutItem { .. })));
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, StoreOp::PutSyncCursor { .. }))
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        h.calendar.fetch_count(),
+        1,
+        "the other calendar is not synced"
+    );
+}
+
+#[tokio::test]
+async fn ticking_a_calendar_imports_its_events_with_its_own_cursor() {
+    let (mut h, store) = selecting_on(1_000, None, vec![], vec![], both_listed()).await;
+    h.calendar.resolve_fetch(0, sync(vec![], Some("t1")));
+    h.rev(2).await;
+    h.send(select(&[CAL, OTHER]));
+    let snap = h.rev(3).await;
+    assert_eq!(flags(&snap), vec![flag(CAL, true), flag(OTHER, true)]);
+    assert_eq!(store.stored_calendars(), snap.calendars, "committed");
+    // A new round at once: the primary resumes, the other is fetched in full.
+    h.fetches(2).await;
+    assert_eq!(h.calendar.fetch_cursor(1), cursor_arg("t1"));
+    h.calendar.resolve_fetch(1, sync(vec![], Some("t1")));
+    h.fetches(3).await;
+    assert_eq!(h.calendar.fetch_calendar(2), OTHER);
+    assert_eq!(h.calendar.fetch_cursor(2), None);
+    assert_eq!(h.calendar.fetch_window(2), (ts(0), ts(DAY_SECS)));
+    h.calendar.resolve_fetch(
+        2,
+        sync_of(OTHER, vec![other_upsert("o1", 20_000, 21_800)], Some("o1")),
+    );
+    let snap = h.rev(4).await;
+    let item = imported(&snap, "o1");
+    assert!(item.fixed());
+    assert_eq!(item.pinned_start(), Some(ts(20_000)));
+    assert_eq!(item.source().unwrap().calendar_id, OTHER);
+    let mut cursors = store.stored_cursors();
+    cursors.sort_by(|a, b| a.calendar_id.cmp(&b.calendar_id));
+    assert_eq!(
+        cursors,
+        vec![cursor("t1", day1()), other_cursor("o1", day1())]
+    );
+    assert_eq!(calendar_changed(&store, day1()), vec![item.id()]);
+}
+
+#[tokio::test]
+async fn the_selection_survives_a_restart_and_is_what_syncs() {
+    let (clock, store) = (FakeClock::at(1_000), MemoryStore::new());
+    let calendar = FakeCalendar::new();
+    calendar.set_listing(Ok(both_listed()));
+    let mut h = start_on(&clock, &store, calendar);
+    h.rev(1).await;
+    h.fetches(1).await;
+    h.calendar.resolve_fetch(0, sync(vec![], Some("t1")));
+    h.rev(2).await;
+    h.send(select(&[CAL, OTHER]));
+    h.rev(3).await;
+    drop(h);
+
+    let calendar = FakeCalendar::new();
+    calendar.set_listing(Ok(both_listed()));
+    let mut h = start_on(&clock, &store, calendar);
+    let snap = h.rev(1).await;
+    assert_eq!(flags(&snap), vec![flag(CAL, true), flag(OTHER, true)]);
+    h.fetches(1).await;
+    assert_eq!(h.calendar.fetch_calendar(0), CAL);
+    h.calendar.resolve_fetch(0, sync(vec![], Some("t1")));
+    h.fetches(2).await;
+    assert_eq!(h.calendar.fetch_calendar(1), OTHER);
+}
+
+/// Today with three items of [`OTHER`]: 100 pending and untracked, 101 done
+/// with time, 102 pending with a closed segment.
+fn other_day() -> Day {
+    let mut day = no_lock(Day::new(day1(), "UTC"));
+    day.add(other_item(100, "o1", 20_000, vec![], ItemStatus::Pending))
+        .unwrap();
+    day.add(other_item(
+        101,
+        "o2",
+        22_000,
+        vec![closed(500, 600)],
+        ItemStatus::Done,
+    ))
+    .unwrap();
+    day.add(other_item(
+        102,
+        "o3",
+        24_000,
+        vec![closed(700, 800)],
+        ItemStatus::Pending,
+    ))
+    .unwrap();
+    day
+}
+
+#[tokio::test]
+async fn unticking_hides_untracked_items_and_reticking_revives_them() {
+    let day = other_day();
+    let (mut h, store) = selecting_on(
+        1_000,
+        Some(&day),
+        vec![entry(CAL, true, true), entry(OTHER, false, true)],
+        vec![cursor("t1", day1()), other_cursor("o1", day1())],
+        both_listed(),
+    )
+    .await;
+    let batches = store.batches().len();
+    h.send(select(&[CAL]));
+    let snap = h.rev(2).await;
+    assert_eq!(flags(&snap), vec![flag(CAL, true), flag(OTHER, false)]);
+    let today = day_of(&snap).clone();
+    let hidden = today.item(id(100)).unwrap();
+    assert_eq!(hidden.status(), ItemStatus::Removed);
+    assert_eq!(hidden.removed_at(), Some(ts(1_000)));
+    assert_eq!(hidden.hidden_at(), Some(ts(1_000)));
+    assert_eq!(today.item(id(101)), day.item(id(101)), "time kept");
+    assert_eq!(today.item(id(102)), day.item(id(102)), "time kept");
+    assert_eq!(store.batches().len(), batches + 1, "one batch");
+    assert_eq!(store.stored_cursors(), vec![cursor("t1", day1())]);
+    assert_eq!(store.stored_calendars(), snap.calendars);
+    assert_eq!(calendar_changed(&store, day1()), vec![id(100)]);
+    assert_eq!(today, store.stored_day(day1()).unwrap());
+
+    // The startup round answers late: superseded by the selection's round.
+    h.fetches(2).await;
+    h.calendar
+        .resolve_fetch(0, sync(vec![upsert("a", "Late", 9_000, 9_900)], Some("x")));
+    h.calendar.resolve_fetch(1, sync(vec![], Some("t1")));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Only the account turning signed in is new: the stale round added nothing.
+    let snap = h.rev(3).await;
+    assert_eq!(snap.google, GoogleAccount::SignedIn);
+    assert_eq!(snap.day, Some(today.clone()));
+    assert_eq!(store.stored_cursors(), vec![cursor("t1", day1())]);
+    assert_eq!(h.calendar.fetch_count(), 2, "only the primary is synced");
+
+    h.send(select(&[CAL, OTHER]));
+    h.rev(4).await;
+    h.fetches(3).await;
+    h.calendar.resolve_fetch(2, sync(vec![], Some("t1")));
+    h.fetches(4).await;
+    assert_eq!(h.calendar.fetch_calendar(3), OTHER);
+    assert_eq!(
+        h.calendar.fetch_cursor(3),
+        None,
+        "a re-include fetches in full"
+    );
+    h.calendar.resolve_fetch(
+        3,
+        sync_of(
+            OTHER,
+            vec![
+                other_upsert("o1", 20_000, 20_900),
+                other_upsert("o2", 22_000, 22_900),
+            ],
+            Some("o2"),
+        ),
+    );
+    let snap = h.rev(5).await;
+    let revived = day_of(&snap).item(id(100)).unwrap();
+    assert_eq!(revived.status(), ItemStatus::Pending);
+    assert_eq!(revived.removed_at(), None);
+    assert_eq!(revived.hidden_at(), None);
+    let original = day.item(id(100)).unwrap();
+    assert_eq!(revived.tags(), original.tags());
+    assert_eq!(revived.order(), original.order());
+    assert_eq!(revived.fixed(), original.fixed());
+    assert_eq!(revived.pinned_start(), original.pinned_start());
+    assert_eq!(day_of(&snap).item(id(101)), day.item(id(101)));
+    assert_eq!(calendar_changed(&store, day1()), vec![id(100), id(100)]);
+    assert_eq!(day_of(&snap), &store.stored_day(day1()).unwrap());
+}
+
+#[tokio::test]
+async fn an_unchanged_or_unknown_selection_changes_nothing() {
+    let (mut h, store) = selecting_on(1_000, None, vec![], vec![], both_listed()).await;
+    h.calendar.resolve_fetch(0, sync(vec![], Some("t1")));
+    h.rev(2).await;
+    let batches = store.batches().len();
+    h.send(select(&[CAL, "nobody@example.com"]));
+    h.send(select(&[CAL]));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    h.rev(3).await;
+    assert_eq!(
+        store.batches().len(),
+        batches + 1,
+        "only the work-end change"
+    );
+    assert_eq!(h.calendar.list_count(), 1, "no new round");
+    assert_eq!(h.calendar.fetch_count(), 1);
+}
+
+#[tokio::test]
+async fn a_calendar_gone_from_the_list_leaves_the_table_and_its_cursor() {
+    let mut day = no_lock(Day::new(day1(), "UTC"));
+    day.add(other_item(100, "o1", 20_000, vec![], ItemStatus::Pending))
+        .unwrap();
+    let (mut h, store) = selecting_on(
+        1_000,
+        Some(&day),
+        vec![entry(CAL, true, true), entry(OTHER, false, true)],
+        vec![other_cursor("o1", day1())],
+        vec![info(CAL, true)],
+    )
+    .await;
+    h.calendar.resolve_fetch(0, sync(vec![], None));
+    let snap = h.rev(2).await;
+    assert_eq!(flags(&snap), vec![flag(CAL, true)]);
+    assert_eq!(store.stored_calendars(), snap.calendars);
+    assert!(store.stored_cursors().is_empty());
+    assert_eq!(day_of(&snap), &day, "its items are untouched");
+    assert_eq!(h.calendar.fetch_count(), 1);
+}
+
+#[tokio::test]
+async fn stored_flags_win_and_a_new_calendar_after_a_choice_is_not_included() {
+    let (mut h, store) = selecting_on(
+        1_000,
+        None,
+        vec![entry(CAL, true, false), entry(OTHER, false, true)],
+        vec![],
+        vec![
+            info(CAL, true),
+            info(OTHER, false),
+            info("new@group", false),
+        ],
+    )
+    .await;
+    assert_eq!(h.calendar.fetch_calendar(0), OTHER, "only the chosen one");
+    h.calendar.resolve_fetch(0, sync_of(OTHER, vec![], None));
+    let snap = h.rev(2).await;
+    assert_eq!(
+        flags(&snap),
+        vec![
+            flag(CAL, false),
+            flag(OTHER, true),
+            flag("new@group", false)
+        ]
+    );
+    assert_eq!(store.stored_calendars(), snap.calendars);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(h.calendar.fetch_count(), 1);
+}
+
+#[tokio::test]
+async fn mixed_outcomes_apply_the_successes_and_back_off() {
+    let (mut h, store) = selecting_on(
+        1_000,
+        None,
+        vec![entry(CAL, true, true), entry(OTHER, false, true)],
+        vec![],
+        both_listed(),
+    )
+    .await;
+    h.calendar.resolve_fetch(
+        0,
+        sync(vec![upsert("a", "Standup", 9_000, 9_900)], Some("t1")),
+    );
+    h.fetches(2).await;
+    h.calendar
+        .resolve_fetch(1, Err(cal_err(CalendarErrorKind::RateLimited, "HTTP 429")));
+    let snap = h.rev(2).await;
+    assert_eq!(imported(&snap, "a").title(), "Standup");
+    assert_eq!(
+        sync_status(&snap),
+        Some("Google is limiting requests; syncing again later")
+    );
+    assert_eq!(store.stored_cursors(), vec![cursor("t1", day1())]);
+    assert_eq!(day_of(&snap), &store.stored_day(day1()).unwrap());
+    // One rate limit doubles the base: the next round is due at 1_600.
+    h.tick_to(1_599).await;
+    assert_eq!(h.calendar.list_count(), 1);
+    h.tick_to(1_600).await;
+    h.fetches(3).await;
+    assert_eq!(h.calendar.list_count(), 2);
+}
+
+#[tokio::test]
+async fn a_410_on_one_calendar_clears_its_cursor_in_the_same_batch_and_refetches() {
+    let (mut h, store) = selecting_on(
+        1_000,
+        None,
+        vec![entry(CAL, true, true), entry(OTHER, false, true)],
+        vec![cursor("t1", day1()), other_cursor("o1", day1())],
+        both_listed(),
+    )
+    .await;
+    assert_eq!(h.calendar.fetch_cursor(0), cursor_arg("t1"));
+    h.calendar.resolve_fetch(
+        0,
+        sync(vec![upsert("a", "Standup", 9_000, 9_900)], Some("t2")),
+    );
+    h.fetches(2).await;
+    assert_eq!(
+        h.calendar.fetch_cursor(1),
+        Some((OTHER.to_owned(), "o1".to_owned()))
+    );
+    let batches = store.batches().len();
+    h.calendar.resolve_fetch(
+        1,
+        Err(cal_err(
+            CalendarErrorKind::Gone,
+            "the calendar sync token expired (HTTP 410)",
+        )),
+    );
+    let snap = h.rev(2).await;
+    assert_eq!(
+        imported(&snap, "a").title(),
+        "Standup",
+        "the primary applied"
+    );
+    assert_eq!(store.batches().len(), batches + 1, "one batch");
+    let ops = store.batches().last().unwrap().ops().to_vec();
+    assert!(ops.iter().any(|op| matches!(op, StoreOp::PutItem { .. })));
+    assert!(ops.iter().any(|op| matches!(
+        op,
+        StoreOp::ClearSyncCursor { calendar_id } if calendar_id == OTHER
+    )));
+    assert_eq!(store.stored_cursors(), vec![cursor("t2", day1())]);
+    // A new round at once: the primary resumes, the other is fetched in full.
+    h.fetches(3).await;
+    assert_eq!(h.calendar.fetch_cursor(2), cursor_arg("t2"));
+    h.calendar.resolve_fetch(2, sync(vec![], Some("t2")));
+    h.fetches(4).await;
+    assert_eq!(h.calendar.fetch_calendar(3), OTHER);
+    assert_eq!(h.calendar.fetch_cursor(3), None);
+}
+
+#[tokio::test]
+async fn a_listing_failure_changes_neither_the_table_nor_the_plan() {
+    for (kind, status) in [
+        (
+            CalendarErrorKind::Other,
+            "Calendar import failed: Calendar API HTTP 503",
+        ),
+        (
+            CalendarErrorKind::RateLimited,
+            "Google is limiting requests; syncing again later",
+        ),
+    ] {
+        let (clock, store) = (FakeClock::at(1_000), MemoryStore::new());
+        let stored = vec![entry(CAL, true, true), entry(OTHER, false, true)];
+        store.seed_calendars(stored.clone());
+        let calendar = FakeCalendar::new();
+        calendar.set_listing(Err(cal_err(kind, "Calendar API HTTP 503")));
+        let mut h = start_on(&clock, &store, calendar);
+        let snap = h.rev(2).await;
+        assert_eq!(sync_status(&snap), Some(status), "{kind:?}");
+        assert_eq!(snap.calendars, stored);
+        assert_eq!(store.stored_calendars(), stored);
+        assert_eq!(store.batches().len(), 1, "only the startup heartbeat");
+        assert_eq!(h.calendar.fetch_count(), 0);
+    }
+}
+
+/// Posts a round result straight into the engine's inbox, as a round task that
+/// finished before it was aborted would.
+fn deliver_round(h: &Harness, id: u64, date: Date, outcomes: Vec<crate::CalendarOutcome>) {
+    let round = crate::SyncRound {
+        calendars: vec![entry(CAL, true, true), entry(OTHER, false, true)],
+        outcomes,
+    };
+    h.engine
+        .tx
+        .send(crate::Inbox::ImportFinished {
+            id,
+            date,
+            result: Ok(round),
+        })
+        .unwrap();
+}
+
+fn primary_outcome(token: &str) -> crate::CalendarOutcome {
+    crate::CalendarOutcome {
+        calendar_id: CAL.into(),
+        incremental: false,
+        result: sync(vec![upsert("late", "Late", 9_000, 9_900)], Some(token)),
+    }
+}
+
+#[tokio::test]
+async fn a_delivered_round_with_a_superseded_id_changes_nothing() {
+    let (mut h, store) = selecting_on(
+        1_000,
+        None,
+        vec![entry(CAL, true, true), entry(OTHER, false, false)],
+        vec![cursor("t1", day1())],
+        both_listed(),
+    )
+    .await;
+    // The selection supersedes the startup round (id 1) with round 2.
+    h.send(select(&[CAL, OTHER]));
+    let snap = h.rev(2).await;
+    let (calendars, cursors, batches) = (
+        store.stored_calendars(),
+        store.stored_cursors(),
+        store.batches().len(),
+    );
+    deliver_round(&h, 1, day1(), vec![primary_outcome("stale")]);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    let after = h.rev(3).await;
+    assert_eq!(after.day, snap.day, "no plan change");
+    assert_eq!(after.calendars, snap.calendars);
+    assert_eq!(store.stored_calendars(), calendars, "no table change");
+    assert_eq!(store.stored_cursors(), cursors, "no cursor change");
+    assert_eq!(
+        store.batches().len(),
+        batches + 1,
+        "only the work-end change"
+    );
+}
+
+#[tokio::test]
+async fn a_delivered_round_for_a_rolled_over_date_changes_nothing() {
+    let (mut h, store) = selecting_on(
+        MIDNIGHT - 60,
+        None,
+        vec![entry(CAL, true, true), entry(OTHER, false, false)],
+        vec![],
+        both_listed(),
+    )
+    .await;
+    h.clock.set(MIDNIGHT + 10);
+    let snap = h.rev(2).await;
+    assert_eq!(day_of(&snap).date(), day2());
+    h.fetches(2).await;
+    let (calendars, cursors, batches) = (
+        store.stored_calendars(),
+        store.stored_cursors(),
+        store.batches().len(),
+    );
+    // The current id (the rollover's round 2), but yesterday's date.
+    deliver_round(&h, 2, day1(), vec![primary_outcome("yesterday")]);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.send(EngineMsg::SetWorkEnd { minutes: 1 });
+    let after = h.rev(3).await;
+    assert_eq!(after.day, snap.day, "no plan change");
+    assert_eq!(after.calendars, snap.calendars);
+    assert_eq!(store.stored_calendars(), calendars, "no table change");
+    assert_eq!(store.stored_cursors(), cursors, "no cursor change");
+    assert_eq!(
+        store.batches().len(),
+        batches + 1,
+        "only the work-end change"
+    );
 }

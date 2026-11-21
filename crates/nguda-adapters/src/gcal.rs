@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nguda_core::{
-    CalendarChange, CalendarError, CalendarErrorKind, CalendarFuture, CalendarSource, EventKey,
-    FetchedEvent, SecretStore, SyncBatch, Timestamp,
+    CalendarChange, CalendarError, CalendarErrorKind, CalendarFuture, CalendarInfo, CalendarSource,
+    EventKey, FetchedEvent, SecretStore, SyncBatch, Timestamp,
 };
 use oauth2::basic::{BasicClient, BasicRequestTokenError};
 use oauth2::{
@@ -158,14 +158,24 @@ impl CalendarSource for GcalSource {
         Box::pin(async move { inner.sign_in().await })
     }
 
-    fn sync_primary(
+    fn list_calendars(&self) -> CalendarFuture<Vec<CalendarInfo>> {
+        let inner = self.inner.clone();
+        Box::pin(async move { inner.list_calendars().await })
+    }
+
+    fn sync_calendar(
         &self,
-        cursor: Option<(String, String)>,
+        calendar_id: String,
+        token: Option<String>,
         window_start: Timestamp,
         window_end: Timestamp,
     ) -> CalendarFuture<SyncBatch> {
         let inner = self.inner.clone();
-        Box::pin(async move { inner.sync_primary(cursor, window_start, window_end).await })
+        Box::pin(async move {
+            inner
+                .sync_calendar(calendar_id, token, window_start, window_end)
+                .await
+        })
     }
 }
 
@@ -399,30 +409,48 @@ impl Inner {
         Ok(url)
     }
 
-    /// One sync of the primary calendar (see [`CalendarSource::sync_primary`]).
-    /// A full fetch looks the primary calendar's id up and lists the window's
-    /// events; an incremental one uses the cursor's calendar id and sync token
-    /// only. Both send `singleEvents` and `showDeleted`, never `orderBy`, follow
-    /// every page, and read `nextSyncToken` from the last one. GET only.
-    async fn sync_primary(
+    /// The account's readable calendars (see [`CalendarSource::list_calendars`]):
+    /// `users/me/calendarList` with `minAccessRole=reader`, following every page.
+    /// The name is the user's `summaryOverride` when set, else the `summary`.
+    /// GET only.
+    async fn list_calendars(&self) -> Result<Vec<CalendarInfo>, CalendarError> {
+        let token = self.access_token().await?;
+        let mut calendars = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = self.api_url(&["users", "me", "calendarList"])?;
+            {
+                let mut query = url.query_pairs_mut();
+                query
+                    .append_pair("minAccessRole", "reader")
+                    .append_pair("maxResults", "250");
+                if let Some(page) = &page_token {
+                    query.append_pair("pageToken", page);
+                }
+            }
+            let page: CalendarListPage = self.get(url, &token).await?;
+            calendars.extend(page.items.into_iter().map(CalendarListEntry::info));
+            match page.next_page_token {
+                Some(next) if !next.is_empty() => page_token = Some(next),
+                _ => break,
+            }
+        }
+        Ok(calendars)
+    }
+
+    /// One sync of the calendar `calendar_id` (see
+    /// [`CalendarSource::sync_calendar`]). A full fetch lists the window's events;
+    /// an incremental one sends the sync token only. Both send `singleEvents` and
+    /// `showDeleted`, never `orderBy`, follow every page, and read `nextSyncToken`
+    /// from the last one. GET only.
+    async fn sync_calendar(
         &self,
-        cursor: Option<(String, String)>,
+        calendar_id: String,
+        sync_token: Option<String>,
         window_start: Timestamp,
         window_end: Timestamp,
     ) -> Result<SyncBatch, CalendarError> {
         let token = self.access_token().await?;
-        let (calendar_id, sync_token) = match cursor {
-            Some((calendar_id, sync_token)) => (calendar_id, Some(sync_token)),
-            None => {
-                let primary: CalendarListEntry = self
-                    .get(
-                        self.api_url(&["users", "me", "calendarList", "primary"])?,
-                        &token,
-                    )
-                    .await?;
-                (primary.id, None)
-            }
-        };
         let mut changes = Vec::new();
         let mut page_token: Option<String> = None;
         let next_token = loop {
@@ -573,8 +601,37 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CalendarListPage {
+    #[serde(default)]
+    items: Vec<CalendarListEntry>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CalendarListEntry {
     id: String,
+    summary: Option<String>,
+    summary_override: Option<String>,
+    #[serde(default)]
+    primary: bool,
+}
+
+impl CalendarListEntry {
+    /// The entry as a listed calendar, named by its override when set.
+    fn info(self) -> CalendarInfo {
+        let name = self
+            .summary_override
+            .filter(|n| !n.is_empty())
+            .or(self.summary)
+            .unwrap_or_else(|| self.id.clone());
+        CalendarInfo {
+            id: self.id,
+            name,
+            primary: self.primary,
+        }
+    }
 }
 
 #[derive(Deserialize)]
