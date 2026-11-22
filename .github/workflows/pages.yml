@@ -1,0 +1,54 @@
+name: Pages
+
+# Deploys the static site in site/ (homepage and privacy policy) to GitHub Pages
+# on every push to master that touches it, and on manual runs.
+# When the NGUDA_SITE_DOMAIN repository variable is set, the artifact gets a CNAME
+# with that domain; Pages settings themselves (enablement, custom domain) are
+# configured in the repository, not here.
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'site/**'
+      - 'scripts/assemble-site.sh'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Assemble site
+        env:
+          NGUDA_SITE_DOMAIN: ${{ vars.NGUDA_SITE_DOMAIN }}
+        run: |
+          bash scripts/assemble-site.sh _site
+          ls -la _site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
