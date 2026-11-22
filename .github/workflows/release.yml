@@ -1,0 +1,158 @@
+name: Release
+
+# A `v*` tag builds every bundle and attaches it to a draft GitHub Release.
+# A manual run builds the same bundles and only uploads them as workflow artifacts.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    permissions:
+      # tauri-action creates the draft Release and uploads its assets on tags.
+      contents: write
+    strategy:
+      fail-fast: false
+      # On tags both jobs look up or create the same draft Release; running them one
+      # after the other keeps tauri-action from creating two drafts for one tag.
+      max-parallel: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && 1 || 2 }}
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            rust-targets: ''
+            # Arguments after the second `--` go to `cargo build` (keeps --locked everywhere).
+            tauri-args: '-- --locked'
+            bundle-dir: target/release/bundle
+          - name: macos-universal
+            os: macos-latest
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            tauri-args: '--target universal-apple-darwin -- --locked'
+            bundle-dir: target/universal-apple-darwin/release/bundle
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      # Unset secrets build fine: an empty client means "no built-in client" (gcal.rs).
+      - name: Build bundles
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NGUDA_GOOGLE_CLIENT_ID: ${{ secrets.NGUDA_GOOGLE_CLIENT_ID }}
+          NGUDA_GOOGLE_CLIENT_SECRET: ${{ secrets.NGUDA_GOOGLE_CLIENT_SECRET }}
+        with:
+          args: ${{ matrix.tauri-args }}
+          # Empty on manual runs, so no Release is created and nothing is uploaded to one.
+          tagName: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && format('nguda {0}', github.ref_name) || '' }}
+          releaseBody: 'See the assets below to download nguda for macOS (universal, ad-hoc signed) and Linux (AppImage, .deb, .rpm).'
+          releaseDraft: true
+          prerelease: false
+
+      # tauri-action itself uploads the macOS .app to the Release as nguda_universal.app.tar.gz;
+      # this stages every bundle (and a versioned .app tarball) for the workflow artifact.
+      - name: Collect bundles
+        shell: bash
+        env:
+          BUNDLE_DIR: ${{ matrix.bundle-dir }}
+          APP_VERSION: ${{ steps.tauri.outputs.appVersion }}
+        run: |
+          set -euo pipefail
+          shopt -s failglob
+          mkdir -p dist-bundles
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            cp "$BUNDLE_DIR"/dmg/*.dmg dist-bundles/
+            tar -czf "dist-bundles/nguda_${APP_VERSION}_universal.app.tar.gz" \
+              -C "$BUNDLE_DIR/macos" nguda.app
+            signature="$(codesign -dv "$BUNDLE_DIR/macos/nguda.app" 2>&1)"
+            grep -q 'Signature=adhoc' <<<"$signature"
+          else
+            cp "$BUNDLE_DIR"/appimage/*.AppImage dist-bundles/
+            cp "$BUNDLE_DIR"/deb/*.deb dist-bundles/
+            cp "$BUNDLE_DIR"/rpm/*.rpm dist-bundles/
+          fi
+          ls -l dist-bundles
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v5
+        with:
+          name: nguda-${{ matrix.name }}
+          path: dist-bundles/
+          if-no-files-found: error
+          retention-days: 7
+
+  deb-smoke:
+    name: deb smoke install (ubuntu 22.04)
+    needs: build
+    # Run even when only the macOS leg failed; the download fails if the Linux artifact is missing.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: nguda-linux-x86_64
+          path: bundles
+
+      - name: Install the .deb in a clean system
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          cd bundles
+          apt-get update
+          apt-get install -y ./*.deb
+
+      - name: Check the installed binary and desktop entry
+        run: |
+          set -eu
+          command -v nguda
+          test "$(command -v nguda)" = /usr/bin/nguda
+          test -f /usr/share/applications/nguda.desktop
+          cat /usr/share/applications/nguda.desktop
+          grep -qx 'StartupWMClass=nguda' /usr/share/applications/nguda.desktop
