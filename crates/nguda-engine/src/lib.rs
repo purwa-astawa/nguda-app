@@ -143,6 +143,11 @@
 //! ([`nguda_core::add_event`]). Each sync round also re-fetches today's live
 //! added items whose calendar is not included, and merges them in the same
 //! batch; un-including a calendar never hides them.
+//!
+//! Launch at login (AD-14): the shell owns the OS login item and reports what
+//! it reads with [`EngineMsg::AutostartObserved`]; the engine only mirrors it
+//! into [`Snapshot::autostart`] (`None` until the first report) and never
+//! persists it.
 
 mod actor;
 mod batch;
@@ -319,6 +324,11 @@ pub enum EngineMsg {
     /// must not be blank; a blank secret means none. Rejected unless the account
     /// is signed out; the same client changes nothing. Not rev-checked.
     SetGoogleClient { client: Option<OAuthClient> },
+    /// The shell read the OS login item (AD-14): `enabled` is whether nguda
+    /// starts at login. Mirrored into [`Snapshot::autostart`] and nothing else:
+    /// no store op, no effect, no status change, no rev check. The same value as
+    /// before publishes nothing. Sent by the shell, never by the view.
+    AutostartObserved { enabled: bool },
 }
 
 /// Where [`EngineMsg::ReorderTask`] puts the moved item, relative to another
@@ -426,6 +436,9 @@ pub struct Snapshot {
     pub calendars: Vec<CalendarEntry>,
     /// The OAuth client sign-in uses.
     pub google_client: GoogleClient,
+    /// Whether nguda starts at login, as the shell last read the OS login item
+    /// ([`EngineMsg::AutostartObserved`]). `None` until the shell reports.
+    pub autostart: Option<bool>,
 }
 
 /// The item the tray shows while nothing runs.

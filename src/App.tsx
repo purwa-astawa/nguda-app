@@ -11,6 +11,7 @@ import {
   googleSection,
   insertCommand,
   insertPositions,
+  launchAtLoginCommand,
   lockBadge,
   lockDayCommand,
   mergeSnapshot,
@@ -73,6 +74,9 @@ async function dispatch(cmd: Command): Promise<string | null> {
       break;
     case "setWorkEnd":
       res = await commands.setWorkEnd(...cmd.args);
+      break;
+    case "setLaunchAtLogin":
+      res = await commands.setLaunchAtLogin(...cmd.args);
       break;
     case "carryOverToTomorrow":
       res = await commands.carryOverToTomorrow(...cmd.args);
@@ -484,6 +488,17 @@ function App() {
         </label>
         <button type="submit">Set</button>
       </form>
+
+      <label className="launch-at-login">
+        <input
+          type="checkbox"
+          checked={snap.autostart === true}
+          disabled={snap.autostart === null}
+          onChange={(e) => send(launchAtLoginCommand(e.target.checked))}
+        />{" "}
+        Launch at login
+        {snap.autostart === null && <span> (unavailable)</span>}
+      </label>
 
       <form
         noValidate

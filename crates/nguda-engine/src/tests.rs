@@ -5853,3 +5853,57 @@ async fn an_expired_session_in_an_events_query_signs_out_and_answers_its_kind() 
     assert_eq!(snap.google, GoogleAccount::SignedOut);
     assert_eq!(sync_status(&snap), Some(EXPIRED));
 }
+
+// --- Launch at login (AutostartObserved) ---
+
+#[tokio::test]
+async fn a_fresh_engine_reports_no_autostart() {
+    let (h, _store) = running_on(1_000, None).await;
+    assert_eq!(h.rx.borrow().autostart, None);
+}
+
+#[tokio::test]
+async fn observing_autostart_mirrors_it_and_publishes_only_on_change() {
+    let (mut h, store) = running_on(1_000, None).await;
+    let batches = store.batches().len();
+    h.send(EngineMsg::AutostartObserved { enabled: true });
+    assert_eq!(h.rev(2).await.autostart, Some(true));
+    h.send(EngineMsg::AutostartObserved { enabled: false });
+    assert_eq!(h.rev(3).await.autostart, Some(false));
+    assert_eq!(store.batches().len(), batches, "never persisted");
+
+    // The same value again: no publish.
+    h.send(EngineMsg::AutostartObserved { enabled: false });
+    h.send(set_work_end(1));
+    let snap = h.rev(4).await;
+    assert_eq!(snap.work_end.minutes(), 1, "rev 4 is the work-end change");
+    assert_eq!(snap.autostart, Some(false));
+}
+
+#[tokio::test]
+async fn observing_autostart_changes_nothing_else() {
+    let (mut h, store) = running_on(1_000, Some(&short_day())).await;
+    expect_rejected(&mut h, &store, EngineMsg::Pause { item_id: id(100) }, 2).await;
+    while h.effects.try_recv().is_ok() {}
+    let before = h.rx.borrow().clone();
+    let batches = store.batches();
+    let stored = store.stored_day(day1());
+
+    h.send(EngineMsg::AutostartObserved { enabled: true });
+    let snap = h.rev(3).await;
+    assert_eq!(snap.autostart, Some(true));
+    assert!(rejected(&snap).is_some(), "CommandRejected kept");
+    assert_eq!(
+        Snapshot {
+            rev: before.rev,
+            autostart: before.autostart,
+            ..snap.clone()
+        },
+        before,
+        "only autostart and rev differ"
+    );
+    assert!(!snap.schedule.slots().is_empty(), "plan non-empty");
+    assert_eq!(store.batches(), batches, "no store op");
+    assert_eq!(store.stored_day(day1()), stored, "store contents unchanged");
+    h.expect_no_effect().await;
+}

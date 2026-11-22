@@ -110,6 +110,7 @@ const SET_INCLUDED_CALENDARS: &str = "SetIncludedCalendars";
 const EXCLUDE_EVENT: &str = "ExcludeEvent";
 const INCLUDE_EVENT: &str = "IncludeEvent";
 const ADD_CALENDAR_EVENT: &str = "AddCalendarEvent";
+const AUTOSTART_OBSERVED: &str = "AutostartObserved";
 
 /// Why a carry-over with no leftovers is rejected.
 pub(crate) const NOTHING_TO_CARRY_OVER: &str = "nothing to carry over";
@@ -139,6 +140,7 @@ pub(crate) fn name(msg: &EngineMsg) -> &'static str {
         EngineMsg::ExcludeEvent { .. } => EXCLUDE_EVENT,
         EngineMsg::IncludeEvent { .. } => INCLUDE_EVENT,
         EngineMsg::AddCalendarEvent { .. } => ADD_CALENDAR_EVENT,
+        EngineMsg::AutostartObserved { .. } => AUTOSTART_OBSERVED,
     }
 }
 
@@ -154,7 +156,8 @@ pub(crate) fn target(msg: &EngineMsg) -> Option<ItemId> {
         | EngineMsg::SignOut
         | EngineMsg::SetGoogleClient { .. }
         | EngineMsg::SetIncludedCalendars { .. }
-        | EngineMsg::AddCalendarEvent { .. } => None,
+        | EngineMsg::AddCalendarEvent { .. }
+        | EngineMsg::AutostartObserved { .. } => None,
         EngineMsg::InsertTask { anchor, .. } => match anchor {
             InsertAnchor::After(id) | InsertAnchor::Before(id) => Some(*id),
             InsertAnchor::Now | InsertAnchor::End => None,
@@ -296,6 +299,10 @@ pub(crate) fn apply(
         // The actor routes it to `set_google_client`; never reached.
         EngineMsg::SetGoogleClient { .. } => {
             Err(Reject::invalid(SET_GOOGLE_CLIENT, "not a plan command"))
+        }
+        // The actor routes it to `autostart_observed`; never reached.
+        EngineMsg::AutostartObserved { .. } => {
+            Err(Reject::invalid(AUTOSTART_OBSERVED, "not a plan command"))
         }
         // The actor routes it to `set_included_calendars`; never reached.
         EngineMsg::SetIncludedCalendars { .. } => Err(Reject::invalid(

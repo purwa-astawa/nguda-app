@@ -44,6 +44,12 @@ export const commands = {
 	 */
 	setWorkEnd: (minutes: number) => typedError<null, string>(__TAURI_INVOKE("set_work_end", { minutes })),
 	/**
+	 *  Turns launch at login on or off (the OS login item, AD-14), then reads it back
+	 *  and reports it to the engine, so the snapshot's `autostart` shows what the OS
+	 *  has. `Err` carries the plugin's error text when the change failed.
+	 */
+	setLaunchAtLogin: (enabled: boolean) => typedError<null, string>(__TAURI_INVOKE("set_launch_at_login", { enabled })),
+	/**
 	 *  Carries the leftovers the snapshot at `expected_rev` lists as overflow over to
 	 *  tomorrow (AD-6). The engine rejects a stale rev or an empty list.
 	 */
@@ -615,6 +621,11 @@ export type SnapshotEvent_Deserialize = {
 	calendars: CalendarView[],
 	/**  The OAuth client sign-in uses. Never the secret. */
 	googleClient: GoogleClientView_Deserialize,
+	/**
+	 *  Whether nguda starts at login, as last read from the OS. `null` until
+	 *  the first successful read; a failed read keeps the last value.
+	 */
+	autostart?: boolean | null,
 };
 
 /**
@@ -655,6 +666,11 @@ export type SnapshotEvent_Serialize = {
 	calendars: CalendarView[],
 	/**  The OAuth client sign-in uses. Never the secret. */
 	googleClient: GoogleClientView_Serialize,
+	/**
+	 *  Whether nguda starts at login, as last read from the OS. `null` until
+	 *  the first successful read; a failed read keeps the last value.
+	 */
+	autostart: boolean | null,
 };
 
 export type StatusKeyView = "store" | "commandRejected" | "overflow" | 
