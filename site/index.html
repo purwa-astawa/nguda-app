@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>nguda: a tray-first planner and time tracker</title>
+    <meta name="description" content="nguda is a tray-first planner and time tracker for macOS and Linux that shows your real estimate gap: planned time next to actual time.">
+    <link rel="icon" type="image/png" href="icon.png">
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="index.html">
+        <img src="icon.png" alt="" width="40" height="40">
+        <span>nguda</span>
+      </a>
+      <nav aria-label="Site">
+        <a href="#download">Download</a>
+        <a href="privacy.html">Privacy policy</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <h1>Plan your day. See how long it really took.</h1>
+        <p class="lead">
+          nguda is a tray-first planner and time tracker that shows your real estimate gap.
+          It plans your day from local tasks and Google Calendar, tracks the running task from
+          the status bar, and lets you extend or switch when you run over. Today's summary puts
+          planned time next to actual time, so you learn how far your estimates are off.
+        </p>
+        <p><a class="button" href="https://github.com/purwa-astawa/nguda-app/releases/latest">Download the latest release</a></p>
+        <p class="note">Free and open source. Runs on macOS and Linux.</p>
+      </section>
+
+      <section>
+        <h2>Features</h2>
+        <ul class="features">
+          <li><strong>Planned versus actual.</strong> Every task has an estimate; nguda records the time you actually spent and shows both side by side.</li>
+          <li><strong>Lives in the status bar.</strong> The running task and its elapsed time sit in the menu bar or tray, with Switch and Extend one click away.</li>
+          <li><strong>Recover when you run over.</strong> Extend the running task by 5 or 15 minutes, or by any amount, or switch to the next task.</li>
+          <li><strong>Google Calendar in your plan.</strong> Events from the calendars you choose are placed in today's plan next to your local tasks.</li>
+          <li><strong>Local first.</strong> Your plan, tasks, and time log stay on your computer. There is no account with us and no telemetry.</li>
+        </ul>
+      </section>
+
+      <section id="google-calendar">
+        <h2>What nguda reads from Google Calendar and why</h2>
+        <p>
+          Connecting Google Calendar is optional. When you sign in, nguda asks for read-only
+          access and reads only two things:
+        </p>
+        <ul>
+          <li><strong>Your calendar list</strong>, so you can choose which calendars go into today's plan.</li>
+          <li><strong>Events of the calendars you chose</strong>, so nguda can place them in today's plan next to your tasks.</li>
+        </ul>
+        <p>
+          nguda never creates, changes, or deletes anything in your calendar. What it reads is
+          stored only on your computer and is never sent anywhere else. The
+          <a href="privacy.html">privacy policy</a> has the details.
+        </p>
+      </section>
+
+      <section id="download">
+        <h2>Download</h2>
+        <div class="platforms">
+          <div class="platform">
+            <h3>macOS</h3>
+            <p>A universal <code>.dmg</code> for Apple silicon and Intel, for macOS 13 or later.</p>
+          </div>
+          <div class="platform">
+            <h3>Linux</h3>
+            <p>An AppImage, a <code>.deb</code>, and an <code>.rpm</code>, for x86_64.</p>
+          </div>
+        </div>
+        <p>
+          <a class="button" href="https://github.com/purwa-astawa/nguda-app/releases/latest">Get the latest release</a>
+        </p>
+        <p>
+          The macOS app is not notarized by Apple, so the first launch needs one extra step.
+          See the <a href="https://github.com/purwa-astawa/nguda-app#install">install steps in the README</a>.
+        </p>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <nav aria-label="Footer">
+        <a href="privacy.html">Privacy policy</a>
+        <a href="https://github.com/purwa-astawa/nguda-app">Source code</a>
+        <a href="https://github.com/purwa-astawa/nguda-app/issues">Contact</a>
+      </nav>
+      <p>nguda is licensed under MIT or Apache-2.0.</p>
+    </footer>
+  </body>
+</html>

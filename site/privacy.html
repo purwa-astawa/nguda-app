@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Privacy policy: nguda</title>
+    <meta name="description" content="How nguda handles your data, including the information it receives from Google Calendar.">
+    <link rel="icon" type="image/png" href="icon.png">
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="index.html">
+        <img src="icon.png" alt="" width="40" height="40">
+        <span>nguda</span>
+      </a>
+      <nav aria-label="Site">
+        <a href="index.html#download">Download</a>
+        <a href="privacy.html" aria-current="page">Privacy policy</a>
+      </nav>
+    </header>
+
+    <main class="prose">
+      <h1>Privacy policy</h1>
+      <p class="note">Effective date: <time datetime="2026-11-22">22 November 2026</time></p>
+
+      <p>
+        nguda is a desktop planner and time tracker for macOS and Linux. It runs entirely on
+        your computer. This policy explains what data nguda accesses, how it uses and stores
+        that data, and how you can delete it.
+      </p>
+
+      <h2 id="summary">Summary</h2>
+      <ul>
+        <li>Your data stays on your computer. nguda has no servers and no accounts.</li>
+        <li>Google Calendar access is optional and read-only.</li>
+        <li>nguda does not share, sell, or transfer your data to anyone.</li>
+        <li>There is no telemetry, analytics, or advertising.</li>
+      </ul>
+
+      <h2 id="accessed">What nguda accesses</h2>
+      <p>
+        <strong>Data you enter.</strong> Your tasks, estimates, plan, and time log, which you
+        create in the app.
+      </p>
+      <p>
+        <strong>Google Calendar, only if you sign in.</strong> nguda requests these two
+        read-only scopes:
+      </p>
+      <ul>
+        <li><code>https://www.googleapis.com/auth/calendar.calendarlist.readonly</code>: reads the list of your calendars, so you can choose which ones go into today's plan.</li>
+        <li><code>https://www.googleapis.com/auth/calendar.events.readonly</code>: reads the events of the calendars you chose, so nguda can place them in today's plan.</li>
+      </ul>
+      <p>nguda never creates, changes, or deletes anything in your Google Calendar.</p>
+
+      <h2 id="use">How nguda uses it</h2>
+      <p>
+        nguda uses your calendar list only to show you the calendars you can choose from, and
+        uses the events of the chosen calendars only to place them in your daily plan and
+        summary inside the app. Google user data is not used for advertising, is not used to
+        train any model, and is not read by any person.
+      </p>
+
+      <h2 id="storage">Storage</h2>
+      <ul>
+        <li>
+          Your plan, tasks, time log, and imported calendar items are stored locally in a
+          SQLite database, <code>nguda.sqlite3</code>, in the app data folder:
+          <ul>
+            <li>macOS: <code>~/Library/Application Support/dev.nguda.app/</code></li>
+            <li>Linux: <code>$XDG_DATA_HOME/dev.nguda.app/</code> (default <code>~/.local/share/dev.nguda.app/</code>)</li>
+          </ul>
+        </li>
+        <li>
+          The Google refresh token is kept in your operating system's keyring (macOS Keychain,
+          Linux Secret Service). If no keyring is available, the sign-in is kept in memory for
+          the current session only and is gone when nguda quits.
+        </li>
+      </ul>
+
+      <h2 id="network">Network access</h2>
+      <p>
+        The only network traffic nguda makes is to Google, for sign-in and calendar sync. No
+        data is sent to the developers of nguda or to any other party.
+      </p>
+
+      <h2 id="sharing">Sharing</h2>
+      <p>
+        None. nguda does not share, sell, rent, or transfer your data, including any
+        information received from Google APIs, to anyone.
+      </p>
+
+      <h2 id="telemetry">Telemetry</h2>
+      <p>None. nguda has no telemetry, analytics, crash reporting, or advertising.</p>
+
+      <h2 id="limited-use">Google API Services User Data Policy</h2>
+      <p>
+        nguda's use and transfer to any other app of information received from Google APIs will adhere to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements.
+      </p>
+
+      <h2 id="deletion">Deleting your data and revoking access</h2>
+      <ul>
+        <li><strong>Sign out</strong> in the window's Google Calendar section. This deletes the refresh token from the keyring. Items already imported stay in your plan until you delete them.</li>
+        <li><strong>Delete the app data folder</strong> listed under <a href="#storage">Storage</a> to remove all local data, including imported calendar items.</li>
+        <li><strong>Revoke access</strong> to nguda in your Google Account at <a href="https://myaccount.google.com/permissions">https://myaccount.google.com/permissions</a>.</li>
+      </ul>
+
+      <h2 id="changes">Changes to this policy</h2>
+      <p>
+        If this policy changes, the new version is published on this page with a new effective
+        date. The history of this page is public in the
+        <a href="https://github.com/purwa-astawa/nguda-app">source repository</a>.
+      </p>
+
+      <h2 id="contact">Contact</h2>
+      <p>
+        Questions about this policy or about your data: open an issue at
+        <a href="https://github.com/purwa-astawa/nguda-app/issues">https://github.com/purwa-astawa/nguda-app/issues</a>.
+      </p>
+    </main>
+
+    <footer class="site-footer">
+      <nav aria-label="Footer">
+        <a href="index.html">Home</a>
+        <a href="https://github.com/purwa-astawa/nguda-app">Source code</a>
+        <a href="https://github.com/purwa-astawa/nguda-app/issues">Contact</a>
+      </nav>
+      <p>nguda is licensed under MIT or Apache-2.0.</p>
+    </footer>
+  </body>
+</html>

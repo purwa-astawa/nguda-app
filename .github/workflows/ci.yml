@@ -87,3 +87,24 @@ jobs:
           path: target/release/nguda
           if-no-files-found: error
           retention-days: 7
+
+  site:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Site assembly test (CNAME only with NGUDA_SITE_DOMAIN)
+        run: bash scripts/test-assemble-site.sh
+
+      - name: Validate HTML
+        run: npx --yes html-validate@11.21.1 --config site/.htmlvalidate.json site/*.html
+
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --max-retries 3 --accept 200,429 site/*.html
+          fail: true
