@@ -17,6 +17,14 @@
 //! `tauri-plugin-opener`, called from Rust, so the webview needs no new
 //! capability. On macOS the app runs as an accessory (no Dock icon) and the tray
 //! title gets monospaced digits once, from `macos`.
+//!
+//! A second launch is caught by `tauri-plugin-single-instance` (registered first
+//! among plugins): it shows and focuses the running instance's window and the
+//! new process exits. Launch at login is the OS login item, managed through
+//! `tauri-plugin-autostart` from Rust and never enabled on its own (opt-in);
+//! the shell reads it at startup and after each `set_launch_at_login` toggle and
+//! reports what it read to the engine as `AutostartObserved` (AD-14), which
+//! only mirrors it into the snapshot.
 
 mod effects;
 mod ipc;
@@ -36,8 +44,10 @@ use nguda_core::{
     SyncBatch, Timestamp,
 };
 use nguda_core::{CalendarSource, Clock, Notifier, SecretStore, Store, TimeZone};
+use nguda_engine::EngineMsg;
 use nguda_engine::{EngineDeps, EngineHandle};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
 use tauri_plugin_opener::OpenerExt;
 use tauri_specta::Event;
 
@@ -59,6 +69,16 @@ pub fn run() {
     }
 
     let app = tauri::Builder::default()
+        // First among plugins, as its docs require: a second launch only brings
+        // this instance's window forward, then exits.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main_window(app);
+        }))
+        // Opt-in: never enabled here, only from `set_launch_at_login`.
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(builder.invoke_handler())
@@ -112,6 +132,7 @@ pub fn run() {
                 targets,
                 on_export_done(app.handle().clone()),
             ));
+            report_autostart(app.handle(), &engine);
             app.manage::<EngineHandle>(engine);
 
             let tray = match tray::build(app) {
@@ -144,6 +165,54 @@ pub fn run() {
             std::process::exit(1);
         }
     }
+}
+
+/// Reads the OS login item and reports it to the engine (AD-14, fire-and-forget);
+/// a failed read is logged and reports nothing, so the snapshot keeps its last
+/// value (`None` at startup).
+pub(crate) fn report_autostart(app: &AppHandle, engine: &EngineHandle) {
+    let read = app.autolaunch().is_enabled().map_err(|e| e.to_string());
+    if let Err(e) = &read {
+        eprintln!("nguda: failed to read the launch-at-login item: {e}");
+    }
+    if let Some(msg) = autostart_report(read)
+        && let Err(e) = engine.send(msg)
+    {
+        eprintln!("nguda: failed to report the launch-at-login item: {e}");
+    }
+}
+
+/// What a read of the login item reports: the value read, or nothing when the
+/// read failed.
+fn autostart_report(read: Result<bool, String>) -> Option<EngineMsg> {
+    read.ok().map(ipc::autostart_observed_msg)
+}
+
+/// Turns the login item on or off, then reports what it reads back, so the
+/// snapshot stays truthful even after a failed or partial write. The write's
+/// error text is the result.
+pub(crate) fn set_autostart(
+    app: &AppHandle,
+    engine: &EngineHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    let manager = app.autolaunch();
+    let write = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }
+    .map_err(|e| e.to_string());
+    if let Err(e) = &write {
+        eprintln!("nguda: failed to change the launch-at-login item: {e}");
+    }
+    report_autostart(app, engine);
+    toggle_result(write)
+}
+
+/// The toggle command's result: the write's outcome, its error text unchanged.
+fn toggle_result(write: Result<(), String>) -> Result<(), String> {
+    write
 }
 
 /// Opens a URL in the system browser, for the Google sign-in (AD-1: the gcal
@@ -294,5 +363,36 @@ fn system_time_zone() -> TimeZone {
             eprintln!("nguda: cannot determine the system time zone, using UTC: {e}");
             TimeZone::UTC
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_login_item_is_reported_as_read() {
+        assert_eq!(
+            autostart_report(Ok(false)),
+            Some(EngineMsg::AutostartObserved { enabled: false })
+        );
+        assert_eq!(
+            autostart_report(Ok(true)),
+            Some(EngineMsg::AutostartObserved { enabled: true })
+        );
+    }
+
+    #[test]
+    fn a_failed_read_reports_nothing() {
+        assert_eq!(autostart_report(Err("no launch agents dir".into())), None);
+    }
+
+    #[test]
+    fn the_toggle_returns_the_write_error_text() {
+        assert_eq!(toggle_result(Ok(())), Ok(()));
+        assert_eq!(
+            toggle_result(Err("permission denied".into())),
+            Err("permission denied".to_owned())
+        );
     }
 }

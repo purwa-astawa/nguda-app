@@ -83,6 +83,9 @@ struct Actor {
     google_client: Option<OAuthClient>,
     /// Whether the calendar source has any client to sign in with.
     client_available: bool,
+    /// The OS login item as the shell last reported it; `None` until it does.
+    /// Never persisted (AD-14).
+    autostart: Option<bool>,
     /// The last sync request id handed out; only its result applies.
     import_issued: u64,
     /// The last calendar-events query id handed out; only its result is
@@ -169,6 +172,7 @@ impl Actor {
             sign_in_task: None,
             google_client: None,
             client_available: false,
+            autostart: None,
             import_issued: 0,
             events_query_issued: 0,
             cursors: BTreeMap::new(),
@@ -1278,6 +1282,11 @@ impl Actor {
     /// is stale, and again after a committed change (a Pause after midnight ends
     /// the old day). Carry-over needs tomorrow's day, so it has its own path.
     async fn handle(&mut self, msg: EngineMsg) {
+        // Changes nothing but the mirrored login item, so no rollover either.
+        if let EngineMsg::AutostartObserved { enabled } = msg {
+            self.autostart_observed(enabled);
+            return;
+        }
         self.roll_over_if_due(self.clock.now()).await;
         let changed = match msg {
             EngineMsg::CarryOverToTomorrow { expected_rev } => self.carry_over(expected_rev).await,
@@ -1313,6 +1322,16 @@ impl Actor {
         if changed {
             self.roll_over_if_due(self.clock.now()).await;
         }
+    }
+
+    /// Mirrors the shell's read of the OS login item (AD-14): publishes only when
+    /// it changed. No store op, no effect, no status change.
+    fn autostart_observed(&mut self, enabled: bool) {
+        if self.autostart == Some(enabled) {
+            return;
+        }
+        self.autostart = Some(enabled);
+        self.publish();
     }
 
     /// A command on today's day and the work-end: rev check, validate and apply on
@@ -1705,6 +1724,7 @@ impl Actor {
                 custom_id: self.google_client.as_ref().map(|c| c.id.clone()),
                 available: self.client_available,
             },
+            autostart: self.autostart,
             status: self
                 .status
                 .iter()

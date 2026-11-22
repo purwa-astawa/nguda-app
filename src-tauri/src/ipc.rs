@@ -266,6 +266,19 @@ pub fn set_work_end(engine: State<'_, EngineHandle>, minutes: u32) -> Result<(),
     send(&engine, Ok(set_work_end_msg(minutes)))
 }
 
+/// Turns launch at login on or off (the OS login item, AD-14), then reads it back
+/// and reports it to the engine, so the snapshot's `autostart` shows what the OS
+/// has. `Err` carries the plugin's error text when the change failed.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_launch_at_login(
+    app: AppHandle,
+    engine: State<'_, EngineHandle>,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::set_autostart(&app, &engine, enabled)
+}
+
 /// Carries the leftovers the snapshot at `expected_rev` lists as overflow over to
 /// tomorrow (AD-6). The engine rejects a stale rev or an empty list.
 #[tauri::command]
@@ -694,6 +707,11 @@ fn set_work_end_msg(minutes: u32) -> EngineMsg {
     EngineMsg::SetWorkEnd { minutes }
 }
 
+/// What the shell reports after reading the OS login item.
+pub(crate) fn autostart_observed_msg(enabled: bool) -> EngineMsg {
+    EngineMsg::AutostartObserved { enabled }
+}
+
 fn sign_in_msg() -> EngineMsg {
     EngineMsg::SignIn
 }
@@ -798,6 +816,9 @@ pub struct SnapshotEvent {
     pub calendars: Vec<CalendarView>,
     /// The OAuth client sign-in uses. Never the secret.
     pub google_client: GoogleClientView,
+    /// Whether nguda starts at login, as last read from the OS. `null` until
+    /// the first successful read; a failed read keeps the last value.
+    pub autostart: Option<bool>,
 }
 
 /// The OAuth client sign-in uses (AD-13). Never carries the secret.
@@ -1318,6 +1339,7 @@ impl From<&Snapshot> for SnapshotEvent {
             known_tags: s.known_tags.clone(),
             google: s.google.into(),
             google_client: (&s.google_client).into(),
+            autostart: s.autostart,
             calendars: s.calendars.iter().map(CalendarView::from).collect(),
             status: s
                 .status
@@ -1381,6 +1403,7 @@ pub fn specta_builder() -> Builder<Wry> {
             set_tags,
             insert_task,
             set_work_end,
+            set_launch_at_login,
             carry_over_to_tomorrow,
             sign_in,
             sign_out,
@@ -1462,6 +1485,7 @@ mod tests {
             "setTags",
             "insertTask",
             "setWorkEnd",
+            "setLaunchAtLogin",
             "carryOverToTomorrow",
             "currentSnapshot",
             "queryDay",
@@ -1862,9 +1886,11 @@ mod tests {
                     included: false,
                 },
             ],
+            autostart: Some(true),
         };
         let ev = SnapshotEvent::from(&snap);
         assert_eq!(ev.rev, 5);
+        assert_eq!(ev.autostart, Some(true));
         assert_eq!(ev.google, GoogleAccountView::SignedIn);
         assert_eq!(
             ev.google_client,
@@ -2049,7 +2075,27 @@ mod tests {
                     custom_id: None,
                     available: false,
                 },
+                autostart: None,
             }
+        );
+    }
+
+    #[test]
+    fn autostart_maps_into_the_view_and_the_observed_message() {
+        for autostart in [None, Some(false), Some(true)] {
+            let snap = Snapshot {
+                autostart,
+                ..Default::default()
+            };
+            assert_eq!(SnapshotEvent::from(&snap).autostart, autostart);
+        }
+        assert_eq!(
+            autostart_observed_msg(true),
+            EngineMsg::AutostartObserved { enabled: true }
+        );
+        assert_eq!(
+            autostart_observed_msg(false),
+            EngineMsg::AutostartObserved { enabled: false }
         );
     }
 

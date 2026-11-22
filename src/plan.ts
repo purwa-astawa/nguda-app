@@ -46,6 +46,7 @@ export type Command =
       ];
     }
   | { name: "setWorkEnd"; args: [minutes: number] }
+  | { name: "setLaunchAtLogin"; args: [enabled: boolean] }
   | { name: "carryOverToTomorrow"; args: [expectedRev: number] }
   | { name: "signIn"; args: [] }
   | { name: "signOut"; args: [] }
@@ -441,6 +442,12 @@ export function includeCalendarCommand(
 /** Signs in to Google; progress comes back in `snapshot.google`. */
 export function signInCommand(): Command {
   return { name: "signIn", args: [] };
+}
+
+/** Turns launch at login on or off; the OS login item as read back comes back in
+ * `snapshot.autostart`. */
+export function launchAtLoginCommand(enabled: boolean): Command {
+  return { name: "setLaunchAtLogin", args: [enabled] };
 }
 
 /** Signs out of Google; every plan item stays. */

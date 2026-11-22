@@ -12,6 +12,7 @@ import {
   includeCalendarCommand,
   signInCommand,
   signOutCommand,
+  launchAtLoginCommand,
   NO_CLIENT,
   addCommand,
   asksLockChoice,
@@ -83,6 +84,7 @@ function snap(rev: number, items: Item[] = [F, A, B], running: Snapshot["running
     google: "signedOut",
     calendars: [],
     googleClient: { customId: null, available: true },
+    autostart: null,
   };
 }
 
@@ -554,4 +556,9 @@ test("excluded flexible items are never reorder or insert anchors", () => {
   assert.deepEqual(flexibleNeighbours(s.items, "A"), { prev: null, next: B });
   assert.deepEqual(flexibleNeighbours(s.items, "X"), { prev: null, next: null });
   assert.ok(!insertPositions(s).some((p) => p.anchor.itemId === "X"));
+});
+
+test("launch at login sends the checkbox's new state", () => {
+  assert.deepEqual(launchAtLoginCommand(true), { name: "setLaunchAtLogin", args: [true] });
+  assert.deepEqual(launchAtLoginCommand(false), { name: "setLaunchAtLogin", args: [false] });
 });
